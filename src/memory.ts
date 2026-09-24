@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
 import { ZodError, type z } from "zod";
-import { bindScope, type BoundScope } from "./bootstrap/workstream-resolution.js";
-import { headCommit, resolveHome, resolveWorkspace, type WorkspaceLocation } from "./bootstrap/workspace-resolution.js";
+import { bindScope, type BoundScope, findBinding } from "./bootstrap/workstream-resolution.js";
+import { headCommit, locateWorkspace, registerWorkspace, resolveHome, type WorkspaceLocation } from "./bootstrap/workspace-resolution.js";
 import { type ErrorCode, MemchorError } from "./errors.js";
 import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integrity/checkpoints.js";
 import { type Citation, citationsFor, linksOf } from "./integrity/provenance.js";
-import { ITEM_EXCERPT_BYTES, openContinuation, packPage, type Packable, sealContinuation, usage } from "./retrieval/context-pack.js";
+import { type ContinuationState, ITEM_EXCERPT_BYTES, openContinuation, packPage, type Packable, sealContinuation, usage } from "./retrieval/context-pack.js";
 import { requireVisibleRecord, type RecordRow } from "./retrieval/eligibility.js";
-import { type Candidate, clipToBytes, currentSeqMax, rankCandidates, rebuildSearchIndex, toFtsQuery } from "./retrieval/search.js";
+import { type Candidate, clipToBytes, loadCandidates, PAGE_CANDIDATES, rankSequence, rebuildSearchIndex, SEQUENCE_CAP, toFtsQuery } from "./retrieval/search.js";
 import {
   type Applicability,
   type Attribution,
@@ -16,8 +16,10 @@ import {
   effectiveBudget,
   estimateTokens,
   type ExternalRef,
+  type Freshness,
   LIMITS,
   type LinkRelation,
+  OPERATION_SCHEMAS,
   ReadInput,
   RecallInput,
   type RecordKind,
@@ -30,13 +32,14 @@ import {
   type Db,
   type IntegrityReport,
   openDatabase,
+  openReadOnly,
   probeRuntime,
   type RuntimeReport,
   SCHEMA_VERSION,
   toStorageError,
   writeTransaction,
 } from "./storage/database.js";
-import { appendRecord } from "./storage/records.js";
+import { appendRecord, recordFields } from "./storage/records.js";
 
 export type { Citation } from "./integrity/provenance.js";
 export type { IntegrityReport } from "./storage/database.js";
@@ -81,7 +84,7 @@ export interface PackItem {
   attribution: Attribution;
   reviewState: ReviewState;
   /** Always "unknown" until freshness validation ships; verify live artifacts before acting. */
-  freshness: "current" | "stale" | "unknown";
+  freshness: Freshness;
   applicability: Applicability;
   citations: Citation[];
   externalRefs: ExternalRef[];
@@ -102,8 +105,12 @@ export interface PackCheckpoint {
 }
 
 export interface Omission {
-  /** `budget`: more eligible records follow (use `continuation`). `exceeds_budget`: records too large for this budget even alone. */
-  reason: "budget" | "exceeds_budget";
+  /**
+   * `budget`: more of the sequence follows (use `continuation`).
+   * `exceeds_budget`: records too large for this budget even alone (read them directly).
+   * `candidate_limit`: eligible matches beyond the 500-record sequence cap; refine the query.
+   */
+  reason: "budget" | "exceeds_budget" | "candidate_limit";
   count: number;
   recordIds?: string[];
 }
@@ -116,7 +123,11 @@ export interface ContextPack {
   omissions: Omission[];
   /** True when eligible content was left out of this pack. */
   truncated: boolean;
-  /** Opaque token for the next page; bound to this workspace/workstream, query and kinds. */
+  /**
+   * Opaque token for the next page. The ranked order is frozen at page 1, so following
+   * it never skips or repeats a record, whatever is written meanwhile; records written
+   * after page 1 are not part of the sequence.
+   */
   continuation: string | null;
   budget: { maxTokens: number; maxBytes: number; usedTokens: number; usedBytes: number };
   /** True when nothing eligible was found: an honest miss, not a reason to invent continuity. */
@@ -157,6 +168,7 @@ export interface ReadResult {
   title: string | null;
   /** The slice of the body starting at `offset`, within the byte budget. */
   body: string;
+  /** Effective start (UTF-16 code units), snapped back if the request split a surrogate pair. */
   offset: number;
   /** Pass as `offset` to continue; null when the slice reaches the end. */
   nextOffset: number | null;
@@ -164,7 +176,7 @@ export interface ReadResult {
   totalLength: number;
   attribution: Attribution;
   reviewState: ReviewState;
-  freshness: "current" | "stale" | "unknown";
+  freshness: Freshness;
   applicability: Applicability;
   externalRefs: ExternalRef[];
   /** Links in both directions whose other end is visible in this scope. */
@@ -179,6 +191,19 @@ export interface ReadResult {
   budget: { maxTokens: number; maxBytes: number; usedTokens: number; usedBytes: number };
 }
 
+export interface StatusScope {
+  workspaceId: string;
+  workspaceLabel: string;
+  worktree: string;
+  branch: string;
+  workstreamId: string | null;
+  workstreamLabel: string | null;
+  headRevision: number | null;
+  /** This instance's session, once an operation other than status has bound scope. */
+  sessionId: string | null;
+  host: string;
+}
+
 export interface StatusResult {
   runtime: RuntimeReport;
   storage: {
@@ -188,7 +213,8 @@ export interface StatusResult {
     supportedSchemaVersion: number;
     journalMode: string | null;
   };
-  scope: Scope | null;
+  /** What bootstrap would bind; `workstreamId` is null while this worktree has no workstream yet. */
+  scope: StatusScope | null;
   counts: { records: number; checkpoints: number; workstreams: number; sessions: number } | null;
   /** Set when scope or storage could not be resolved; status itself never throws for these. */
   problem: { code: ErrorCode; message: string } | null;
@@ -222,11 +248,19 @@ export interface Memory {
   recall(input?: RecallInput): ContextPack;
   /** Returns one visible record's body slice within a budget, plus its in-scope links. */
   read(input: ReadInput): ReadResult;
-  /** Reports runtime, storage and scope health. Does not throw for unresolved scope. */
+  /**
+   * Reports runtime, storage and scope health. Strictly read-only: it never creates the
+   * workspace, workstream, session or registry entry, never migrates, and does not
+   * throw for unresolved scope or unusable storage (see `problem`).
+   */
   status(input?: StatusInput): StatusResult;
   /** Regenerates the search projection from canonical records; canonical rows are untouched. */
   rebuildSearchIndex(): { records: number; chunks: number };
-  /** Diagnostics: SQLite integrity_check, foreign-key check, and FTS index-vs-content check. Read-only. */
+  /**
+   * Diagnostics: SQLite integrity_check, foreign-key check, and FTS index-vs-content check
+   * on this worktree's workspace database. Read-only; reports (never repairs or migrates)
+   * a damaged, foreign or unmigrated file.
+   */
   checkIntegrity(): IntegrityReport;
   /** Closes the database connection. Further calls fail with `storage_unavailable`. */
   close(): void;
@@ -236,6 +270,7 @@ export interface Memory {
  * Creates a Memory for a process. Cheap and side-effect free: Git, the registry and the
  * database are touched on the first operation, so an agent launched outside a Git
  * repository still gets a working `status` and a clear `scope_unresolved` elsewhere.
+ * `status` and `checkIntegrity` only read; every other operation binds scope first.
  */
 export function openMemory(options: OpenMemoryOptions): Memory {
   return new LocalMemory(options);
@@ -243,7 +278,7 @@ export function openMemory(options: OpenMemoryOptions): Memory {
 
 // ───────────────────────────── Implementation ─────────────────────────────
 
-const OPERATIONS = ["memory_bootstrap", "memory_recall", "memory_read", "memory_record", "memory_checkpoint", "memory_status"];
+const OPERATIONS = Object.keys(OPERATION_SCHEMAS);
 
 interface Bound {
   db: Db;
@@ -262,7 +297,7 @@ class LocalMemory implements Memory {
 
   constructor(options: OpenMemoryOptions) {
     this.cwd = options.cwd;
-    this.host = options.host.trim().slice(0, 100) || "unknown";
+    this.host = options.host.trim().slice(0, LIMITS.hostChars) || "unknown";
     this.home = resolveHome(options.home);
     this.busyTimeoutMs = options.busyTimeoutMs;
     this.hostSessionId = options.hostSessionId;
@@ -342,36 +377,29 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(ReadInput, input);
       const { db, scope } = this.bind();
-      return db.transaction(() => {
+      return db.transaction((): ReadResult => {
         const row = requireVisibleRecord(db, scope.workstreamId, parsed.recordId);
         if (parsed.offset > row.body.length) {
           throw new MemchorError("invalid_input", `offset ${parsed.offset} is past the end of the record (${row.body.length}).`, {
             details: { offset: parsed.offset, totalLength: row.body.length },
           });
         }
+        const offset = isLowSurrogate(row.body.charCodeAt(parsed.offset)) && isHighSurrogate(row.body.charCodeAt(parsed.offset - 1)) ? parsed.offset - 1 : parsed.offset;
         const budget = effectiveBudget(parsed);
-        const body = clipToBytes(row.body.slice(parsed.offset), budget.maxBytes);
-        const end = parsed.offset + body.length;
+        const body = clipToBytes(row.body.slice(offset), budget.maxBytes);
+        const end = offset + body.length;
         const nextOffset = end < row.body.length ? end : null;
-        const revision = db.prepare("SELECT revision FROM checkpoints WHERE record_id = ?").get(row.id) as
-          | { revision: number }
-          | undefined;
+        const revision = db.prepare("SELECT revision FROM checkpoints WHERE record_id = ?").get(row.id) as { revision: number } | undefined;
         return {
           recordId: row.id,
-          kind: row.kind as RecordKind,
           title: row.title,
           body,
-          offset: parsed.offset,
+          offset,
           nextOffset,
           truncated: nextOffset !== null,
           totalLength: row.body.length,
-          attribution: row.attribution as Attribution,
-          reviewState: row.review_state as ReviewState,
-          freshness: row.freshness as ReadResult["freshness"],
-          applicability: JSON.parse(row.applicability) as Applicability,
-          externalRefs: JSON.parse(row.external_refs) as ExternalRef[],
+          ...recordFields(row),
           links: linksOf(db, scope.workstreamId, row.id),
-          workspaceLevel: row.workstream_id === null,
           checkpointRevision: revision?.revision ?? null,
           host: row.host,
           sessionId: row.session_id,
@@ -394,23 +422,49 @@ class LocalMemory implements Memory {
         problem: null,
         capabilities: { operations: OPERATIONS, freshnessValidation: false, transcriptImport: false },
       };
+      let db: Db | null = null;
       try {
-        const { db, scope, location } = this.bind();
-        const count = (table: string): number => (db.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
+        if (this.closed) throw new MemchorError("storage_unavailable", "This Memory has been closed.");
+        const location = locateWorkspace(this.cwd, this.home);
         result.storage.dbPath = location.dbPath;
-        result.storage.schemaVersion = db.pragma("user_version", { simple: true }) as number;
-        result.storage.journalMode = db.pragma("journal_mode", { simple: true }) as string;
-        result.scope = scopeView(db, scope);
-        result.counts = {
-          records: count("records"),
-          checkpoints: count("checkpoints"),
-          workstreams: count("workstreams"),
-          sessions: count("sessions"),
+        result.scope = {
+          workspaceId: location.workspaceId,
+          workspaceLabel: location.label,
+          worktree: location.worktree,
+          branch: location.branch,
+          workstreamId: null,
+          workstreamLabel: null,
+          headRevision: null,
+          sessionId: this.bound?.scope.sessionId ?? null,
+          host: this.host,
         };
+        db = openReadOnly(location.dbPath);
+        if (db === null) return result;
+        const schemaVersion = db.pragma("user_version", { simple: true }) as number;
+        result.storage.schemaVersion = schemaVersion;
+        result.storage.journalMode = db.pragma("journal_mode", { simple: true }) as string;
+        if (schemaVersion > SCHEMA_VERSION) {
+          result.problem = {
+            code: "unsupported_runtime",
+            message: `The database uses schema version ${schemaVersion}; this Memchor supports up to ${SCHEMA_VERSION}. Upgrade Memchor.`,
+          };
+          return result;
+        }
+        if (schemaVersion < SCHEMA_VERSION) return result; // migrated by the next bootstrap
+        const workstream = findBinding(db, location.worktree);
+        if (workstream !== null) {
+          result.scope.workstreamId = workstream.id;
+          result.scope.workstreamLabel = workstream.label;
+          result.scope.headRevision = headRevision(db, workstream.id);
+        }
+        const count = (table: string): number => (db?.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
+        result.counts = { records: count("records"), checkpoints: count("checkpoints"), workstreams: count("workstreams"), sessions: count("sessions") };
       } catch (error) {
         const mapped = toStorageError(error);
         if (!(mapped instanceof MemchorError)) throw mapped;
         result.problem = { code: mapped.code, message: mapped.message };
+      } finally {
+        db?.close();
       }
       return result;
     });
@@ -424,7 +478,7 @@ class LocalMemory implements Memory {
   }
 
   checkIntegrity(): IntegrityReport {
-    return this.guard(() => checkIntegrity(this.bind().db));
+    return this.guard(() => checkIntegrity(locateWorkspace(this.cwd, this.home).dbPath));
   }
 
   close(): void {
@@ -439,7 +493,8 @@ class LocalMemory implements Memory {
   private bind(): Bound {
     if (this.closed) throw new MemchorError("storage_unavailable", "This Memory has been closed.");
     if (this.bound !== undefined) return this.bound;
-    const location = resolveWorkspace(this.cwd, this.home);
+    const location = locateWorkspace(this.cwd, this.home);
+    registerWorkspace(location);
     const db = openDatabase(location.dbPath, this.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: this.busyTimeoutMs });
     try {
       const scope = bindScope(db, location, this.host, this.hostSessionId);
@@ -511,28 +566,46 @@ class LocalMemory implements Memory {
    * Builds one page of a context pack inside a single read transaction, so the head
    * checkpoint, the candidates, and their citations come from one consistent snapshot.
    */
+  /**
+   * Builds one page of a context pack inside a single read transaction, so the head
+   * checkpoint, the candidates, and their citations come from one consistent snapshot.
+   *
+   * Page 1 ranks and freezes the whole sequence (≤ SEQUENCE_CAP seqs); the continuation
+   * carries the unreturned remainder. Later pages only load records by seq, re-checking
+   * scope and eligibility, so concurrent writes (which shift bm25 statistics) can neither
+   * reorder nor inject records into an in-flight sequence.
+   */
   private pack(db: Db, scope: BoundScope, parsed: z.output<typeof RecallInput>): ContextPack {
     const kinds = parsed.kinds === undefined ? null : [...new Set(parsed.kinds)].sort();
-    let state: { query: string | null; kinds: string[] | null; seqMax: number; offset: number };
+    let continued: ContinuationState | null = null;
     if (parsed.continuation !== undefined) {
-      state = openContinuation(scope.continuationSecret, parsed.continuation, scope);
-      if ((parsed.query !== undefined && parsed.query !== state.query) || (kinds !== null && canonicalJson(kinds) !== canonicalJson(state.kinds))) {
+      continued = openContinuation(scope.continuationSecret, parsed.continuation, scope);
+      if ((parsed.query !== undefined && parsed.query !== continued.query) || (kinds !== null && canonicalJson(kinds) !== canonicalJson(continued.kinds))) {
         throw new MemchorError("invalid_input", "A continuation cannot change the query or kinds of its sequence.", {
           details: { reason: "continuation_mismatch" },
         });
       }
-    } else {
-      state = { query: parsed.query ?? null, kinds, seqMax: 0, offset: 0 };
     }
-    const match = state.query === null ? null : toFtsQuery(state.query);
+    const query = continued === null ? (parsed.query ?? null) : continued.query;
+    const sequenceKinds = continued === null ? kinds : continued.kinds;
+    const match = query === null ? null : toFtsQuery(query);
     const budget = effectiveBudget(parsed);
-    const firstPage = parsed.continuation === undefined;
 
     return db.transaction((): ContextPack => {
-      if (firstPage) state.seqMax = currentSeqMax(db);
+      let sequence: number[];
+      let beyondCap: number;
+      if (continued === null) {
+        const ranked = rankSequence(db, { workstreamId: scope.workstreamId, match, kinds: sequenceKinds });
+        sequence = ranked.seqs;
+        beyondCap = ranked.total - ranked.seqs.length;
+      } else {
+        sequence = continued.remaining;
+        beyondCap = continued.beyondCap;
+      }
       const view = scopeView(db, scope);
-      const checkpointRow = firstPage ? loadHeadCheckpoint(db, scope.workstreamId) : null;
-      const { rows, total } = rankCandidates(db, { workstreamId: scope.workstreamId, match, kinds: state.kinds, seqMax: state.seqMax, offset: state.offset });
+      const checkpointRow = continued === null ? loadHeadCheckpoint(db, scope.workstreamId) : null;
+      const window = sequence.slice(0, PAGE_CANDIDATES);
+      const rows = loadCandidates(db, { workstreamId: scope.workstreamId, match, seqs: window });
       const citations = citationsFor(db, scope.workstreamId, [...rows.map((r) => r.id), ...(checkpointRow ? [checkpointRow.id] : [])]);
 
       const checkpointPackable: Packable<PackCheckpoint> | null =
@@ -548,29 +621,34 @@ class LocalMemory implements Memory {
                 excerpt,
                 truncated,
                 citations: citations.get(checkpointRow.id) ?? [],
-                externalRefs: JSON.parse(checkpointRow.external_refs) as ExternalRef[],
+                externalRefs: recordFields(checkpointRow).externalRefs,
                 host: checkpointRow.host,
                 createdAt: checkpointRow.created_at,
               }),
             };
       const page = packPage(budget, checkpointPackable, rows.map((row) => itemPackable(row, citations.get(row.id) ?? [])));
 
-      const nextOffset = state.offset + page.consumed;
-      const remaining = Math.max(0, total - nextOffset);
+      // Resume at the first unconsumed row; records dropped as ineligible leave the sequence.
+      const next = rows[page.consumed];
+      const remaining = next === undefined ? sequence.slice(window.length) : sequence.slice(sequence.indexOf(next.seq));
       const omissions: Omission[] = [];
       if (page.oversized.length > 0) omissions.push({ reason: "exceeds_budget", count: page.oversized.length, recordIds: page.oversized });
-      if (remaining > 0) omissions.push({ reason: "budget", count: remaining });
-      const truncated = remaining > 0 || page.oversized.length > 0 || page.checkpoint?.truncated === true;
+      if (remaining.length > 0) omissions.push({ reason: "budget", count: remaining.length });
+      if (beyondCap > 0) omissions.push({ reason: "candidate_limit", count: beyondCap });
+      const truncated = omissions.length > 0 || page.checkpoint?.truncated === true;
       const empty = page.checkpoint === null && page.items.length === 0 && omissions.length === 0;
 
       let notice: string | null = null;
       if (empty) {
         notice =
-          firstPage && state.query === null
+          continued === null && query === null
             ? "No memory has been recorded for this workstream yet. There is no prior context; do not assume any."
             : "No eligible memory matches this request. Nothing is known about it; do not assume prior context.";
       } else if (truncated) {
-        notice = "Budget reached before all eligible memory was returned. Pass `continuation` for more, or read a recordId to expand it.";
+        notice =
+          beyondCap > 0 && remaining.length === 0
+            ? `More than ${SEQUENCE_CAP} records match; only the top ${SEQUENCE_CAP} are sequenced. Refine the query to see the rest.`
+            : "Budget reached before all eligible memory was returned. Pass `continuation` for more, or read a recordId to expand it.";
       }
 
       return {
@@ -580,14 +658,14 @@ class LocalMemory implements Memory {
         omissions,
         truncated,
         continuation:
-          remaining > 0
+          remaining.length > 0
             ? sealContinuation(scope.continuationSecret, {
                 workspaceId: scope.workspaceId,
                 workstreamId: scope.workstreamId,
-                query: state.query,
-                kinds: state.kinds,
-                seqMax: state.seqMax,
-                offset: nextOffset,
+                query,
+                kinds: sequenceKinds,
+                remaining,
+                beyondCap,
               })
             : null,
         budget: { ...budget, usedBytes: page.usedBytes, usedTokens: estimateTokens(page.usedBytes) },
@@ -609,28 +687,32 @@ class LocalMemory implements Memory {
 }
 
 function itemPackable(row: Candidate, citations: Citation[]): Packable<PackItem> {
+  const fields = recordFields(row);
   return {
     recordId: row.id,
     source: row.excerpt_source,
     maxExcerptBytes: ITEM_EXCERPT_BYTES,
     build: (excerpt, truncated) => ({
       recordId: row.id,
-      kind: row.kind as RecordKind,
+      kind: fields.kind,
       title: row.title,
       excerpt,
       truncated: truncated || row.excerpt_source !== row.body,
-      attribution: row.attribution as Attribution,
-      reviewState: row.review_state as ReviewState,
-      freshness: row.freshness as PackItem["freshness"],
-      applicability: JSON.parse(row.applicability) as Applicability,
+      attribution: fields.attribution,
+      reviewState: fields.reviewState,
+      freshness: fields.freshness,
+      applicability: fields.applicability,
       citations,
-      externalRefs: JSON.parse(row.external_refs) as ExternalRef[],
-      workspaceLevel: row.workstream_id === null,
+      externalRefs: fields.externalRefs,
+      workspaceLevel: fields.workspaceLevel,
       host: row.host,
       createdAt: row.created_at,
     }),
   };
 }
+
+const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
 
 function loadHeadCheckpoint(db: Db, workstreamId: string): RecordRow | null {
   const recordId = headCheckpointRecordId(db, workstreamId);

@@ -1,5 +1,5 @@
 import type { LinkRelation } from "../schemas.js";
-import type { Db } from "../storage/database.js";
+import { type Db, requireTransaction } from "../storage/database.js";
 import { requireVisibleRecord, VISIBLE_SQL } from "../retrieval/eligibility.js";
 
 export interface Citation {
@@ -14,6 +14,7 @@ export interface Citation {
  * Call inside the transaction that inserts `fromId`.
  */
 export function insertLinks(db: Db, workstreamId: string, fromId: string, links: readonly Citation[], now: string): Citation[] {
+  requireTransaction(db, "insertLinks");
   const unique = [...new Map(links.map((link) => [`${link.recordId}\u0000${link.relation}`, link])).values()];
   const insert = db.prepare("INSERT INTO links (from_id, to_id, relation, created_at) VALUES (?, ?, ?, ?)");
   for (const link of unique) {

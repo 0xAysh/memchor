@@ -1,9 +1,9 @@
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, test } from "vitest";
 import { openMemory, type Memory } from "../../src/memory.js";
-import { catchMemchorError, initRepo, onCleanup, tempDir } from "../helpers.js";
+import { catchMemchorError, git, initRepo, onCleanup, tempDir } from "../helpers.js";
 
 function open(cwd: string, home: string, options: { host?: string; busyTimeoutMs?: number } = {}): Memory {
   const memory = openMemory({ cwd, home, host: options.host ?? "claude-code", ...(options.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: options.busyTimeoutMs }) });
@@ -11,6 +11,10 @@ function open(cwd: string, home: string, options: { host?: string; busyTimeoutMs
     memory.close();
   });
   return memory;
+}
+
+function mkdirp(file: string): void {
+  mkdirSync(dirname(file), { recursive: true });
 }
 
 /** A pack with the per-session scope fields removed, for comparing across instances. */
@@ -89,10 +93,91 @@ describe("durability", () => {
   });
 });
 
+describe("atomic writes", () => {
+  test("a failure after the chunks are written rolls back the record, its links, its chunks and its operation key", () => {
+    const memory = open(initRepo(), tempDir());
+    const evidence = memory.record({ kind: "evidence", body: "baseline evidence", attribution: "direct_observation" });
+    const dbPath = memory.status().storage.dbPath ?? "";
+    const raw = new Database(dbPath);
+    onCleanup(() => {
+      raw.close();
+    });
+    const counts = () =>
+      raw.prepare("SELECT (SELECT count(*) FROM records) AS records, (SELECT count(*) FROM links) AS links, (SELECT count(*) FROM chunks) AS chunks, (SELECT count(*) FROM operations) AS operations").get();
+    const before = counts();
+    // The operation row is the last insert of a record write, after links and chunks.
+    raw.exec("CREATE TRIGGER fail_operations BEFORE INSERT ON operations BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
+
+    expect(() =>
+      memory.record({ kind: "decision", body: "zeppelin decision", attribution: "agent_inference", supportedBy: [evidence.recordId], operationKey: "op-rollback" }),
+    ).toThrow(/injected failure/);
+
+    raw.exec("DROP TRIGGER fail_operations");
+    expect(counts()).toEqual(before);
+    expect(memory.recall({ query: "zeppelin" }).empty).toBe(true);
+    expect(memory.read({ recordId: evidence.recordId }).links).toEqual([]);
+    expect(memory.checkIntegrity()).toMatchObject({ ok: true, searchIndex: "ok" });
+  });
+});
+
+describe("read-only diagnostics", () => {
+  test("status on a fresh repository writes nothing, and the first bootstrap still creates the workspace and workstream", () => {
+    const repo = initRepo();
+    const home = tempDir();
+    const status = open(repo, home).status();
+    expect(status.problem).toBeNull();
+    expect(status.scope).toMatchObject({ worktree: repo, workstreamId: null, sessionId: null });
+    expect(status.storage.schemaVersion).toBeNull();
+    expect(readdirSync(home)).toEqual([]);
+    expect(open(repo, home).checkIntegrity()).toMatchObject({ exists: false, ok: true });
+    expect(readdirSync(home)).toEqual([]);
+
+    expect(open(repo, home).bootstrap().created).toEqual({ workspace: true, workstream: true });
+  });
+
+  test("status and checkIntegrity on an existing workspace create no sessions, workstreams or bindings", () => {
+    const repo = initRepo();
+    const home = tempDir();
+    const boot = open(repo, home).bootstrap();
+    const other = join(tempDir("memchor-wt-"), "wt");
+    git(repo, "worktree", "add", "--quiet", "-b", "unbound", other);
+
+    const inspector = open(other, home);
+    const status = inspector.status();
+    expect(status.scope).toMatchObject({ workspaceId: boot.scope.workspaceId, workstreamId: null });
+    expect(inspector.checkIntegrity().ok).toBe(true);
+    expect(open(repo, home).status()).toMatchObject({
+      counts: { sessions: 1, workstreams: 1 },
+      scope: { workstreamId: boot.scope.workstreamId, sessionId: null },
+    });
+    expect(open(other, home).bootstrap().created.workstream).toBe(true);
+  });
+
+  test("checkIntegrity reports a damaged database instead of throwing, and never migrates one", () => {
+    const repo = initRepo();
+    const home = tempDir();
+    const dbPath = open(repo, home).status().storage.dbPath ?? "";
+    mkdirp(dbPath);
+    const empty = new Database(dbPath);
+    empty.exec("CREATE TABLE unrelated (x)");
+    empty.close();
+    expect(open(repo, home).checkIntegrity()).toMatchObject({ exists: true, schemaVersion: 0 });
+    const still = new Database(dbPath, { readonly: true });
+    expect(still.pragma("user_version", { simple: true })).toBe(0);
+    still.close();
+
+    writeFileSync(dbPath, "this is not a database ".repeat(200));
+    const report = open(repo, home).checkIntegrity();
+    expect(report.ok).toBe(false);
+    expect(report.sqlite.join(" ")).toMatch(/not a database/);
+  });
+});
+
 describe("storage failures", () => {
   test("a writer held off past the busy timeout gets a retryable storage_busy, and nothing is written", () => {
     const repo = initRepo();
     const memory = open(repo, tempDir(), { busyTimeoutMs: 100 });
+    memory.bootstrap();
     const dbPath = memory.status().storage.dbPath ?? "";
     const other = new Database(dbPath);
     onCleanup(() => {
@@ -123,7 +208,9 @@ describe("storage failures", () => {
   });
 
   test("status reports the runtime gate and storage health", () => {
-    const status = open(initRepo(), tempDir()).status();
+    const memory = open(initRepo(), tempDir());
+    memory.bootstrap();
+    const status = memory.status();
     expect(status.runtime).toMatchObject({ fts5: true, supported: true, requiredSqliteVersion: "3.51.3" });
     expect(status.runtime.sqliteVersion).toMatch(/^3\.\d+\.\d+$/);
     expect(status.storage).toMatchObject({ schemaVersion: 1, supportedSchemaVersion: 1, journalMode: "wal" });

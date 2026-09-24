@@ -35,6 +35,14 @@ describe("read", () => {
     expect(assembled).toBe(body);
   });
 
+  test("an offset inside a surrogate pair snaps back to the start of that code point", () => {
+    const memory = open(initRepo(), tempDir());
+    const { recordId } = memory.record({ kind: "note", body: "a😀b", attribution: "agent_inference" });
+    const slice = memory.read({ recordId, offset: 2 });
+    expect(slice.offset).toBe(1);
+    expect(slice.body).toBe("😀b");
+  });
+
   test("maxTokens bounds the slice at four bytes per token", () => {
     const memory = open(initRepo(), tempDir());
     const { recordId } = memory.record({ kind: "note", body: "a".repeat(1000), attribution: "agent_inference" });

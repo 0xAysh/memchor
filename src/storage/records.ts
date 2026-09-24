@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { type Citation, insertLinks } from "../integrity/provenance.js";
 import { indexRecord } from "../retrieval/search.js";
-import type { Applicability, Attribution, ExternalRef, RecordKind, ReviewState } from "../schemas.js";
-import type { Db } from "./database.js";
+import type { RecordRow } from "../retrieval/eligibility.js";
+import type { Applicability, Attribution, ExternalRef, Freshness, RecordKind, ReviewState } from "../schemas.js";
+import { type Db, requireTransaction } from "./database.js";
 
 export interface NewRecord {
   kind: RecordKind;
@@ -31,6 +32,7 @@ export interface NewRecord {
  * so later slices can detect duplicate bodies without merging distinct observations.
  */
 export function appendRecord(db: Db, scopeWorkstreamId: string, record: NewRecord): { recordId: string; createdAt: string; links: Citation[] } {
+  requireTransaction(db, "appendRecord");
   const recordId = `rec_${randomUUID().replaceAll("-", "")}`;
   const createdAt = new Date().toISOString();
   const applicability = JSON.stringify(record.applicability);
@@ -62,4 +64,27 @@ export function appendRecord(db: Db, scopeWorkstreamId: string, record: NewRecor
   const links = insertLinks(db, scopeWorkstreamId, recordId, record.links, createdAt);
   indexRecord(db, { id: recordId, title: record.title, body: record.body, externalRefs: record.externalRefs });
   return { recordId, createdAt, links };
+}
+
+/** The typed, parsed fields every view of a stored record shares (the one row→view mapping). */
+export interface RecordFields {
+  kind: RecordKind;
+  attribution: Attribution;
+  reviewState: ReviewState;
+  freshness: Freshness;
+  applicability: Applicability;
+  externalRefs: ExternalRef[];
+  workspaceLevel: boolean;
+}
+
+export function recordFields(row: RecordRow): RecordFields {
+  return {
+    kind: row.kind as RecordKind,
+    attribution: row.attribution as Attribution,
+    reviewState: row.review_state as ReviewState,
+    freshness: row.freshness as Freshness,
+    applicability: JSON.parse(row.applicability) as Applicability,
+    externalRefs: JSON.parse(row.external_refs) as ExternalRef[],
+    workspaceLevel: row.workstream_id === null,
+  };
 }

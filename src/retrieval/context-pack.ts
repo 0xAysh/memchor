@@ -18,17 +18,29 @@ export interface ContinuationState {
   workstreamId: string;
   query: string | null;
   kinds: string[] | null;
-  seqMax: number;
-  offset: number;
+  /** The not-yet-returned part of the sequence frozen at page 1, as record seqs in rank order. */
+  remaining: number[];
+  /** Eligible matches beyond the sequence cap at page 1 (reported, never returned). */
+  beyondCap: number;
 }
 
 /**
  * Seals continuation state with an HMAC keyed by a per-workspace secret, so a token
- * cannot be forged, edited, or replayed in another workspace/workstream.
+ * cannot be forged, edited, or replayed in another workspace/workstream. The token
+ * carries the frozen remainder of the ranked sequence itself, so later pages neither
+ * re-rank (bm25 statistics drift as others write) nor need server-side state.
  */
 export function sealContinuation(secret: Buffer, state: ContinuationState): string {
   const payload = Buffer.from(
-    JSON.stringify({ v: 1, ws: state.workspaceId, wst: state.workstreamId, q: state.query, k: state.kinds, s: state.seqMax, o: state.offset }),
+    JSON.stringify({
+      v: 2,
+      ws: state.workspaceId,
+      wst: state.workstreamId,
+      q: state.query,
+      k: state.kinds,
+      r: state.remaining.map((seq) => seq.toString(36)).join(","),
+      x: state.beyondCap,
+    }),
   ).toString("base64url");
   return `${payload}.${sign(secret, payload)}`;
 }
@@ -50,12 +62,19 @@ export function openContinuation(secret: Buffer, token: string, scope: { workspa
     wst: string;
     q: string | null;
     k: string[] | null;
-    s: number;
-    o: number;
+    r: string;
+    x: number;
   };
-  if (state.v !== 1) throw invalid("unsupported version");
+  if (state.v !== 2) throw invalid("unsupported version");
   if (state.ws !== scope.workspaceId || state.wst !== scope.workstreamId) throw invalid("issued for another scope");
-  return { workspaceId: state.ws, workstreamId: state.wst, query: state.q, kinds: state.k, seqMax: state.s, offset: state.o };
+  return {
+    workspaceId: state.ws,
+    workstreamId: state.wst,
+    query: state.q,
+    kinds: state.k,
+    remaining: state.r === "" ? [] : state.r.split(",").map((seq) => parseInt(seq, 36)),
+    beyondCap: state.x,
+  };
 }
 
 function sign(secret: Buffer, payload: string): string {
@@ -117,7 +136,6 @@ export interface PackedPage<C, I> {
   consumed: number;
   usedBytes: number;
   oversized: string[];
-  budgetExhausted: boolean;
 }
 
 /**
@@ -140,7 +158,6 @@ export function packPage<C, I>(budget: Budget, checkpoint: Packable<C> | null, c
   }
   const items: I[] = [];
   let consumed = 0;
-  let budgetExhausted = false;
   for (const candidate of candidates) {
     let fitted = fit(candidate, budget.maxBytes - usedBytes);
     const leadsPage = packedCheckpoint === null && items.length === 0;
@@ -157,10 +174,9 @@ export function packPage<C, I>(budget: Budget, checkpoint: Packable<C> | null, c
       consumed++;
       continue;
     }
-    budgetExhausted = true;
     break;
   }
-  return { checkpoint: packedCheckpoint, items, consumed, usedBytes, oversized, budgetExhausted };
+  return { checkpoint: packedCheckpoint, items, consumed, usedBytes, oversized };
 }
 
 export function usage(usedBytes: number): { usedBytes: number; usedTokens: number } {

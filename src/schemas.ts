@@ -17,11 +17,14 @@ export const LIMITS = {
   operationKeyChars: 200,
   queryChars: 1_000,
   hostSessionIdChars: 200,
+  /** Host names longer than this are cut (they are labels, not identities). */
+  hostChars: 100,
   linksPerRecord: 20,
   externalRefsPerRecord: 10,
   checkpointListItems: 50,
   checkpointEntryChars: 2_000,
-  continuationChars: 4_096,
+  /** A continuation carries the frozen remainder of its sequence (≤ 500 base-36 seqs). */
+  continuationChars: 8_192,
   /** Budgets: tokens are estimated as ceil(utf8Bytes / 4); the tighter of the two limits applies. */
   defaultMaxTokens: 2_000,
   maxTokens: 8_000,
@@ -67,6 +70,10 @@ export type ReviewState = z.infer<typeof ReviewState>;
 /** `supersedes` is reserved until supersession semantics ship; accepting it now would promise behaviour that does not exist. */
 export const LinkRelation = z.enum(["supported_by", "derived_from", "references", "related_to"]);
 export type LinkRelation = z.infer<typeof LinkRelation> | "supersedes";
+
+/** Only "unknown" is produced until freshness validation ships (#21). */
+export const Freshness = z.enum(["current", "stale", "unknown"]);
+export type Freshness = z.infer<typeof Freshness>;
 
 export const RecordId = z.string().regex(/^rec_[0-9a-f]{32}$/, "expected a record id like rec_<32 hex>");
 
@@ -167,13 +174,30 @@ export const ReadInput = z.strictObject({
   recordId: RecordId,
   maxTokens: MaxTokens.optional(),
   maxBytes: MaxBytes.optional(),
-  /** Resume point returned as `nextOffset` by a previous read (UTF-16 code units). */
+  /**
+   * Resume point returned as `nextOffset` by a previous read, in UTF-16 code units. An
+   * offset that falls inside a surrogate pair snaps back to the start of that code point.
+   */
   offset: z.int().min(0).default(0),
 });
 export type ReadInput = z.input<typeof ReadInput>;
 
 export const StatusInput = z.strictObject({});
 export type StatusInput = z.input<typeof StatusInput>;
+
+/**
+ * Every operation the memory module offers to agents, with its input schema. Adapters
+ * build their tool lists from this map (the single source of operation names).
+ */
+export const OPERATION_SCHEMAS = {
+  memory_bootstrap: BootstrapInput,
+  memory_recall: RecallInput,
+  memory_read: ReadInput,
+  memory_record: RecordInput,
+  memory_checkpoint: CheckpointInput,
+  memory_status: StatusInput,
+} as const;
+export type OperationName = keyof typeof OPERATION_SCHEMAS;
 
 /** Effective byte budget: the tighter of maxBytes and maxTokens × 4, defaulting to the default token budget. */
 export function effectiveBudget(input: { maxTokens?: number | undefined; maxBytes?: number | undefined }): {

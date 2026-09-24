@@ -1,6 +1,6 @@
 import { MemchorError } from "../errors.js";
 import { LIMITS, type Applicability, type ExternalRef } from "../schemas.js";
-import type { Db } from "../storage/database.js";
+import { type Db, requireTransaction } from "../storage/database.js";
 import { appendRecord } from "../storage/records.js";
 
 export interface CheckpointContent {
@@ -40,6 +40,7 @@ export function publishCheckpoint(
   content: CheckpointContent,
   applicability: Applicability,
 ): PublishedCheckpoint {
+  requireTransaction(db, "publishCheckpoint");
   const currentRevision = headRevision(db, scope.workstreamId);
   if (currentRevision !== expectedRevision) {
     throw new MemchorError(

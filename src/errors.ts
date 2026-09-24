@@ -8,7 +8,12 @@
 export const ERROR_CODES = [
   /** The process cwd is not inside a Git worktree, so no workspace can be derived. */
   "scope_unresolved",
-  /** More than one workstream could own this worktree; Memchor refuses to guess. */
+  /**
+   * More than one workstream could own this scope; Memchor refuses to guess. Not raised
+   * in #18 (an unbound worktree always gets its own workstream); reserved for the PRD §9.2
+   * steps that weigh session/imported-history bindings and task identity against the
+   * worktree binding, where genuine conflicts can occur.
+   */
   "scope_ambiguous",
   /** The target exists but belongs to another workstream. */
   "scope_denied",

@@ -21,16 +21,17 @@ The adapters contain no memory policy. The MCP server forwards raw tool argument
 | `record({kind, body, attribution, …})` | Appends one record with its links and search chunks; `operationKey` makes it idempotent |
 | `checkpoint({expectedRevision, goal, status, …})` | Appends revision `expectedRevision + 1` only if the head still equals `expectedRevision` |
 | `recall({query?, kinds?, maxTokens?, maxBytes?, continuation?})` | A bounded pack: head checkpoint first, then ranked eligible items |
-| `read({recordId, maxTokens?, maxBytes?, offset?})` | A slice of one visible record's body, with its visible links |
-| `status()` | Runtime, storage, scope and counts. Never throws for scope problems |
-| `rebuildSearchIndex()` / `checkIntegrity()` | Regenerate the derived index / read-only checks |
+| `read({recordId, maxTokens?, maxBytes?, offset?})` | A slice of one visible record's body, with its visible links. Offsets count UTF-16 code units; an offset inside a surrogate pair snaps back to that code point's start |
+| `status()` | Runtime, storage, the scope bootstrap *would* bind, and counts. Strictly read-only: no registry entry, rows or migrations. Never throws for scope or storage problems |
+| `rebuildSearchIndex()` | Regenerates the derived index inside one write transaction |
+| `checkIntegrity()` | Read-only `integrity_check`, `foreign_key_check` and FTS index-vs-content check. It reports a damaged, foreign or unmigrated file and never repairs or migrates it |
 
 **Scope** is resolved once per instance from the trusted `cwd`:
 
 1. Git toplevel and common dir give the workspace (id = hash of the common dir's realpath).
-2. For the workstream, an existing worktree binding wins.
-3. Otherwise the worktree adopts the single active workstream labelled with its branch. Two or more such workstreams is `scope_ambiguous`.
-4. Otherwise a new workstream is created.
+2. For the workstream, an existing worktree binding wins, whatever branch is checked out.
+3. Otherwise the worktree gets a new workstream, labelled with its branch. The branch is only a label and never selects another worktree's workstream (PRD §9.2).
+4. `bindScope` fails closed with `storage_unavailable` if the database's `workspaces` row names a different workspace id or repository key, for example when a registry entry points at another repository's database.
 
 Payload schemas are strict, so `workspaceId`, `cwd` and `path` are rejected.
 
@@ -53,7 +54,7 @@ Payload schemas are strict, so `workspaceId`, `cwd` and `path` are rejected.
 
 ## Transaction ordering
 
-Every write is one `BEGIN IMMEDIATE` transaction, so it never upgrades from reader to writer and cannot hit `SQLITE_BUSY_SNAPSHOT`. Inside it:
+Every write is one `BEGIN IMMEDIATE` transaction, so it never upgrades from reader to writer and cannot hit `SQLITE_BUSY_SNAPSHOT`. Helpers that rely on the caller's transaction assert `db.inTransaction`: `appendRecord`, `insertLinks`, `indexRecord`, `rebuildSearchIndex` and `publishCheckpoint`. Inside the transaction:
 
 - **`record`**: look up the operation key → insert the record → insert links (each target scope-checked) → insert chunks and FTS rows → insert the operation row.
 - **`checkpoint`**: look up the operation key (a replay wins over a conflict) → compare the head with `expectedRevision` → append the checkpoint record, its links and chunks → insert the `checkpoints` row → conditionally update `head_revision`.
@@ -62,20 +63,22 @@ Every write is one `BEGIN IMMEDIATE` transaction, so it never upgrades from read
 
 **Budgets.** A pack's size is the sum of the UTF-8 JSON bytes of the checkpoint and items, and never exceeds `min(maxBytes, 4 × maxTokens)`. Tokens are estimated as `ceil(bytes / 4)`.
 
-**Continuations** are HMAC-signed with a per-workspace secret and bound to the workspace, workstream, query, kinds and a `seq` snapshot.
+**Continuations** freeze the sequence. Page 1 ranks up to 500 eligible records, and the token carries the unreturned `seq`s in rank order. The token is HMAC-signed with a per-workspace secret and bound to the workspace, workstream, query and kinds. Later pages load records by `seq` and re-check scope and eligibility, without re-ranking. So writes between pages, which shift bm25 statistics, can neither reorder nor inject records, and no eligible page-1 record is skipped or repeated. Matches beyond the cap are reported as `candidate_limit`. This design keeps recall read-only, with no server-side snapshot table to expire.
+
+**Ranking caveat.** bm25's corpus statistics (IDF, average length) are computed by FTS5 over *all* chunks, including retracted and other-workstream records. Ineligible rows can therefore change scores, but never eligibility: they are filtered in the WHERE clause and cannot be returned, cited or counted.
 
 **Durability.** Connections run with `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON` and a bounded `busy_timeout` (default 5 s). The one-time switch to WAL retries when SQLite answers `SQLITE_BUSY` immediately.
 
 ## Runtime gate
 
-At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix for the [WAL-reset bug](https://sqlite.org/wal.html#walresetbug). It also requires FTS5: the compile option must be present and creating an FTS5 table must succeed. If either check fails, it throws `unsupported_runtime` with the version it found.
+At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix for the [WAL-reset bug](https://sqlite.org/wal.html#walresetbug). It also requires FTS5: the compile option must be present and creating an FTS5 table must succeed. If either check fails, it throws `unsupported_runtime` with the version it found. The rule is the pure function `assertSupportedRuntime`, which has no override. `memchor mcp` runs it at process start and exits non-zero with the message on stderr before serving. Every database open runs it again.
 
 ## Error codes
 
 | Code | Meaning |
 |---|---|
 | `scope_unresolved` | cwd is not inside a Git worktree |
-| `scope_ambiguous` | Several active workstreams could own this unbound worktree |
+| `scope_ambiguous` | Reserved and not raised in #18: an unbound worktree always gets its own workstream. It is meant for the later PRD §9.2 steps (session or imported-history bindings, task identity) |
 | `scope_denied` | The target belongs to another workstream |
 | `not_found` | Unknown or ineligible (e.g. retracted) record |
 | `invalid_input` | Schema violation, unknown key, oversized content, or a bad continuation |
@@ -83,7 +86,7 @@ At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix f
 | `checkpoint_conflict` | The head ≠ `expectedRevision`; `details.currentRevision` gives the head |
 | `storage_busy` | The busy timeout was exceeded (`retryable: true`) |
 | `storage_full` | The disk or database is full; nothing was acknowledged |
-| `storage_unavailable` | The database, registry or home cannot be used |
+| `storage_unavailable` | The database, registry or home cannot be used, or the database belongs to another workspace or repository |
 | `unsupported_runtime` | SQLite too old, no FTS5, or a database schema newer than this build |
 
 ## Migrations

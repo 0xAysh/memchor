@@ -27,6 +27,7 @@ describe("MCP protocol surface", () => {
 
   test("a payload carrying workspaceId or cwd is an invalid_input envelope", async () => {
     const server = await spawnServer({ cwd: initRepo(), home: tempDir() });
+    await server.ok("memory_bootstrap");
     for (const [tool, args] of [
       ["memory_record", { kind: "note", body: "x", attribution: "agent_inference", workspaceId: "ws_0000000000000000" }],
       ["memory_recall", { cwd: "/" }],
@@ -48,6 +49,20 @@ describe("MCP protocol surface", () => {
     expect(again).toEqual({ ...first, replayed: true });
     const conflict = await server.call("memory_record", { ...input, body: "different" });
     expect(conflict.structured).toMatchObject({ error: { code: "idempotency_conflict" } });
+  });
+
+  test("an operationKey replays across a real server restart", async () => {
+    const repo = initRepo();
+    const home = tempDir();
+    const input = { kind: "evidence", body: "survives restart", attribution: "direct_observation", operationKey: "restart-op" };
+    const first = await spawnServer({ cwd: repo, home, host: "claude-code" });
+    const original = await first.ok<RecordResult>("memory_record", input);
+    process.kill(first.pid, "SIGKILL");
+
+    const second = await spawnServer({ cwd: repo, home, host: "codex" });
+    expect(await second.ok<RecordResult>("memory_record", input)).toEqual({ ...original, replayed: true });
+    expect((await second.ok<StatusResult>("memory_status")).counts?.records).toBe(1);
+    expect((await second.call("memory_record", { ...input, body: "changed" })).structured).toMatchObject({ error: { code: "idempotency_conflict" } });
   });
 
   test("host comes from --host, else the MCP client name", async () => {

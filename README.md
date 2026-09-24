@@ -23,10 +23,12 @@ npm test            # builds dist/, then runs all suites against real SQLite, Gi
 
 ```sh
 memchor mcp [--host claude-code|codex|pi|unknown]   # MCP server over stdio (the host starts this)
-memchor diag status                                 # runtime (SQLite/FTS5), storage, scope, counts
+memchor diag status                                 # runtime (SQLite/FTS5), storage, scope, counts (read-only)
 memchor diag records [--query <text>] [--kind <k>]  # what agents can currently recall here
 memchor diag reindex                                # rebuild the search index from canonical records
-memchor diag integrity                              # SQLite, foreign-key and FTS integrity checks
+memchor diag integrity                              # SQLite, foreign-key and FTS integrity checks (read-only)
+memchor diag demo [--temp-home]                     # run the tracer flow here and print the pack
+                                                    # (writes demo records: set MEMCHOR_HOME or pass --temp-home)
 ```
 
 Scope always comes from the current directory's Git worktree. No command or tool accepts a workspace id or path.

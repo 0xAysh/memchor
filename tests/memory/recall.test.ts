@@ -154,6 +154,29 @@ describe("recall", () => {
     expect(ids).not.toContain(late.recordId);
   });
 
+  test("a query continuation never skips or duplicates page-1 items, even when heavy writes shift bm25 statistics", () => {
+    const memory = open(initRepo(), tempDir());
+    const pad = "filler ".repeat(60);
+    const existing = new Set<string>();
+    for (let i = 0; i < 6; i++) existing.add(memory.record({ kind: "note", body: `alpha ${i} ${pad}`, attribution: "agent_inference" }).recordId);
+    for (let i = 0; i < 6; i++) existing.add(memory.record({ kind: "note", body: `beta beta ${i} ${pad}`, attribution: "agent_inference" }).recordId);
+
+    const first = memory.recall({ query: "alpha beta", maxTokens: 300 });
+    expect(first.continuation).not.toBeNull();
+    const seen = first.items.map((i) => i.recordId);
+    // Make "beta" common so its IDF collapses and the live ranking reorders.
+    for (let i = 0; i < 60; i++) memory.record({ kind: "note", body: `beta common ${i}`, attribution: "agent_inference", applicability: { commit: "0000000" } });
+
+    let continuation = first.continuation;
+    while (continuation !== null) {
+      const page = memory.recall({ continuation, maxTokens: 300 });
+      seen.push(...page.items.map((i) => i.recordId));
+      continuation = page.continuation;
+    }
+    expect(seen).toHaveLength(12);
+    expect(new Set(seen)).toEqual(existing);
+  });
+
   test("a tampered or foreign continuation is invalid_input", () => {
     const repo = initRepo();
     const home = tempDir();
@@ -164,8 +187,8 @@ describe("recall", () => {
     const token = continuation ?? "";
 
     const [payload = "", signature = ""] = token.split(".");
-    const state = JSON.parse(Buffer.from(payload, "base64url").toString()) as { o: number };
-    const forged = Buffer.from(JSON.stringify({ ...state, o: 0 })).toString("base64url") + "." + signature;
+    const state = JSON.parse(Buffer.from(payload, "base64url").toString()) as { r: string };
+    const forged = Buffer.from(JSON.stringify({ ...state, r: state.r.split(",").slice(1).join(",") })).toString("base64url") + "." + signature;
     expect(catchMemchorError(() => memory.recall({ continuation: forged })).code).toBe("invalid_input");
     expect(catchMemchorError(() => memory.recall({ continuation: token.slice(0, -2) + "zz" })).code).toBe("invalid_input");
     expect(catchMemchorError(() => memory.recall({ continuation: token, query: "other" })).code).toBe("invalid_input");

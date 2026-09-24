@@ -33,13 +33,44 @@ describe("memchor CLI", () => {
     expect(JSON.parse(memchor(repo, home, "diag", "reindex").stdout)).toEqual({ records: 2, chunks: 4 });
     const integrity = memchor(repo, home, "diag", "integrity");
     expect(integrity.code).toBe(0);
-    expect(JSON.parse(integrity.stdout)).toEqual({ ok: true, sqlite: ["ok"], searchIndex: "ok", foreignKeyViolations: 0 });
+    expect(JSON.parse(integrity.stdout)).toMatchObject({ exists: true, schemaVersion: 1, ok: true, sqlite: ["ok"], searchIndex: "ok", foreignKeyViolations: 0 });
+  });
+
+  test("diag status is read-only: the first real bootstrap afterwards still creates the workstream", async () => {
+    const repo = initRepo();
+    const home = tempDir();
+    const status = memchor(repo, home, "diag", "status");
+    expect(status.code).toBe(0);
+    expect(JSON.parse(status.stdout)).toMatchObject({ scope: { workstreamId: null }, storage: { schemaVersion: null } });
+    const integrity = memchor(repo, home, "diag", "integrity");
+    expect(JSON.parse(integrity.stdout)).toMatchObject({ exists: false });
+
+    const server = await spawnServer({ cwd: repo, home, host: "codex" });
+    expect(await server.ok("memory_bootstrap")).toMatchObject({ created: { workspace: true, workstream: true } });
+  });
+
+  test("diag demo runs the tracer flow against MEMCHOR_HOME and prints the recalled pack", () => {
+    const repo = initRepo();
+    const home = tempDir();
+    const first = memchor(repo, home, "diag", "demo");
+    expect(first.code).toBe(0);
+    const pack = JSON.parse(first.stdout) as { checkpoint: { revision: number; citations: unknown[] }; items: { kind: string; citations: unknown[] }[]; empty: boolean };
+    expect(pack.empty).toBe(false);
+    expect(pack.checkpoint.revision).toBe(1);
+    expect(pack.checkpoint.citations).toHaveLength(2);
+    expect(pack.items.find((item) => item.kind === "decision")?.citations).toHaveLength(1);
+    expect(first.stderr).toContain(home);
+
+    // Re-running publishes the next revision rather than conflicting.
+    expect((JSON.parse(memchor(repo, home, "diag", "demo").stdout) as { checkpoint: { revision: number } }).checkpoint.revision).toBe(2);
   });
 
   test("errors are envelopes on stderr with a non-zero exit; usage errors exit 64", () => {
     const outside = memchor(tempDir("memchor-plain-"), tempDir(), "diag", "records");
     expect(outside.code).toBe(2);
-    expect(JSON.parse(outside.stderr)).toMatchObject({ error: { code: "scope_unresolved" } });
+    const [headline = "", ...envelope] = outside.stderr.split("\n");
+    expect(headline).toMatch(/^memchor: Memchor could not resolve a Git worktree/);
+    expect(JSON.parse(envelope.join("\n"))).toMatchObject({ error: { code: "scope_unresolved" } });
     expect(memchor(initRepo(), tempDir(), "mcp", "--host", "not-a-host").code).toBe(64);
     expect(memchor(initRepo(), tempDir(), "bogus").code).toBe(64);
   });

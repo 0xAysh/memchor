@@ -1,7 +1,7 @@
 import { MemchorError } from "../errors.js";
 import type { ExternalRef } from "../schemas.js";
-import type { Db } from "../storage/database.js";
-import { RECALL_ELIGIBLE_SQL, type RecordRow } from "./eligibility.js";
+import { type Db, requireTransaction } from "../storage/database.js";
+import { RECALL_ELIGIBLE_SQL, type RecordRow, VISIBLE_SQL } from "./eligibility.js";
 
 /**
  * Lexical search over the derived `chunks` / `chunks_fts` projection.
@@ -13,7 +13,7 @@ import { RECALL_ELIGIBLE_SQL, type RecordRow } from "./eligibility.js";
  */
 
 const CHUNK_BYTES = 1_000;
-/** Candidates fetched per page; far above what any budget can pack, so budgets, not this, bound a page. */
+/** Candidates loaded per page; far above what any budget can pack, so budgets, not this, bound a page. */
 export const PAGE_CANDIDATES = 200;
 const MAX_QUERY_TERMS = 32;
 
@@ -38,6 +38,7 @@ function chunksFor(record: IndexableRecord): { field: ChunkField; text: string }
 
 /** Adds a record's chunks to the projection. Call inside the transaction that inserts the record. */
 export function indexRecord(db: Db, record: IndexableRecord): void {
+  requireTransaction(db, "indexRecord");
   const insertChunk = db.prepare("INSERT INTO chunks (record_id, ordinal, field, text) VALUES (?, ?, ?, ?)");
   const insertFts = db.prepare("INSERT INTO chunks_fts (rowid, text) VALUES (?, ?)");
   chunksFor(record).forEach((chunk, ordinal) => {
@@ -51,6 +52,7 @@ export function indexRecord(db: Db, record: IndexableRecord): void {
  * Call inside a write transaction; canonical tables are only read.
  */
 export function rebuildSearchIndex(db: Db): { records: number; chunks: number } {
+  requireTransaction(db, "rebuildSearchIndex");
   db.exec("INSERT INTO chunks_fts (chunks_fts) VALUES ('delete-all'); DELETE FROM chunks;");
   const rows = db.prepare("SELECT id, title, body, external_refs FROM records ORDER BY seq").all() as {
     id: string;
@@ -80,74 +82,89 @@ export function toFtsQuery(query: string): string {
 }
 
 export interface Candidate extends RecordRow {
-  /** Best-matching body chunk (or the body start when the match was in the title or references). */
+  /** Best-matching body chunk for the query, else the body itself. */
   excerpt_source: string;
 }
+
+/**
+ * Upper bound on a recall sequence. Page 1 freezes at most this many ranked records;
+ * anything beyond is reported as omitted (`candidate_limit`), never silently dropped.
+ */
+export const SEQUENCE_CAP = 500;
 
 export interface RankRequest {
   workstreamId: string;
   /** Already converted with {@link toFtsQuery}; null lists recent records instead. */
   match: string | null;
   kinds: readonly string[] | null;
-  /** Snapshot bound: records created after the first page never enter the sequence. */
-  seqMax: number;
-  offset: number;
 }
 
 /**
- * One page of recall candidates in a total, deterministic order, plus the size of the
- * whole eligible sequence. Scope and eligibility are part of the WHERE clause, so they
- * apply before ORDER BY / LIMIT: ineligible rows can neither outrank nor displace
- * eligible ones.
+ * The frozen order of a recall sequence: record `seq`s in a total, deterministic order
+ * (capped at {@link SEQUENCE_CAP}), plus how many eligible records match in all.
+ * Scope and eligibility are part of the WHERE clause, so they apply before ORDER BY /
+ * LIMIT: ineligible rows can neither outrank nor displace eligible ones. (bm25's corpus
+ * statistics do include ineligible rows; that can change scores, never eligibility.)
  *
- * Order with a query: bm25 (best chunk per record), then newest first, then seq.
+ * Order with a query: bm25 of the best-matching chunk, then newest first, then seq.
  * Order without a query: newest first, then seq.
  */
-export function rankCandidates(db: Db, request: RankRequest): { rows: Candidate[]; total: number } {
+export function rankSequence(db: Db, request: RankRequest): { seqs: number[]; total: number } {
   const params = {
     workstreamId: request.workstreamId,
-    seqMax: request.seqMax,
     kinds: request.kinds === null ? null : JSON.stringify(request.kinds),
     match: request.match,
-    limit: PAGE_CANDIDATES,
-    offset: request.offset,
+    cap: SEQUENCE_CAP,
   };
-  const filters = `${RECALL_ELIGIBLE_SQL} AND r.seq <= $seqMax
-    AND ($kinds IS NULL OR r.kind IN (SELECT value FROM json_each($kinds)))`;
-
-  if (request.match === null) {
-    const from = `FROM records r WHERE ${filters}`;
-    const rows = db
-      .prepare(`SELECT r.*, r.body AS excerpt_source ${from} ORDER BY r.created_at DESC, r.seq DESC LIMIT $limit OFFSET $offset`)
-      .all(params) as Candidate[];
-    const { total } = db.prepare(`SELECT count(*) AS total ${from}`).get(params) as { total: number };
-    return { rows, total };
-  }
-
-  const ranked = `
-    WITH hits AS (
-      SELECT c.record_id, c.ordinal, c.field, bm25(chunks_fts) AS rank
-      FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid
-      WHERE chunks_fts MATCH $match
-    ), best AS (
-      SELECT record_id, ordinal, field, rank,
-             row_number() OVER (PARTITION BY record_id ORDER BY rank, ordinal) AS n
-      FROM hits
-    )
-    SELECT r.*, b.rank AS rank,
-           CASE WHEN b.field = 'body' THEN (SELECT text FROM chunks WHERE record_id = r.id AND ordinal = b.ordinal)
-                ELSE r.body END AS excerpt_source
-    FROM best b JOIN records r ON r.id = b.record_id
-    WHERE b.n = 1 AND ${filters}`;
-  const rows = db
-    .prepare(`${ranked} ORDER BY b.rank, r.created_at DESC, r.seq DESC LIMIT $limit OFFSET $offset`)
-    .all(params) as Candidate[];
+  const filters = `${RECALL_ELIGIBLE_SQL} AND ($kinds IS NULL OR r.kind IN (SELECT value FROM json_each($kinds)))`;
+  const ranked =
+    request.match === null
+      ? `SELECT r.seq AS seq, r.created_at AS created_at, 0 AS rank FROM records r WHERE ${filters}`
+      : // MATERIALIZED keeps bm25() evaluated in its full-text query rather than flattened into the aggregate.
+        `WITH chunk_hits AS MATERIALIZED (
+           SELECT c.record_id, bm25(chunks_fts) AS rank
+           FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid
+           WHERE chunks_fts MATCH $match
+         ),
+         hits AS (SELECT record_id, min(rank) AS rank FROM chunk_hits GROUP BY record_id)
+         SELECT r.seq AS seq, r.created_at AS created_at, h.rank AS rank
+         FROM hits h JOIN records r ON r.id = h.record_id WHERE ${filters}`;
+  const seqs = (
+    db.prepare(`SELECT seq FROM (${ranked}) ORDER BY rank, created_at DESC, seq DESC LIMIT $cap`).all(params) as { seq: number }[]
+  ).map((row) => row.seq);
   const { total } = db.prepare(`SELECT count(*) AS total FROM (${ranked})`).get(params) as { total: number };
-  return { rows, total };
+  return { seqs, total };
 }
 
-export function currentSeqMax(db: Db): number {
-  return (db.prepare("SELECT coalesce(max(seq), 0) AS n FROM records").get() as { n: number }).n;
+/**
+ * Loads the given records in the given order, re-applying scope and eligibility (a
+ * record that became ineligible since page 1 is dropped, never shown). With a query,
+ * `excerpt_source` is the best-matching body chunk.
+ */
+export function loadCandidates(db: Db, request: { workstreamId: string; match: string | null; seqs: readonly number[] }): Candidate[] {
+  if (request.seqs.length === 0) return [];
+  const params = { workstreamId: request.workstreamId, seqs: JSON.stringify(request.seqs), match: request.match };
+  const wanted = `wanted AS (SELECT CAST(value AS INTEGER) AS seq, key AS pos FROM json_each($seqs))`;
+  if (request.match === null) {
+    return db
+      .prepare(`WITH ${wanted} SELECT r.*, r.body AS excerpt_source FROM wanted w JOIN records r ON r.seq = w.seq WHERE ${VISIBLE_SQL} ORDER BY w.pos`)
+      .all(params) as Candidate[];
+  }
+  return db
+    .prepare(
+      `WITH ${wanted},
+       ids AS (SELECT r.id FROM wanted w JOIN records r ON r.seq = w.seq),
+       hits AS MATERIALIZED (
+         SELECT c.record_id, c.text, c.ordinal, bm25(chunks_fts) AS rank
+         FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid
+         WHERE chunks_fts MATCH $match AND c.field = 'body' AND c.record_id IN (SELECT id FROM ids)
+       ),
+       best AS (SELECT record_id, text, row_number() OVER (PARTITION BY record_id ORDER BY rank, ordinal) AS n FROM hits)
+       SELECT r.*, coalesce(b.text, r.body) AS excerpt_source
+       FROM wanted w JOIN records r ON r.seq = w.seq LEFT JOIN best b ON b.record_id = r.id AND b.n = 1
+       WHERE ${VISIBLE_SQL} ORDER BY w.pos`,
+    )
+    .all(params) as Candidate[];
 }
 
 function splitText(text: string, maxBytes: number): string[] {

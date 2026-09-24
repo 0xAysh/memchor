@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import { MemchorError } from "../errors.js";
@@ -25,9 +25,20 @@ export interface RuntimeReport {
 
 /** Inspects the embedded SQLite without touching any workspace database. */
 export function probeRuntime(): RuntimeReport {
+  return withMemoryDb(inspectRuntime);
+}
+
+/** Throws `unsupported_runtime` unless the embedded SQLite passes the gate (used at process start). */
+export function assertEmbeddedRuntime(): void {
+  withMemoryDb((db) => {
+    assertSupportedRuntime(runtimeFacts(db));
+  });
+}
+
+function withMemoryDb<T>(fn: (db: Db) => T): T {
   const db = new Database(":memory:");
   try {
-    return inspectRuntime(db);
+    return fn(db);
   } finally {
     db.close();
   }
@@ -49,16 +60,7 @@ export function openDatabase(path: string, options: { busyTimeoutMs?: number } =
   try {
     mkdirSync(dirname(path), { recursive: true });
     db = new Database(path, { timeout: busyTimeoutMs });
-    const runtime = inspectRuntime(db);
-    if (!runtime.supported) {
-      throw new MemchorError(
-        "unsupported_runtime",
-        runtime.fts5
-          ? `Embedded SQLite ${runtime.sqliteVersion} is too old; Memchor requires ${REQUIRED_SQLITE_VERSION} or newer (WAL-reset corruption fix). Reinstall Memchor with a newer better-sqlite3.`
-          : `Embedded SQLite ${runtime.sqliteVersion} was built without FTS5, which Memchor requires for search.`,
-        { details: { ...runtime } },
-      );
-    }
+    assertSupportedRuntime(runtimeFacts(db));
     db.pragma(`busy_timeout = ${busyTimeoutMs}`);
     assertSupportedSchema(db);
     const mode = enableWal(db, busyTimeoutMs);
@@ -147,51 +149,131 @@ export function toStorageError(error: unknown, path?: string): unknown {
   return error;
 }
 
+/**
+ * Opens an existing workspace database for inspection only: no migrations, no pragmas
+ * that write, no rows. Returns null when the file does not exist. (SQLite may still
+ * create its -wal/-shm housekeeping files next to a WAL database.)
+ */
+export function openReadOnly(path: string): Db | null {
+  if (!existsSync(path)) return null;
+  try {
+    return new Database(path, { readonly: true, fileMustExist: true });
+  } catch (error) {
+    throw toStorageError(error, path);
+  }
+}
+
 export interface IntegrityReport {
+  dbPath: string;
+  /** False when the workspace has no database yet (nothing to check). */
+  exists: boolean;
+  /** `PRAGMA user_version`; null when the file is missing or unreadable. */
+  schemaVersion: number | null;
   ok: boolean;
-  /** `PRAGMA integrity_check` rows; `["ok"]` when the file is sound. */
+  /** `PRAGMA integrity_check` rows (`["ok"]` when sound), or the error that prevented it. */
   sqlite: string[];
-  /** FTS5 'integrity-check' of chunks_fts against its content table: "ok" or the error. */
+  /** FTS5 'integrity-check' of chunks_fts against its content table: "ok", "absent", or the error. */
   searchIndex: string;
   foreignKeyViolations: number;
 }
 
-/** Read-only structural checks of a workspace database. */
-export function checkIntegrity(db: Db): IntegrityReport {
-  const sqlite = (db.pragma("integrity_check") as { integrity_check: string }[]).map((row) => row.integrity_check);
-  const foreignKeyViolations = (db.pragma("foreign_key_check") as unknown[]).length;
-  let searchIndex = "ok";
+/**
+ * Read-only structural checks of the database at `path`. Never migrates or repairs, and
+ * reports (rather than throws for) a damaged, foreign or unmigrated file.
+ */
+export function checkIntegrity(path: string): IntegrityReport {
+  const report: IntegrityReport = { dbPath: path, exists: existsSync(path), schemaVersion: null, ok: true, sqlite: [], searchIndex: "absent", foreignKeyViolations: 0 };
+  if (!report.exists) return report;
+  const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+  let db: Db | undefined;
   try {
-    // 'integrity-check' with rank 1 also verifies the index matches the external content table.
-    db.prepare("INSERT INTO chunks_fts (chunks_fts, rank) VALUES ('integrity-check', 1)").run();
+    db = new Database(path, { readonly: true, fileMustExist: true });
+    report.sqlite = (db.pragma("integrity_check") as { integrity_check: string }[]).map((row) => row.integrity_check);
+    report.schemaVersion = db.pragma("user_version", { simple: true }) as number;
+    report.foreignKeyViolations = (db.pragma("foreign_key_check") as unknown[]).length;
+    if (db.prepare("SELECT 1 FROM sqlite_schema WHERE name = 'chunks_fts'").get() !== undefined) {
+      // FTS5 spells its check as an INSERT command, which a read-only connection refuses;
+      // it modifies nothing. With rank = 1 it also verifies the index against `chunks`.
+      const checker = new Database(path, { fileMustExist: true });
+      try {
+        checker.prepare("INSERT INTO chunks_fts (chunks_fts, rank) VALUES ('integrity-check', 1)").run();
+        report.searchIndex = "ok";
+      } catch (error) {
+        report.searchIndex = describe(error);
+      } finally {
+        checker.close();
+      }
+    }
   } catch (error) {
-    searchIndex = error instanceof Error ? error.message : String(error);
+    report.sqlite = [describe(error)];
+  } finally {
+    db?.close();
   }
-  return {
-    ok: sqlite.length === 1 && sqlite[0] === "ok" && searchIndex === "ok" && foreignKeyViolations === 0,
-    sqlite,
-    searchIndex,
-    foreignKeyViolations,
-  };
+  report.ok =
+    report.sqlite.length === 1 && report.sqlite[0] === "ok" && report.foreignKeyViolations === 0 && ["ok", "absent"].includes(report.searchIndex);
+  return report;
+}
+
+/** Throws unless called inside an open transaction; guards helpers whose atomicity depends on the caller's. */
+export function requireTransaction(db: Db, what: string): void {
+  if (!db.inTransaction) throw new Error(`${what} must run inside the caller's write transaction`);
+}
+
+export interface RuntimeFacts {
+  sqliteVersion: string;
+  compileOptions: readonly string[];
+  /** Whether creating an FTS5 table actually succeeded. */
+  fts5Works: boolean;
+}
+
+/**
+ * The runtime gate as a pure function of what the embedded SQLite reports. Throws
+ * `unsupported_runtime` with the found and required versions; no override exists.
+ */
+export function assertSupportedRuntime(facts: RuntimeFacts): void {
+  const details = { sqliteVersion: facts.sqliteVersion, requiredSqliteVersion: REQUIRED_SQLITE_VERSION };
+  if (compareVersions(facts.sqliteVersion, REQUIRED_SQLITE_VERSION) < 0) {
+    throw new MemchorError(
+      "unsupported_runtime",
+      `Embedded SQLite ${facts.sqliteVersion} is too old; Memchor requires ${REQUIRED_SQLITE_VERSION} or newer (fix for the WAL-reset corruption bug, https://sqlite.org/wal.html#walresetbug). Reinstall Memchor so better-sqlite3 bundles a newer SQLite.`,
+      { details },
+    );
+  }
+  if (!facts.compileOptions.includes("ENABLE_FTS5") || !facts.fts5Works) {
+    throw new MemchorError("unsupported_runtime", `Embedded SQLite ${facts.sqliteVersion} lacks a working FTS5, which Memchor requires for search.`, {
+      details,
+    });
+  }
+}
+
+function runtimeFacts(db: Db): RuntimeFacts {
+  const sqliteVersion = (db.prepare("select sqlite_version() as v").get() as { v: string }).v;
+  const compileOptions = (db.pragma("compile_options") as { compile_options: string }[]).map((row) => row.compile_options);
+  let fts5Works = false;
+  if (compileOptions.includes("ENABLE_FTS5")) {
+    try {
+      db.exec("CREATE VIRTUAL TABLE temp.memchor_fts5_probe USING fts5(x); DROP TABLE temp.memchor_fts5_probe;");
+      fts5Works = true;
+    } catch {
+      fts5Works = false;
+    }
+  }
+  return { sqliteVersion, compileOptions, fts5Works };
 }
 
 function inspectRuntime(db: Db): RuntimeReport {
-  const sqliteVersion = (db.prepare("select sqlite_version() as v").get() as { v: string }).v;
-  const options = (db.pragma("compile_options") as { compile_options: string }[]).map((row) => row.compile_options);
-  let fts5 = options.includes("ENABLE_FTS5");
-  if (fts5) {
-    try {
-      // The compile option says FTS5 was built in; creating a table proves it works.
-      db.exec("CREATE VIRTUAL TABLE temp.memchor_fts5_probe USING fts5(x); DROP TABLE temp.memchor_fts5_probe;");
-    } catch {
-      fts5 = false;
-    }
+  const facts = runtimeFacts(db);
+  let supported = true;
+  try {
+    assertSupportedRuntime(facts);
+  } catch {
+    supported = false;
   }
   return {
-    sqliteVersion,
+    sqliteVersion: facts.sqliteVersion,
     requiredSqliteVersion: REQUIRED_SQLITE_VERSION,
-    fts5,
-    supported: fts5 && compareVersions(sqliteVersion, REQUIRED_SQLITE_VERSION) >= 0,
+    fts5: facts.fts5Works && facts.compileOptions.includes("ENABLE_FTS5"),
+    supported,
   };
 }
 

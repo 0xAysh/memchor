@@ -33,18 +33,18 @@ export function resolveHome(home: string | undefined): string {
 }
 
 /**
- * cwd → Git worktree → repository identity → workspace.
+ * cwd → Git worktree → repository identity → workspace, without writing anything.
  *
  * Invariants:
  * - Only reads the repository (`git rev-parse` family with optional locks disabled);
- *   every file Memchor writes lives under `home`.
+ *   every file Memchor writes lives under `home`, and only {@link registerWorkspace} writes.
  * - The workspace id is a pure function of the repository key, so two processes that
  *   first-bootstrap the same repository concurrently converge on the same id even if
  *   one registry write is lost to the other's rename. The registry records the mapping
  *   (and the root commit) so a later slice can re-point a moved repository.
  * - A corrupt registry fails closed (`storage_unavailable`); it is never overwritten.
  */
-export function resolveWorkspace(cwd: string, home: string): WorkspaceLocation {
+export function locateWorkspace(cwd: string, home: string): WorkspaceLocation & { registered: boolean } {
   // One spawn for both paths; --show-toplevel fails outside a worktree (and in bare repos).
   const [topLevel, commonDir] = gitOrScopeError(cwd, ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]).split("\n");
   if (topLevel === undefined || commonDir === undefined) {
@@ -56,29 +56,43 @@ export function resolveWorkspace(cwd: string, home: string): WorkspaceLocation {
   const rootCommit = tryGit(worktree, ["rev-list", "--max-parents=0", "HEAD"])?.split("\n").sort()[0] ?? null;
 
   try {
-    const registryPath = join(home, "registry.json");
-    const registry = readRegistry(registryPath);
-    const existing = registry.repositories[repositoryKey];
+    const existing = readRegistry(join(home, "registry.json")).repositories[repositoryKey];
     const workspaceId = existing?.workspaceId ?? `ws_${createHash("sha256").update(repositoryKey).digest("hex").slice(0, 16)}`;
     const label = existing?.label ?? basename(basename(repositoryKey) === ".git" ? dirname(repositoryKey) : repositoryKey);
-    const workspaceDir = join(home, "workspaces", workspaceId);
-    const dbPath = join(workspaceDir, "memory.sqlite");
-    const isNew = !existsSync(dbPath);
+    const dbPath = join(home, "workspaces", workspaceId, "memory.sqlite");
+    return { workspaceId, label, repositoryKey, rootCommit, worktree, branch, home, dbPath, isNew: !existsSync(dbPath), registered: existing !== undefined };
+  } catch (error) {
+    throw toStorageError(error, home);
+  }
+}
 
-    if (existing === undefined) {
-      registry.repositories[repositoryKey] = { workspaceId, label, rootCommit, registeredAt: new Date().toISOString() };
+/** Records the workspace in the registry and writes its config.json, if missing (atomic writes). */
+export function registerWorkspace(location: WorkspaceLocation & { registered: boolean }): void {
+  try {
+    if (!location.registered) {
+      const registryPath = join(location.home, "registry.json");
+      const registry = readRegistry(registryPath);
+      registry.repositories[location.repositoryKey] ??= {
+        workspaceId: location.workspaceId,
+        label: location.label,
+        rootCommit: location.rootCommit,
+        registeredAt: new Date().toISOString(),
+      };
       writeFileAtomic(registryPath, JSON.stringify(registry, null, 2) + "\n");
     }
-    const configPath = join(workspaceDir, "config.json");
+    const configPath = join(dirname(location.dbPath), "config.json");
     if (!existsSync(configPath)) {
       writeFileAtomic(
         configPath,
-        JSON.stringify({ workspaceId, label, repositoryKey, createdAt: new Date().toISOString() }, null, 2) + "\n",
+        JSON.stringify(
+          { workspaceId: location.workspaceId, label: location.label, repositoryKey: location.repositoryKey, createdAt: new Date().toISOString() },
+          null,
+          2,
+        ) + "\n",
       );
     }
-    return { workspaceId, label, repositoryKey, rootCommit, worktree, branch, home, dbPath, isNew };
   } catch (error) {
-    throw toStorageError(error, home);
+    throw toStorageError(error, location.home);
   }
 }
 

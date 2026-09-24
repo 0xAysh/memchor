@@ -8,7 +8,7 @@ import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError, typ
 import { z } from "zod";
 import { MemchorError } from "../errors.js";
 import { type Memory, openMemory } from "../memory.js";
-import { BootstrapInput, CheckpointInput, ReadInput, RecallInput, RecordInput, StatusInput } from "../schemas.js";
+import { OPERATION_SCHEMAS, type OperationName } from "../schemas.js";
 
 /**
  * Thin MCP adapter over the memory module. It holds no memory policy: it forwards raw
@@ -25,54 +25,50 @@ const INSTRUCTIONS = `Memchor is local working memory shared by the coding agent
 - An empty or partial pack is an honest miss: do not invent prior context. Report storage errors and conflicts to the user.`;
 
 interface ToolSpec {
-  schema: z.ZodType;
   description: string;
   run: (memory: Memory, args: unknown) => object;
 }
 
+// One entry per operation in OPERATION_SCHEMAS (the compiler enforces completeness).
 // Arguments are passed through untyped: the module's own `parse` is the only validation.
-const TOOLS: Record<string, ToolSpec> = {
+const TOOLS: Record<OperationName, ToolSpec> = {
   memory_bootstrap: {
-    schema: BootstrapInput,
     description:
       "Call first in every session. Resolves this repository's workspace and workstream (never from arguments), and returns the head checkpoint plus recent memory, or an honest empty result.",
     run: (memory, args) => memory.bootstrap(args as never),
   },
   memory_recall: {
-    schema: RecallInput,
     description:
       "Return a bounded, cited context pack: the head checkpoint first, then eligible records ranked for the query. Respects maxTokens/maxBytes; follow `continuation` for more. Items carry recordIds, citations, attribution and freshness; verify live artifacts before acting on them.",
     run: (memory, args) => memory.recall(args as never),
   },
   memory_read: {
-    schema: ReadInput,
     description: "Expand one record by recordId within a byte/token budget; continue with nextOffset. Other workstreams' and retracted records are refused.",
     run: (memory, args) => memory.read(args as never),
   },
   memory_record: {
-    schema: RecordInput,
     description:
       "Store one attributed piece of working knowledge (evidence, decision, attempt, preference, constraint, question, next_step, note, reference). Store knowledge about artifacts and point to them with externalRefs; never paste whole files. Cite evidence with supportedBy. Use operationKey to make retries safe. Do not re-record recalled memory.",
     run: (memory, args) => memory.record(args as never),
   },
   memory_checkpoint: {
-    schema: CheckpointInput,
     description:
       "Publish the workstream's continuation state (goal, status, decisions, failed attempts, open questions, next steps) before finishing. Compare-and-swap: pass expectedRevision = the headRevision you last read; a checkpoint_conflict means someone else published first, so recall and reconcile.",
     run: (memory, args) => memory.checkpoint(args as never),
   },
   memory_status: {
-    schema: StatusInput,
     description: "Report Memchor health: embedded SQLite/FTS5 runtime, schema version, database path, resolved scope, counts and capabilities.",
     run: (memory, args) => memory.status(args as never),
   },
 };
 
-const TOOL_LIST = Object.entries(TOOLS).map(([name, spec]) => {
-  const inputSchema = z.toJSONSchema(spec.schema, { io: "input" }) as { type: "object"; [key: string]: unknown };
+const TOOL_LIST = (Object.keys(OPERATION_SCHEMAS) as OperationName[]).map((name) => {
+  const inputSchema = z.toJSONSchema(OPERATION_SCHEMAS[name], { io: "input" }) as { type: "object"; [key: string]: unknown };
   delete inputSchema["$schema"];
-  return { name, description: spec.description, inputSchema };
+  return { name, description: TOOLS[name].description, inputSchema };
 });
+
+const isOperation = (name: string): name is OperationName => Object.hasOwn(OPERATION_SCHEMAS, name);
 
 export interface McpServerOptions {
   cwd: string;
@@ -101,8 +97,9 @@ export function createMcpServer(options: McpServerOptions): { server: Server; cl
 
   server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: TOOL_LIST }));
   server.setRequestHandler(CallToolRequestSchema, (request): CallToolResult => {
-    const spec = TOOLS[request.params.name];
-    if (spec === undefined) throw new McpError(ErrorCode.InvalidParams, `Unknown tool ${request.params.name}`);
+    const name = request.params.name;
+    if (!isOperation(name)) throw new McpError(ErrorCode.InvalidParams, `Unknown tool ${name}`);
+    const spec = TOOLS[name];
     try {
       const result = spec.run(getMemory(), request.params.arguments ?? {}) as Record<string, unknown>;
       return { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result };

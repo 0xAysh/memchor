@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { openMemory, type Memory } from "../../src/memory.js";
@@ -108,31 +108,8 @@ describe("scope", () => {
   });
 });
 
-describe("ambiguous scope", () => {
-  test("an unbound worktree with two active candidate workstreams fails closed with scope_ambiguous", async () => {
-    const { default: Database } = await import("better-sqlite3");
-    const repo = initRepo({ branch: "feat" });
-    const home = tempDir();
-    const memory = open(repo, home);
-    memory.bootstrap();
-    const dbPath = memory.status().storage.dbPath;
-    memory.close();
-    // Fixture: a second active workstream with the same label, as a later slice's
-    // "start a separate workstream" operation could create.
-    const db = new Database(dbPath ?? "");
-    db.prepare("INSERT INTO workstreams (id, label, created_at) VALUES ('wst_fixture', 'feat', ?)").run(new Date().toISOString());
-    db.close();
-
-    git(repo, "checkout", "--quiet", "-b", "elsewhere");
-    const worktree = join(tempDir("memchor-wt-"), "wt");
-    git(repo, "worktree", "add", "--quiet", worktree, "feat");
-
-    const error = catchMemchorError(() => open(worktree, home).bootstrap());
-    expect(error.code).toBe("scope_ambiguous");
-    expect(error.details["candidates"]).toHaveLength(2);
-  });
-
-  test("an unbound worktree adopts the single active workstream labelled with its branch", () => {
+describe("workstream binding", () => {
+  test("an unbound worktree gets its own workstream even when another workstream carries its branch label", () => {
     const repo = initRepo({ branch: "feat" });
     const home = tempDir();
     const original = open(repo, home).bootstrap();
@@ -140,8 +117,33 @@ describe("ambiguous scope", () => {
     const worktree = join(tempDir("memchor-wt-"), "wt");
     git(repo, "worktree", "add", "--quiet", worktree, "feat");
 
-    const adopted = open(worktree, home).bootstrap();
-    expect(adopted.scope.workstreamId).toBe(original.scope.workstreamId);
-    expect(adopted.created.workstream).toBe(false);
+    const fresh = open(worktree, home).bootstrap();
+    expect(fresh.scope.workspaceId).toBe(original.scope.workspaceId);
+    expect(fresh.scope.workstreamId).not.toBe(original.scope.workstreamId);
+    expect(fresh.scope.workstreamLabel).toBe("feat");
+    expect(fresh.created.workstream).toBe(true);
+  });
+});
+
+describe("workspace identity", () => {
+  test("a registry entry pointing at another repository's database fails closed and leaves that database untouched", () => {
+    const home = tempDir();
+    const repoA = initRepo();
+    const a = open(repoA, home);
+    a.record({ kind: "note", body: "belongs to A", attribution: "agent_inference" });
+    const workspaceA = a.status().scope?.workspaceId ?? "";
+    a.close();
+
+    const repoB = initRepo();
+    const registryPath = join(home, "registry.json");
+    const registry = JSON.parse(readFileSync(registryPath, "utf8")) as { repositories: Record<string, unknown> };
+    registry.repositories[realpathSync(join(repoB, ".git"))] = { workspaceId: workspaceA, label: "b", rootCommit: null, registeredAt: "now" };
+    writeFileSync(registryPath, JSON.stringify(registry));
+
+    const error = catchMemchorError(() => open(repoB, home).bootstrap());
+    expect(error.code).toBe("storage_unavailable");
+    expect(error.message).toMatch(/different repository/);
+    const again = open(repoA, home).status();
+    expect(again.counts).toMatchObject({ records: 1, sessions: 1, workstreams: 1 });
   });
 });
