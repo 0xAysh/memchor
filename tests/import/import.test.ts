@@ -1,7 +1,10 @@
-import { appendFileSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { fork, type ChildProcess } from "node:child_process";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, utimesSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, test } from "vitest";
 import { openMemory, type Memory } from "../../src/memory.js";
+import type { TranscriptAdapter } from "../../src/import/normalized-event.js";
 import { git, initRepo, onCleanup, tempDir } from "../helpers.js";
 import { claudeConfigDir, installTranscript, renderFixture } from "./fixtures.js";
 
@@ -12,6 +15,15 @@ interface Env {
 
 function env(): Env {
   return { home: tempDir(), config: claudeConfigDir() };
+}
+
+const CONSENT_WRITER = resolve(import.meta.dirname, "consent-writer.mjs");
+
+function nextMessage(child: ChildProcess): Promise<unknown> {
+  return new Promise((resolveMessage, reject) => {
+    child.once("message", resolveMessage);
+    child.once("error", reject);
+  });
 }
 
 function open(cwd: string, e: Env, options: { host?: string; importBudgetMs?: number } = {}): Memory {
@@ -108,6 +120,60 @@ describe("first-use consent", () => {
     const second = open(repo, e);
     expect(second.bootstrap().import).toMatchObject({ state: "declined", question: null });
     expect(second.status().counts?.records).toBe(1);
+  });
+
+  test("bootstrap and status do not discover or inspect transcript heads after consent is none", () => {
+    const repo = initRepo();
+    const untouched = (): never => { throw new Error("declined transcript adapter was touched"); };
+    const adapter: TranscriptAdapter = {
+      host: "privacy-test",
+      displayName: "Privacy Test",
+      compatibility: [],
+      root: "/must-not-be-read",
+      discover: untouched,
+      inspect: untouched,
+      read: untouched,
+    };
+    const memory = openMemory({ cwd: repo, home: tempDir(), host: adapter.host, transcriptAdapter: adapter });
+    onCleanup(() => { memory.close(); });
+
+    expect(memory.bootstrap({ importChoice: "none" }).import).toMatchObject({ state: "declined", transcripts: null });
+    expect(memory.bootstrap().import).toMatchObject({ state: "declined", transcripts: null });
+    expect(memory.status().import).toMatchObject({ state: "declined", transcripts: null });
+  });
+
+  test("concurrent current-project choices in two processes preserve both repository approvals", async () => {
+    const home = tempDir();
+    const repositories = [initRepo(), initRepo()];
+    const repositoryKeys = repositories.map((repo) => realpathSync(join(repo, ".git")));
+    // A realistic lock test needs both processes inside the read-modify-write window at once.
+    // A large existing approval set makes that overlap deterministic even on a single-core runner.
+    const seededProjects = Array.from({ length: 100_000 }, (_, index) => `/seed/repository/${index.toString().padStart(6, "0")}`);
+    writeFileSync(
+      join(home, "consent.json"),
+      JSON.stringify({
+        version: 1,
+        hosts: {
+          "claude-code": {
+            choice: "current_project",
+            projects: seededProjects,
+            decidedAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      }),
+    );
+
+    const children = repositories.map(() => fork(CONSENT_WRITER, [], { stdio: ["ignore", "ignore", "pipe", "ipc"] }));
+    for (const child of children) onCleanup(() => child.kill());
+    await Promise.all(children.map(nextMessage));
+    const outcomes = children.map(nextMessage);
+    children.forEach((child, index) => child.send({ home, repositoryKey: repositoryKeys[index] }));
+    expect(await Promise.all(outcomes)).toEqual([{ ok: true }, { ok: true }]);
+
+    const stored = JSON.parse(readFileSync(join(home, "consent.json"), "utf8")) as { hosts: { "claude-code": { projects: string[] } } };
+    expect(stored.hosts["claude-code"].projects).toEqual(expect.arrayContaining(repositoryKeys));
+    expect(stored.hosts["claude-code"].projects).toHaveLength(seededProjects.length + 2);
   });
 
   test("the consent decision is per host, inspectable in status and changeable through bootstrap", () => {
@@ -250,6 +316,31 @@ describe("reconciliation", () => {
     expect(boot.import.currentProject).toMatchObject({ complete: 1, counters: { rewrites: 1, missing: 6, replayed: 1 } });
     expect(recordCount(second)).toBe(7);
   });
+
+  test("a same-length early edit before the trailing anchor forces an explicit reconciliation pass", () => {
+    const e = env();
+    const repo = initRepo();
+    const t = installTranscript(e.config, "2.1.281/basic.jsonl", { cwd: repo });
+    const first = open(repo, e);
+    first.bootstrap({ importChoice: "current_project" });
+    first.close();
+
+    const before = readFileSync(t.path, "utf8");
+    const after = before.replace("Checkout double-charges", "Checkout triple-charges");
+    expect(Buffer.byteLength(after)).toBe(Buffer.byteLength(before));
+    expect(before.indexOf("Checkout double-charges")).toBeLessThan(before.length - 4_096);
+    writeFileSync(t.path, after);
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(t.path, later, later);
+
+    const second = open(repo, e);
+    const boot = second.bootstrap();
+    expect(boot.import.currentProject).toMatchObject({
+      complete: 1,
+      counters: { rewrites: 1, conflicts: 1, missing: 0, replayed: 11 },
+    });
+    expect(second.recall({ query: "triple charges" }).items[0]?.citations).toHaveLength(1);
+  });
 });
 
 describe("capture safety", () => {
@@ -307,6 +398,65 @@ describe("capture safety", () => {
     expect(body).toMatch(/\[… [\d,]+ bytes omitted by Memchor …\]\n.*BUILD-TAIL$/s);
     expect(Buffer.byteLength(body)).toBeLessThan(2_000);
     expect(boot.import.currentProject?.counters).toMatchObject({ clipped: 2, withheld: 1, redactions: 2 });
+  });
+
+  test("tool-call bookkeeping never persists raw secrets, oversized inputs, credential URLs or sensitive paths", () => {
+    const e = env();
+    const repo = initRepo();
+    const sessionId = "77777777-7777-4777-8777-777777777777";
+    const bashSecret = "sk-live-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
+    const unknownSecret = "password=UNKNOWN-TOOL-PASSWORD-123456";
+    const unknownHead = "UNKNOWN-RAW-HEAD-MUST-NOT-PERSIST";
+    const oversizedSecret = "OVERSIZED-INTERIOR-PAYLOAD-MUST-NOT-PERSIST";
+    const unknownTail = "UNKNOWN-RAW-TAIL-MUST-NOT-PERSIST";
+    const commandPrefix = "SENSITIVE-COMMAND-PREFIX-MUST-NOT-PERSIST";
+    const commandSuffix = "SENSITIVE-COMMAND-SUFFIX-MUST-NOT-PERSIST";
+    const credentialUrl = "https://alice:URL-PASSWORD-123456@example.invalid/private?token=URL-TOKEN-123456";
+    const sensitivePath = "/home/alice/.ssh/id_ed25519";
+    const huge = `${unknownHead}${"x".repeat(2_000)}${oversizedSecret}${"y".repeat(2_000)}${unknownTail}`;
+    const base = { timestamp: "2026-09-23T09:00:00.000Z", cwd: repo, sessionId, version: "2.1.281", gitBranch: "main" };
+    const assistant = (uuid: string, id: string, name: string, input: object): string => JSON.stringify({ ...base, type: "assistant", uuid, message: { content: [{ type: "tool_use", id, name, input }] } });
+    const result = (uuid: string, id: string, content: string): string => JSON.stringify({ ...base, type: "user", uuid, origin: { kind: "human" }, message: { content: [{ type: "tool_result", tool_use_id: id, content }] } });
+    const content = [
+      assistant("call-1", "toolu-private-1", "Bash", { command: `${commandPrefix}; export API_KEY=${bashSecret}; ${commandSuffix}` }),
+      result("result-1", "toolu-private-1", "command completed usefully without echoing its arguments"),
+      assistant("call-2", "toolu-private-2", "UnknownTool", { payload: unknownSecret, huge }),
+      result("result-2", "toolu-private-2", "unknown tool completed usefully"),
+      assistant("call-3", "toolu-private-3", "WebFetch", { url: credentialUrl }),
+      result("result-3", "toolu-private-3", "web fetch completed usefully"),
+      assistant("call-4", "toolu-private-4", "Read", { file_path: sensitivePath }),
+      result("result-4", "toolu-private-4", "SENSITIVE-FILE-DUMP-MUST-NOT-PERSIST"),
+    ].join("\n") + "\n";
+    installTranscript(e.config, "", { cwd: repo, sessionId, content });
+
+    const memory = open(repo, e);
+    const boot = memory.bootstrap({ importChoice: "current_project" });
+    expect(boot.import.currentProject?.counters).toMatchObject({ records: 4, withheld: 1 });
+    const visible = visibleText(memory);
+    expect(visible).toMatch(/command completed usefully|unknown tool completed usefully|web fetch completed usefully/);
+    expect(visible).toContain("Bash [sensitive arguments withheld]");
+    expect(visible).toContain("UnknownTool [arguments omitted]");
+    const dbPath = memory.status().storage.dbPath ?? "";
+    memory.close();
+
+    const forbidden = [
+      bashSecret,
+      commandPrefix,
+      commandSuffix,
+      unknownSecret,
+      unknownHead,
+      oversizedSecret,
+      unknownTail,
+      credentialUrl,
+      sensitivePath,
+      "SENSITIVE-FILE-DUMP-MUST-NOT-PERSIST",
+    ];
+    const db = new Database(dbPath, { readonly: true });
+    const tables = (db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[]).map((row) => row.name);
+    const canonical = tables.map((table) => JSON.stringify(db.prepare(`SELECT * FROM ${table}`).all())).join("\n");
+    db.close();
+    for (const value of forbidden) expect(canonical).not.toContain(value);
+    expect(Buffer.byteLength(canonical)).toBeLessThan(100_000);
   });
 
   test("Memchor output echoed in a transcript keeps its references to existing records and is never new evidence", () => {
@@ -383,6 +533,26 @@ describe("capture safety", () => {
     expect(again.bootstrap().import.currentProject).toMatchObject({ stopped: 1, counters: { records: 5, replayed: 0 } });
   });
 
+  test("a versionless content entry stops import at that line and reports a compatibility gap", () => {
+    const e = env();
+    const repo = initRepo();
+    const sessionId = "88888888-8888-4888-8888-888888888888";
+    const before = JSON.stringify({ type: "user", uuid: "before", timestamp: "2026-09-23T10:00:00.000Z", cwd: repo, sessionId, version: "2.1.281", origin: { kind: "human" }, message: { content: "Imported before the format gap." } });
+    const gap = JSON.stringify({ type: "user", uuid: "gap", timestamp: "2026-09-23T10:00:01.000Z", cwd: repo, sessionId, origin: { kind: "human" }, message: { content: "Must remain beyond the cursor." } });
+    installTranscript(e.config, "", { cwd: repo, sessionId, content: `${before}\n${gap}\n` });
+
+    const memory = open(repo, e);
+    const boot = memory.bootstrap({ importChoice: "current_project" });
+    expect(boot.import.currentProject).toMatchObject({ stopped: 1, counters: { records: 1, excluded: {} } });
+    expect(boot.import.gaps).toEqual([expect.objectContaining({ reason: "unsupported_version", hostVersion: "missing" })]);
+    expect(visibleText(memory)).toContain("Imported before the format gap.");
+    expect(visibleText(memory)).not.toContain("Must remain beyond the cursor.");
+    memory.close();
+
+    const again = open(repo, e).bootstrap();
+    expect(again.import.currentProject).toMatchObject({ stopped: 1, counters: { records: 1, replayed: 0 } });
+  });
+
   test("malformed lines are skipped and counted; a line still being written is imported once it is complete", () => {
     const e = env();
     const repo = initRepo();
@@ -394,7 +564,9 @@ describe("capture safety", () => {
     });
     memory.close();
 
-    appendFileSync(t.path, 'ten","origin":"x"},"uuid":"00000000-0000-4000-8000-000000000305"}\n'.replace('"origin":"x"}', '"x":1}'));
+    // Complete the partial object with a supported version; it is still malformed because
+    // timestamp/cwd are absent, so it is skipped rather than becoming a format gap.
+    appendFileSync(t.path, 'ten"},"uuid":"00000000-0000-4000-8000-000000000305","version":"2.1.281"}\n');
     appendFileSync(t.path, JSON.stringify({ type: "user", uuid: "00000000-0000-4000-8000-000000000306", timestamp: "2026-09-23T08:00:04.000Z", cwd: repo, sessionId: t.sessionId, version: "2.1.281", message: { role: "user", content: "A complete zebracorn message after the partial one." } }) + "\n");
     const again = open(repo, e);
     const boot = again.bootstrap();

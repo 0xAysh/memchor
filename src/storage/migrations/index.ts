@@ -2,13 +2,14 @@ import type BetterSqlite3 from "better-sqlite3";
 import { MemchorError } from "../../errors.js";
 import * as initial from "./0001-initial.js";
 import * as transcriptImport from "./0002-transcript-import.js";
+import * as importSourceFingerprint from "./0003-import-source-fingerprint.js";
 
 /**
  * Ordered schema migrations. Entry `i` upgrades `PRAGMA user_version` from `i` to `i + 1`.
  * Append only: a shipped migration is never edited, because databases in the field
  * have already applied it.
  */
-const MIGRATIONS: readonly string[] = [initial.sql, transcriptImport.sql];
+const MIGRATIONS: readonly string[] = [initial.sql, transcriptImport.sql, importSourceFingerprint.sql];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
 

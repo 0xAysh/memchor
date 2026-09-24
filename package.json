@@ -15,6 +15,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
+    "benchmark:import": "npm run build --silent && node scripts/benchmark-synthetic-import.mjs",
     "snapshot:transcripts": "node scripts/snapshot-real-transcripts.mjs"
   },
   "dependencies": {
