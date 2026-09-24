@@ -1,11 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import type { BootstrapResult, CheckpointResult, ContextPack, PackItem, ReadResult, RecordResult } from "../../src/memory.js";
 import { git, tempDir } from "../helpers.js";
 import { claudeConfigDir, codexHome, codexThreadId, installCodexRollout, installTranscript, renderCodexFixture } from "../import/fixtures.js";
 import { spawnServer, type ServerHandle } from "../mcp/harness.js";
+import { writeArtifact } from "./artifacts.js";
 
 /**
  * The central V1 story (issue #20, PRD §18 "Handoff"), proved across real processes: separate
@@ -14,8 +14,6 @@ import { spawnServer, type ServerHandle } from "../mcp/harness.js";
  * server runs with the no-network preload. The packs these tests see are written, with temporary
  * paths replaced by placeholders, to the git-ignored `tests/mcp/__artifacts__/handoff/` as PR evidence.
  */
-
-const ARTIFACTS = join(import.meta.dirname, "../mcp/__artifacts__/handoff");
 
 /** Claude's root-cause message in `2.1.281/basic.jsonl`, repeated verbatim by Codex in `0.148.0-alpha.21/handoff.jsonl`. */
 const ROOT_CAUSE = "Root cause: charge() retries a 504 up to three times without an idempotency key, so the gateway settles the first attempt and the retry charges again.";
@@ -39,16 +37,6 @@ function storeRepo(name = "store"): string {
 
 function networkLogIsEmpty(path: string): boolean {
   return (existsSync(path) ? readFileSync(path, "utf8") : "") === "";
-}
-
-/** Writes an evidence artifact with every temporary path replaced by a placeholder. */
-function writeArtifact(name: string, value: unknown, placeholders: [string, string][]): void {
-  let text = JSON.stringify(value, null, 2);
-  const tmp = realpathSync(tmpdir());
-  for (const [path, label] of [...placeholders].sort((a, b) => b[0].length - a[0].length)) text = text.replaceAll(path, label);
-  text = text.replaceAll(tmp, "<tmp>");
-  mkdirSync(ARTIFACTS, { recursive: true });
-  writeFileSync(join(ARTIFACTS, `${name}.json`), `${text}\n`);
 }
 
 function item(pack: ContextPack, body: string, host?: string): PackItem {

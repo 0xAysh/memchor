@@ -5,6 +5,7 @@ import { openMemory, type Memory, type PackItem } from "../../src/memory.js";
 import type { RecordInput } from "../../src/schemas.js";
 import { git, initRepo, onCleanup, tempDir } from "../helpers.js";
 import { claudeConfigDir, installTranscript } from "../import/fixtures.js";
+import { writeArtifact } from "./artifacts.js";
 
 /**
  * The repository/worktree identity and freshness matrix for the #20 PR: each case runs
@@ -12,8 +13,6 @@ import { claudeConfigDir, installTranscript } from "../import/fixtures.js";
  * observed against the documented expectation, and is written (case → expected → observed)
  * to the git-ignored `tests/mcp/__artifacts__/handoff/identity-freshness-matrix.json`.
  */
-
-const ARTIFACT = join(import.meta.dirname, "../mcp/__artifacts__/handoff/identity-freshness-matrix.json");
 
 interface Row {
   group: "identity" | "freshness";
@@ -25,8 +24,7 @@ interface Row {
 const rows: Row[] = [];
 
 afterAll(() => {
-  mkdirSync(join(ARTIFACT, ".."), { recursive: true });
-  writeFileSync(ARTIFACT, `${JSON.stringify({ issue: "#20", rows }, null, 2)}\n`);
+  writeArtifact("identity-freshness-matrix", { issue: "#20", rows });
 });
 
 function matrixCase(group: Row["group"], name: string, why: string, expected: Record<string, unknown>, observe: () => Record<string, unknown>): void {
