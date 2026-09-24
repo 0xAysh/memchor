@@ -8,7 +8,7 @@ import { type ExternalRef, IMPORT_CHOICES, type ImportChoice } from "../schemas.
 import { type Db, openDatabase, prepared, toStorageError, writeTransaction } from "../storage/database.js";
 import { appendRecord } from "../storage/records.js";
 import { approves, type Consent, readConsent, writeConsent } from "./consent.js";
-import type { CompatibilityRow, ExclusionReason, NormalizedEvent, OutputPolicy, TranscriptAdapter, TranscriptFile } from "./normalized-event.js";
+import type { CompatibilityRow, ExclusionReason, NormalizedEvent, ToolKind, TranscriptAdapter, TranscriptFile } from "./normalized-event.js";
 import { boundPassage, PASSAGE_LIMITS, redactSecrets, touchesSensitivePath } from "./privacy.js";
 
 /**
@@ -139,6 +139,7 @@ interface CursorRow {
   workstream_id: string;
   byte_offset: number;
   anchor_hash: string | null;
+  source_hash: string | null;
   file_size: number;
   file_mtime_ms: number;
   epoch: number;
@@ -147,13 +148,19 @@ interface CursorRow {
   stats: string;
 }
 
+type OutputRetention = "passage" | "reference_only" | "memchor_echo";
+
 interface CallMeta {
+  /** Exact host id is the only raw call field retained: tool results need it for the join. */
   callId: string;
   tool: string;
   summary: string;
-  output: OutputPolicy;
+  retention: OutputRetention;
+  /** Workspace-relative, non-sensitive artifact paths only. */
   paths: string[];
+  /** URL origins only: credentials, queries, fragments and remote paths are never canonical. */
   urls: string[];
+  sensitive: boolean;
 }
 
 class Contended extends Error {}
@@ -214,6 +221,8 @@ export class TranscriptImporter {
     let consent: Consent | null = null;
     try {
       consent = readConsent(this.options.home, this.host);
+      // A declined host's transcripts are not discovered or inspected, including on read-only status.
+      if (consent?.choice === "none") return this.report(current, consent, null);
       return this.report(current, consent, this.inventory());
     } catch (error) {
       return this.failed(current, consent, null, error);
@@ -315,14 +324,15 @@ export class TranscriptImporter {
     const { file } = entry;
     const cursor = readCursor(db, this.host, file.transcriptId);
     if (cursor?.state === "quarantined") return "done";
-    if (cursor?.state === "active" && cursor.path === file.path && cursor.file_size === file.size && cursor.file_mtime_ms === file.mtimeMs) return "done";
 
     let offset = 0;
     let epoch = 0;
     let rewritten = false;
     if (cursor !== undefined) {
       epoch = cursor.epoch;
-      if (file.size >= cursor.byte_offset && anchorOf(file.path, cursor.byte_offset) === cursor.anchor_hash) {
+      const caughtUpAtSameSize = cursor.state === "active" && cursor.path === file.path && cursor.file_size === file.size;
+      if (caughtUpAtSameSize && cursor.source_hash !== null && sourceHashOf(file.path, file.size) === cursor.source_hash) return "done";
+      if (!caughtUpAtSameSize && file.size >= cursor.byte_offset && anchorOf(file.path, cursor.byte_offset) === cursor.anchor_hash) {
         offset = cursor.byte_offset;
       } else {
         epoch += 1;
@@ -413,12 +423,13 @@ export class TranscriptImporter {
           // skips the unread remainder of a transcript left half-imported by a deadline.
           const finished = state === "active" && caughtUp;
           prepared(db,
-            `UPDATE import_cursors SET path = ?, byte_offset = ?, anchor_hash = ?, file_size = ?, file_mtime_ms = ?, epoch = ?, state = ?, gap = ?,
+            `UPDATE import_cursors SET path = ?, byte_offset = ?, anchor_hash = ?, source_hash = ?, file_size = ?, file_mtime_ms = ?, epoch = ?, state = ?, gap = ?,
                stats = ?, host_version = coalesce(?, host_version), updated_at = ? WHERE host = ? AND transcript_id = ?`,
           ).run(
             file.path,
             newOffset,
             anchorOf(file.path, newOffset),
+            finished ? sourceHashOf(file.path, file.size) : null,
             finished ? file.size : -1,
             finished ? file.mtimeMs : -1,
             epoch,
@@ -602,7 +613,7 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
     if (same !== undefined) {
       touch.run(batch.epoch, batch.host, batch.transcriptId, event.branch, event.eventId, hash);
       batch.counters.replayed++;
-      if (event.type === "tool_call") batch.calls.set(event.callId, JSON.parse(same.meta) as CallMeta);
+      if (event.type === "tool_call") batch.calls.set(event.callId, parseCallMeta(same.meta));
       continue;
     }
     const previous = versions.find((v) => v.record_id !== null)?.record_id ?? null;
@@ -612,7 +623,7 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
     };
 
     if (event.type === "tool_call") {
-      const meta: CallMeta = { callId: event.callId, tool: event.tool, summary: event.summary, output: event.output, paths: event.paths, urls: event.urls };
+      const meta = safeCallMeta(batch, event);
       batch.calls.set(event.callId, meta);
       store("tool_call", null, meta);
       continue;
@@ -620,7 +631,7 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
 
     if (event.type === "tool_result") {
       const call = batch.calls.get(event.callId) ?? lookupCall(batch, event.callId);
-      if (call?.output === "memchor_echo") {
+      if (call?.retention === "memchor_echo") {
         // Memchor's own output: keep which existing records it mentioned, never the text.
         const mentioned = [...new Set(event.text.match(RECORD_ID) ?? [])];
         const existing = mentioned.length === 0 ? [] : (prepared(db, "SELECT id FROM records WHERE id IN (SELECT value FROM json_each(?))").all(JSON.stringify(mentioned)) as { id: string }[]).map((r) => r.id);
@@ -635,7 +646,9 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
         continue;
       }
       const written = appendImported(batch, event, previous, toolResultRecord(batch, call, event));
-      store("record", written, previous === null ? {} : { versionOf: previous });
+      // Keep the host's call identity with result provenance so future migrations never
+      // need to infer this relationship from presentation text.
+      store("record", written, { callId: event.callId, ...(previous === null ? {} : { versionOf: previous }) });
       continue;
     }
 
@@ -677,26 +690,22 @@ function toolResultRecord(batch: Batch, call: CallMeta | null, event: Extract<No
   const summary = call === null ? "Tool result" : passage(batch, call.summary, PASSAGE_LIMITS.callSummaryBytes, false);
   const title = clip(`${call?.tool ?? "Tool"}${event.isError ? " (error)" : ""}: ${summary.split("\n")[0] ?? ""}`, 200);
   let output: string;
-  if (call?.output === "reference_only") {
+  if (call?.sensitive === true) {
+    batch.counters.withheld++;
+    output = "[output withheld by Memchor: the call touched a sensitive path]";
+  } else if (call?.retention === "reference_only") {
     if (event.text !== "") batch.counters.fileContents++;
     output = event.isError ? passage(batch, event.text, 300) : "(file content not stored; read the file for its current state)";
   } else if (call === null) {
     // Without the call, Memchor cannot tell whether the output came from a sensitive path.
     batch.counters.withheld++;
     output = "[output withheld by Memchor: the tool call that produced it could not be read]";
-  } else if (touchesSensitivePath([call.summary, ...call.paths])) {
-    batch.counters.withheld++;
-    output = "[output withheld by Memchor: the call touched a sensitive path]";
   } else {
     output = event.text.trim() === "" ? "(no text output)" : passage(batch, event.text, PASSAGE_LIMITS.toolOutputBytes);
   }
   const refs: ExternalRef[] = [];
-  for (const path of call?.paths ?? []) {
-    if (!isWithin(path, batch.worktree)) continue;
-    const rel = relative(batch.worktree, path) || ".";
-    refs.push({ kind: "code", locator: clip(rel, 500), path: clip(rel, 500) });
-  }
-  for (const url of call?.urls ?? []) refs.push({ kind: "url", locator: clip(url, 500) });
+  for (const path of call?.paths ?? []) refs.push({ kind: "code", locator: path, path });
+  for (const url of call?.urls ?? []) refs.push({ kind: "url", locator: url });
   return { kind: "evidence", title, body: `${summary}\n\n${output}`, attribution: "direct_observation", externalRefs: refs.slice(0, 10) };
 }
 
@@ -732,7 +741,59 @@ function appendImported(batch: Batch, event: NormalizedEvent, previous: string |
 function lookupCall(batch: Batch, callId: string): CallMeta | null {
   const row = prepared(batch.db, "SELECT meta FROM import_events WHERE host = ? AND transcript_id = ? AND disposition = 'tool_call' AND json_extract(meta, '$.callId') = ? LIMIT 1")
     .get(batch.host, batch.transcriptId, callId) as { meta: string } | undefined;
-  return row === undefined ? null : (JSON.parse(row.meta) as CallMeta);
+  return row === undefined ? null : parseCallMeta(row.meta);
+}
+
+function retentionFor(toolKind: ToolKind): OutputRetention {
+  switch (toolKind) {
+    case "artifact_access":
+      return "reference_only";
+    case "memchor":
+      return "memchor_echo";
+    case "other":
+      return "passage";
+  }
+}
+
+/** Redacts and bounds every descriptive field before canonical bookkeeping sees it. */
+function safeCallMeta(batch: Batch, event: Extract<NormalizedEvent, { type: "tool_call" }>): CallMeta {
+  const sensitivePath = touchesSensitivePath([event.summary, ...event.paths]);
+  const redactedSummary = redactSecrets(event.summary);
+  batch.counters.redactions += redactedSummary.redactions;
+  // Once any argument is sensitive, retaining the command's "safe" remainder still reveals
+  // user input. Replace the whole description; only sensitive paths also withhold the output.
+  const sensitiveArguments = sensitivePath || redactedSummary.redactions > 0;
+  const tool = passage(batch, event.tool, 100, false);
+  const paths = sensitiveArguments
+    ? []
+    : event.paths
+        .filter((path) => isWithin(path, batch.worktree))
+        .map((path) => passage(batch, relative(batch.worktree, path) || ".", 500, false))
+        .slice(0, 10);
+  const urls = sensitiveArguments ? [] : event.urls.map(safeUrlOrigin).filter((url): url is string => url !== null).slice(0, 10);
+  let summary: string;
+  if (sensitiveArguments) summary = `${tool} [sensitive arguments withheld]`;
+  else if (event.urls.length > 0) summary = `${tool} ${urls[0] ?? "[external URL omitted]"}`;
+  else if (event.paths.length > 0) summary = `${tool} ${paths[0] ?? "[external path omitted]"}`;
+  else summary = boundPassage(redactedSummary.text.trim(), PASSAGE_LIMITS.callSummaryBytes).text;
+  return { callId: event.callId, tool, summary, retention: retentionFor(event.toolKind), paths, urls, sensitive: sensitivePath };
+}
+
+function safeUrlOrigin(raw: string): string | null {
+  try {
+    const url = new URL(raw);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Reads current metadata and the policy-shaped metadata written before issue #19's seam fix. */
+function parseCallMeta(json: string): CallMeta {
+  const stored = JSON.parse(json) as Omit<CallMeta, "retention" | "sensitive"> & { retention?: OutputRetention; output?: OutputRetention; sensitive?: boolean };
+  const retention = stored.retention ?? stored.output;
+  if (retention === undefined) throw new Error("Imported tool-call metadata has no retention classification");
+  return { callId: stored.callId, tool: stored.tool, summary: stored.summary, retention, paths: stored.paths, urls: stored.urls, sensitive: stored.sensitive ?? touchesSensitivePath([stored.summary, ...stored.paths]) };
 }
 
 /** Hash of what an event says (not where it sits), so a moved line is a replay and an edited one a version. */
@@ -746,7 +807,9 @@ function eventHash(event: NormalizedEvent): string {
       content = [event.type, event.text];
       break;
     case "tool_call":
-      content = [event.type, event.callId, event.tool, event.summary, event.output, event.paths, event.urls];
+      // Known-tool hashes stay compatible with the former output-policy seam. Unknown tools
+      // use the adapter's input digest so argument changes remain distinct without persisting input.
+      content = [event.type, event.callId, event.tool, event.inputDigest ?? event.summary, retentionFor(event.toolKind), event.paths, event.urls];
       break;
     case "tool_result":
       content = [event.type, event.callId, event.text, event.isError];
@@ -792,6 +855,28 @@ function mergeCounters(a: ImportCounters, b: ImportCounters, newPass: boolean): 
   addExcluded(out, a.excluded);
   addExcluded(out, b.excluded);
   return out;
+}
+
+function sourceHashOf(path: string, size: number): string {
+  const hash = createHash("sha256");
+  const buffer = Buffer.alloc(1 << 20);
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return "unreadable";
+  }
+  try {
+    for (let offset = 0; offset < size; ) {
+      const n = readSync(fd, buffer, 0, Math.min(buffer.length, size - offset), offset);
+      if (n === 0) return "changed-during-read";
+      hash.update(buffer.subarray(0, n));
+      offset += n;
+    }
+    return hash.digest("hex");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function anchorOf(path: string, offset: number): string | null {

@@ -5,6 +5,7 @@ import { headCommit, locateWorkspace, registerWorkspace, resolveHome, type Works
 import { type ErrorCode, MemchorError } from "./errors.js";
 import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integrity/checkpoints.js";
 import { claudeCodeAdapter } from "./import/adapters/claude.js";
+import type { TranscriptAdapter } from "./import/normalized-event.js";
 import { type ImportStatus, TranscriptImporter, unsupportedHostStatus } from "./import/reconcile.js";
 import { type Citation, citationsFor, importedFrom, type ImportedSource, linksOf } from "./integrity/provenance.js";
 import { type ContinuationState, ITEM_EXCERPT_BYTES, openContinuation, packPage, type Packable, sealContinuation, usage } from "./retrieval/context-pack.js";
@@ -63,6 +64,8 @@ export interface OpenMemoryOptions {
   busyTimeoutMs?: number;
   /** Claude Code's config directory (transcripts live in its `projects/`). Defaults to `$CLAUDE_CONFIG_DIR`, then `~/.claude`. */
   claudeConfigDir?: string;
+  /** Alternate host-format adapter, primarily for compatibility and privacy integration tests. */
+  transcriptAdapter?: TranscriptAdapter;
   /** How long `bootstrap` may spend importing the current project's transcripts before returning. Default 3000 ms. */
   importBudgetMs?: number;
 }
@@ -330,15 +333,16 @@ class LocalMemory implements Memory {
     this.home = resolveHome(options.home);
     this.busyTimeoutMs = options.busyTimeoutMs;
     this.hostSessionId = options.hostSessionId;
+    const adapter = options.transcriptAdapter ?? (this.host === "claude-code" ? claudeCodeAdapter(options.claudeConfigDir === undefined ? {} : { configDir: options.claudeConfigDir }) : null);
     this.importer =
-      this.host === "claude-code"
-        ? new TranscriptImporter({
+      adapter === null
+        ? null
+        : new TranscriptImporter({
             home: this.home,
-            adapter: claudeCodeAdapter(options.claudeConfigDir === undefined ? {} : { configDir: options.claudeConfigDir }),
+            adapter,
             bootstrapBudgetMs: options.importBudgetMs ?? DEFAULT_IMPORT_BUDGET_MS,
             ...(options.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: options.busyTimeoutMs }),
-          })
-        : null;
+          });
   }
 
   bootstrap(input: BootstrapInput = {}): BootstrapResult {

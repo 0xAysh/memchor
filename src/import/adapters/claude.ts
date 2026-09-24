@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
@@ -5,7 +6,7 @@ import type {
   CompatibilityRow,
   ExclusionReason,
   NormalizedEvent,
-  OutputPolicy,
+  ToolKind,
   TranscriptAdapter,
   TranscriptChunk,
   TranscriptFile,
@@ -131,7 +132,7 @@ function inspect(file: TranscriptFile): TranscriptHead {
     const entry = parseJson(line.text);
     if (entry !== null && typeof entry["cwd"] === "string") {
       const hostVersion = typeof entry["version"] === "string" ? entry["version"] : null;
-      return { cwd: entry["cwd"], hostVersion, supported: hostVersion === null || isSupported(hostVersion) };
+      return { cwd: entry["cwd"], hostVersion, supported: hostVersion !== null && isSupported(hostVersion) };
     }
   }
   return { cwd: null, hostVersion: null, supported: true };
@@ -155,8 +156,9 @@ function read(file: TranscriptFile, from: number, maxBytes: number): TranscriptC
       continue;
     }
     const version = entry["version"];
-    if (typeof version === "string" && !isSupported(version)) {
-      chunk.stop = { reason: "unsupported_version", hostVersion: version, offset: line.start };
+    const versionedEntry = entry["type"] === "user" || entry["type"] === "assistant" || entry["type"] === "system" || entry["type"] === "attachment";
+    if (versionedEntry && (typeof version !== "string" || !isSupported(version))) {
+      chunk.stop = { reason: "unsupported_version", hostVersion: typeof version === "string" ? version : "missing", offset: line.start };
       return chunk;
     }
     normalizeEntry(entry, line, chunk.events, exclude);
@@ -260,37 +262,45 @@ function normalizeEntry(entry: Entry, line: { start: number; end: number }, out:
   }
 }
 
-/** One-line description, touched paths and output policy of a tool call, from its input. */
-function describeCall(name: string, input: Entry): { summary: string; paths: string[]; urls: string[]; output: OutputPolicy } {
+/** One-line description, touched paths and semantic kind of a tool call, from its input. */
+function describeCall(name: string, input: Entry): { summary: string; paths: string[]; urls: string[]; toolKind: ToolKind; inputDigest?: string } {
   const str = (key: string): string | null => (typeof input[key] === "string" ? input[key] : null);
   const memchor = MEMCHOR_TOOL.exec(name);
-  if (memchor !== null) return { summary: `${memchor[1] ?? name} ${JSON.stringify(input)}`, paths: [], urls: [], output: "memchor_echo" };
+  if (memchor !== null) return { summary: `${memchor[1] ?? name} ${JSON.stringify(input)}`, paths: [], urls: [], toolKind: "memchor" };
   if (FILE_TOOLS.has(name)) {
     const path = str("file_path") ?? str("notebook_path");
     const offset = typeof input["offset"] === "number" ? input["offset"] : null;
     const limit = typeof input["limit"] === "number" ? input["limit"] : null;
     const lines = offset !== null && limit !== null ? ` (lines ${offset}-${offset + limit - 1})` : "";
-    return { summary: `${name} ${path ?? "(no path)"}${lines}`, paths: path === null ? [] : [path], urls: [], output: "reference_only" };
+    return { summary: `${name} ${path ?? "(no path)"}${lines}`, paths: path === null ? [] : [path], urls: [], toolKind: "artifact_access" };
   }
   switch (name) {
     case "Bash":
-      return { summary: `$ ${str("command") ?? ""}`, paths: [], urls: [], output: "passage" };
+      return { summary: `$ ${str("command") ?? ""}`, paths: [], urls: [], toolKind: "other" };
     case "Grep":
     case "Glob": {
       const path = str("path");
-      return { summary: `${name} ${JSON.stringify(str("pattern") ?? "")}${path === null ? "" : ` in ${path}`}`, paths: path === null ? [] : [path], urls: [], output: "passage" };
+      return { summary: `${name} ${JSON.stringify(str("pattern") ?? "")}${path === null ? "" : ` in ${path}`}`, paths: path === null ? [] : [path], urls: [], toolKind: "other" };
     }
     case "WebFetch": {
       const url = str("url");
-      return { summary: `WebFetch ${url ?? ""}`, paths: [], urls: url === null ? [] : [url], output: "passage" };
+      return { summary: `WebFetch ${url ?? ""}`, paths: [], urls: url === null ? [] : [url], toolKind: "other" };
     }
     case "WebSearch":
-      return { summary: `WebSearch ${JSON.stringify(str("query") ?? "")}`, paths: [], urls: [], output: "passage" };
+      return { summary: `WebSearch ${JSON.stringify(str("query") ?? "")}`, paths: [], urls: [], toolKind: "other" };
     case "Agent":
     case "Task":
-      return { summary: `${name}: ${str("description") ?? ""}`, paths: [], urls: [], output: "passage" };
+      return { summary: `${name}: ${str("description") ?? ""}`, paths: [], urls: [], toolKind: "other" };
     default:
-      return { summary: `${name} ${JSON.stringify(input)}`, paths: [], urls: [], output: "passage" };
+      // Unknown schemas are not safe to summarize. Keep only a deterministic digest for
+      // event-version identity; importer bookkeeping never persists this digest or input.
+      return {
+        summary: `${name} [arguments omitted]`,
+        paths: [],
+        urls: [],
+        toolKind: "other",
+        inputDigest: `sha256:${createHash("sha256").update(JSON.stringify(input)).digest("hex")}`,
+      };
   }
 }
 

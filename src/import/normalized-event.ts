@@ -1,8 +1,8 @@
 /**
  * The host-neutral event model that transcript adapters produce and the importer
  * consumes. Nothing downstream of an adapter knows a host's file format: an adapter
- * decides *what* an entry is (a message, a tool call and its output policy, a host
- * summary, or something to exclude), and the importer decides *how* it is stored.
+ * decides *what* an entry is (a message, a semantic kind of tool call, a host summary,
+ * or something to exclude), and the importer decides *how* it is stored.
  */
 
 /** Where an event sits in its transcript; together with the host and transcript id it is the event's identity. */
@@ -24,15 +24,8 @@ export interface EventOrigin {
   lineEnd: number;
 }
 
-/**
- * What the importer may keep from a tool call's result:
- * - `passage`: a bounded excerpt of the output;
- * - `reference_only`: only the call's summary and references (file reads and edits are
- *   full-file dumps; Memchor stores knowledge about artifacts, not the artifacts);
- * - `memchor_echo`: Memchor's own output, never new evidence (only the record ids it
- *   mentions are kept, as references).
- */
-export type OutputPolicy = "passage" | "reference_only" | "memchor_echo";
+/** Host-neutral meaning of a tool call; retention policy belongs to the importer. */
+export type ToolKind = "artifact_access" | "memchor" | "other";
 
 export type NormalizedEvent = EventOrigin &
   (
@@ -51,12 +44,17 @@ export type NormalizedEvent = EventOrigin &
         type: "tool_call";
         callId: string;
         tool: string;
-        /** One line describing the call (command, path, query), never file content. */
+        /** One line describing a known call, or a safe omitted-arguments marker for an unknown schema. */
         summary: string;
+        /**
+         * Adapter-only identity signal for an unknown tool's input. The importer hashes it
+         * into event identity but never persists it in canonical metadata.
+         */
+        inputDigest?: string;
         /** Absolute paths the call reads or writes, for code references and sensitive-path checks. */
         paths: string[];
         urls: string[];
-        output: OutputPolicy;
+        toolKind: ToolKind;
       }
     | {
         type: "tool_result";

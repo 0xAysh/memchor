@@ -2,8 +2,10 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, test } from "vitest";
 import { openMemory } from "../../src/memory.js";
-import { openDatabase, SCHEMA_VERSION } from "../../src/storage/database.js";
+import { rebuildSearchIndex } from "../../src/retrieval/search.js";
+import { openDatabase, SCHEMA_VERSION, writeTransaction } from "../../src/storage/database.js";
 import { sql as schemaV1 } from "../../src/storage/migrations/0001-initial.js";
+import { sql as schemaV2 } from "../../src/storage/migrations/0002-transcript-import.js";
 import { catchMemchorError, initRepo, tempDir } from "../helpers.js";
 
 const CANONICAL_TABLES = [
@@ -48,11 +50,11 @@ function atVersionZero(setup = ""): string {
 }
 
 describe("migrations", () => {
-  test("this build introduces schema version 2", () => {
-    expect(SCHEMA_VERSION).toBe(2);
+  test("this build introduces schema version 3", () => {
+    expect(SCHEMA_VERSION).toBe(3);
   });
 
-  test("a version-1 database with memory upgrades to version 2 and keeps every row", () => {
+  test("a version-1 database with memory upgrades to version 3 and keeps every row", () => {
     const path = join(tempDir(), "memory.sqlite");
     const v1 = new Database(path);
     v1.exec(schemaV1);
@@ -64,12 +66,136 @@ describe("migrations", () => {
     v1.close();
 
     openDatabase(path).close();
-    expect(inspect(path)).toEqual({ version: 2, tables: CANONICAL_TABLES });
+    expect(inspect(path)).toEqual({ version: 3, tables: CANONICAL_TABLES });
     const db = new Database(path, { readonly: true });
     expect(db.prepare("SELECT id, body FROM records").all()).toEqual([{ id: "rec_1", body: "kept across the upgrade" }]);
     const cursorColumns = (db.pragma("table_info(import_cursors)") as { name: string }[]).map((c) => c.name);
-    expect(cursorColumns).toEqual(expect.arrayContaining(["transcript_id", "byte_offset", "anchor_hash", "state", "gap", "stats"]));
+    expect(cursorColumns).toEqual(expect.arrayContaining(["transcript_id", "byte_offset", "anchor_hash", "source_hash", "state", "gap", "stats"]));
     db.close();
+  });
+
+  test("a version-2 database scrubs legacy tool arguments from metadata, result records and search projections", () => {
+    const path = join(tempDir(), "memory.sqlite");
+    const v2 = new Database(path);
+    v2.exec(schemaV1);
+    v2.exec(schemaV2);
+    v2.pragma("user_version = 2");
+    const unknownHead = "LEGACY-UNKNOWN-RAW-HEAD";
+    const unknownTail = "LEGACY-UNKNOWN-RAW-TAIL";
+    const commandPrefix = "LEGACY-SENSITIVE-COMMAND-PREFIX";
+    const commandSecret = "sk-live-LEGACYSECRETVALUE123456789";
+    const commandSuffix = "LEGACY-SENSITIVE-COMMAND-SUFFIX";
+    const unknownSummary = `FutureTool {"payload":"${unknownHead}${"x".repeat(800)}${unknownTail}"}`;
+    const commandSummary = `$ ${commandPrefix}; export API_KEY=${commandSecret}; ${commandSuffix}`;
+    const errorMarker = "LEGACY-ERROR-RESULT-MARKER";
+    const longAsciiMarker = "LEGACY-LONG-ASCII-RESULT-MARKER";
+    const unicodeMarker = "LEGACY-NON-BMP-RESULT-MARKER";
+    const longAsciiTool = "A".repeat(210);
+    const unicodeTool = "🛠".repeat(100); // 100 code points, 200 UTF-16 code units.
+    const jsClip = (text: string): string => text.length <= 200 ? text : `${text.slice(0, 199)}…`;
+    const unknownBody = `${unknownSummary}\n\nlegacy unknown result output that cannot be separated safely`;
+    const commandBody = `${commandSummary}\n\nlegacy command result output that cannot be separated safely`;
+    const errorBody = `ErrorTool ${errorMarker}\n\nlegacy error output`;
+    const longAsciiBody = `${longAsciiTool} ${longAsciiMarker}\n\nlegacy long ASCII output`;
+    const unicodeBody = `${unicodeTool} ${unicodeMarker}\n\nlegacy non-BMP output`;
+    v2.exec(`INSERT INTO workstreams (id, label, created_at) VALUES ('wst_1', 'main', 'now');
+      INSERT INTO sessions (id, host, workstream_id, started_at) VALUES ('ses_1', 'claude-code', 'wst_1', 'now');
+      INSERT INTO sources (id, kind, host, locator, created_at) VALUES ('src_1', 'transcript', 'claude-code', 't', 'now');`);
+    const insertRecord = v2.prepare(`INSERT INTO records
+      (id, kind, title, body, workstream_id, session_id, source_id, host, attribution, content_hash, created_at)
+      VALUES (?, 'evidence', ?, ?, 'wst_1', 'ses_1', 'src_1', 'claude-code', 'direct_observation', ?, 'now')`);
+    insertRecord.run("rec_unknown", `FutureTool: ${unknownSummary}`, unknownBody, "legacy-unknown-hash");
+    insertRecord.run("rec_command", `Bash: ${commandSummary}`, commandBody, "legacy-command-hash");
+    insertRecord.run("rec_error", `ErrorTool (error): ErrorTool ${errorMarker}`, errorBody, "legacy-error-hash");
+    insertRecord.run("rec_long_ascii", jsClip(`${longAsciiTool}: ${longAsciiTool} ${longAsciiMarker}`), longAsciiBody, "legacy-long-ascii-hash");
+    insertRecord.run("rec_unicode", jsClip(`${unicodeTool}: ${unicodeTool} ${unicodeMarker}`), unicodeBody, "legacy-unicode-hash");
+    insertRecord.run("rec_safe", null, "useful safe transcript observation remains available", "safe-hash");
+    v2.exec(`UPDATE records SET attribution = 'agent_inference' WHERE id = 'rec_safe';
+      INSERT INTO links (from_id, to_id, relation, created_at) VALUES ('rec_safe', 'rec_unknown', 'references', 'now');`);
+
+    const insertEvent = v2.prepare(`INSERT INTO import_events
+      (host, transcript_id, branch, event_id, content_hash, record_id, disposition, meta, seen_epoch, created_at)
+      VALUES ('claude-code', 't', 'main', ?, ?, ?, ?, ?, 0, 'now')`);
+    insertEvent.run("unknown-call", "call-hash-1", null, "tool_call", JSON.stringify({ callId: "call-1", tool: "FutureTool", summary: unknownSummary, output: "passage", paths: [], urls: [] }));
+    // Earliest v2 rows omitted callId; direct_observation + import provenance is the fail-safe identity.
+    insertEvent.run("unknown-result", "result-hash-1", "rec_unknown", "record", "{}");
+    insertEvent.run("bash-call", "call-hash-2", null, "tool_call", JSON.stringify({ callId: "call-2", tool: "Bash", summary: commandSummary, output: "passage", paths: [], urls: [] }));
+    insertEvent.run("bash-result", "result-hash-2", "rec_command", "record", JSON.stringify({ callId: "call-2" }));
+    insertEvent.run("error-call", "call-hash-3", null, "tool_call", JSON.stringify({ callId: "call-3", tool: "ErrorTool", summary: `ErrorTool ${errorMarker}`, output: "passage", paths: [], urls: [] }));
+    insertEvent.run("error-result", "result-hash-3", "rec_error", "record", JSON.stringify({ callId: "call-3" }));
+    insertEvent.run("long-ascii-call", "call-hash-4", null, "tool_call", JSON.stringify({ callId: "call-4", tool: longAsciiTool, summary: `${longAsciiTool} ${longAsciiMarker}`, output: "passage", paths: [], urls: [] }));
+    insertEvent.run("long-ascii-result", "result-hash-4", "rec_long_ascii", "record", JSON.stringify({ callId: "call-4" }));
+    insertEvent.run("unicode-call", "call-hash-5", null, "tool_call", JSON.stringify({ callId: "call-5", tool: unicodeTool, summary: `${unicodeTool} ${unicodeMarker}`, output: "passage", paths: [], urls: [] }));
+    insertEvent.run("unicode-result", "result-hash-5", "rec_unicode", "record", JSON.stringify({ callId: "call-5" }));
+    insertEvent.run("safe-message", "safe-hash", "rec_safe", "record", "{}");
+
+    const insertChunk = v2.prepare("INSERT INTO chunks (record_id, ordinal, field, text) VALUES (?, ?, ?, ?)");
+    const insertFts = v2.prepare("INSERT INTO chunks_fts (rowid, text) VALUES (?, ?)");
+    for (const [recordId, title, body] of [
+      ["rec_unknown", `FutureTool: ${unknownSummary}`, unknownBody],
+      ["rec_command", `Bash: ${commandSummary}`, commandBody],
+      ["rec_error", `ErrorTool (error): ErrorTool ${errorMarker}`, errorBody],
+      ["rec_long_ascii", jsClip(`${longAsciiTool}: ${longAsciiTool} ${longAsciiMarker}`), longAsciiBody],
+      ["rec_unicode", jsClip(`${unicodeTool}: ${unicodeTool} ${unicodeMarker}`), unicodeBody],
+      ["rec_safe", null, "useful safe transcript observation remains available"],
+    ] as const) {
+      let ordinal = 0;
+      for (const [field, text] of [["title", title], ["body", body]] as const) {
+        if (text === null) continue;
+        const result = insertChunk.run(recordId, ordinal++, field, text);
+        insertFts.run(result.lastInsertRowid, text);
+      }
+    }
+    v2.close();
+
+    const migrated = openDatabase(path);
+    const columns = (migrated.pragma("table_info(import_cursors)") as { name: string }[]).map((column) => column.name);
+    expect(columns).toContain("source_hash");
+    const forbidden = [unknownHead, unknownTail, commandPrefix, commandSecret, commandSuffix, errorMarker, longAsciiMarker, unicodeMarker];
+    const searchable = [
+      JSON.stringify(migrated.prepare("SELECT * FROM import_events").all()),
+      JSON.stringify(migrated.prepare("SELECT * FROM records").all()),
+      JSON.stringify(migrated.prepare("SELECT * FROM chunks").all()),
+      JSON.stringify(migrated.prepare("SELECT rowid, text FROM chunks_fts").all()),
+    ].join("\n");
+    for (const value of forbidden) expect(searchable).not.toContain(value);
+    expect(migrated.prepare(`SELECT count(*) AS n FROM chunks_fts WHERE chunks_fts MATCH '"legacy unknown raw head"'`).get()).toEqual({ n: 0 });
+    expect(migrated.prepare(`SELECT count(*) AS n FROM chunks_fts WHERE chunks_fts MATCH '"legacysecretvalue123456789"'`).get()).toEqual({ n: 0 });
+
+    expect(migrated.prepare("SELECT id FROM records WHERE review_state = 'retracted' ORDER BY id").all()).toEqual([
+      { id: "rec_command" },
+      { id: "rec_error" },
+      { id: "rec_long_ascii" },
+      { id: "rec_unicode" },
+      { id: "rec_unknown" },
+    ]);
+    expect(migrated.prepare("SELECT title, body, review_state, retracted_at FROM records WHERE id = 'rec_unicode'").get()).toEqual({
+      title: "Legacy imported tool result removed",
+      body: expect.stringContaining("schema v3 migration") as unknown,
+      review_state: "retracted",
+      retracted_at: "migration-v3",
+    });
+    expect(migrated.prepare("SELECT title, body, review_state, retracted_at FROM records WHERE id = 'rec_safe'").get()).toEqual({
+      title: null,
+      body: "useful safe transcript observation remains available",
+      review_state: "unreviewed",
+      retracted_at: null,
+    });
+    expect(migrated.prepare("SELECT from_id, to_id, relation FROM links").all()).toEqual([{ from_id: "rec_safe", to_id: "rec_unknown", relation: "references" }]);
+    expect(migrated.prepare("SELECT event_id, record_id FROM import_events WHERE record_id IS NOT NULL ORDER BY event_id").all()).toEqual([
+      { event_id: "bash-result", record_id: "rec_command" },
+      { event_id: "error-result", record_id: "rec_error" },
+      { event_id: "long-ascii-result", record_id: "rec_long_ascii" },
+      { event_id: "safe-message", record_id: "rec_safe" },
+      { event_id: "unicode-result", record_id: "rec_unicode" },
+      { event_id: "unknown-result", record_id: "rec_unknown" },
+    ]);
+    expect(migrated.pragma("foreign_key_check")).toEqual([]);
+    expect(() => migrated.exec("INSERT INTO chunks_fts (chunks_fts) VALUES ('integrity-check')")).not.toThrow();
+    expect(writeTransaction(migrated, () => rebuildSearchIndex(migrated))).toEqual({ records: 6, chunks: 11 });
+    const rebuilt = JSON.stringify(migrated.prepare("SELECT rowid, text FROM chunks_fts").all());
+    for (const value of forbidden) expect(rebuilt).not.toContain(value);
+    migrated.close();
   });
 
   test("a new database is created at the current schema version", () => {

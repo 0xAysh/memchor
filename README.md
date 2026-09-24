@@ -19,12 +19,17 @@ npm run typecheck
 npm run lint
 npm test            # builds dist/, then runs all suites against real SQLite, Git and server processes
 
+# Deterministic sanitized workload: small + large import timing and peak-RSS JSON evidence
+npm run benchmark:import
+
 # Local-only: snapshot your real Claude Code and Pi transcripts into the git-ignored .real-transcripts/
 npm run snapshot:transcripts    # then `npm test` also runs tests/import/real-history.test.ts against it
 MEMCHOR_REAL_CLAUDE_DIR=~/.claude npx vitest run tests/import/real-history.test.ts   # or read a config dir in place
 ```
 
-Real transcripts hold account ids, file contents and credentials, so they never leave your machine. `.real-transcripts/` is git-ignored, and the snapshot script refuses to run unless git confirms that. It copies only `*.jsonl` transcripts, never settings or Pi's `auth.json`. Every committed fixture under `tests/import/fixtures/` is hand-written. Other tests never read real history: `vitest.config.ts` points `CLAUDE_CONFIG_DIR` at an empty directory.
+`npm run benchmark:import` generates sanitized JSONL in a temporary directory, imports it without network/model calls, and reports stable `small`/`large` scenario fields: transcript, turn, event and record counts; elapsed milliseconds; RSS delta and process peak RSS; and database bytes. Values are evidence for the machine running the command, not flaky pass/fail thresholds. Scenario sizes can be overridden with `-- --small-transcripts N --small-turns N --large-transcripts N --large-turns N`.
+
+Real transcripts hold account ids, file contents and credentials, so they never leave your machine. `.real-transcripts/` is git-ignored, and the snapshot script refuses to run unless git confirms that. It intentionally copies both Claude and Pi `*.jsonl` histories as local product-development fixtures, never settings or Pi's `auth.json`; current product import support remains independently adapter-gated. Every committed fixture under `tests/import/fixtures/` is hand-written. Other tests never read real history: `vitest.config.ts` points `CLAUDE_CONFIG_DIR` at an empty directory.
 
 ## Commands
 
