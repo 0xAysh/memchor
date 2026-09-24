@@ -193,8 +193,11 @@ export const LISTED_COPIES = 5;
  * Records that state one claim from one independent root, collapsed into one entry.
  *
  * A claim is the record body with whitespace normalised; two records share a root when
- * provenance says one repeats the other (see `independentRoots`). Copies are folded into
- * the first-ranked record of their (claim, root) group. Records with the same claim but
+ * provenance says one repeats the other (see `independentRoots`). A group takes the rank
+ * of its first-ranked record but is represented by its earliest one (`observedBefore`): a
+ * restatement is always written after the record it cites, so the earliest is the original
+ * statement, while a newer copy often ranks first on recency and would otherwise present
+ * its own host, kind and attribution as the original's. Records with the same claim but
  * different roots are never folded together: each stays its own entry, and
  * `independentRoots` tells how many distinct observations back the claim.
  */
@@ -208,7 +211,12 @@ export interface ClaimGroup<R> {
   records: number;
 }
 
-export function groupClaims<R>(rows: readonly R[], claimOf: (row: R) => string, rootOf: (row: R) => string): ClaimGroup<R>[] {
+export function groupClaims<R>(
+  rows: readonly R[],
+  claimOf: (row: R) => string,
+  rootOf: (row: R) => string,
+  observedBefore: (a: R, b: R) => boolean,
+): ClaimGroup<R>[] {
   const byClaim = new Map<string, { roots: Set<string>; records: number }>();
   const byKey = new Map<string, ClaimGroup<R>>();
   const groups: ClaimGroup<R>[] = [];
@@ -225,6 +233,9 @@ export function groupClaims<R>(rows: readonly R[], claimOf: (row: R) => string, 
       const created: ClaimGroup<R> = { representative: row, copies: [], independentRoots: 0, records: 0 };
       byKey.set(key, created);
       groups.push(created);
+    } else if (observedBefore(row, group.representative)) {
+      group.copies.unshift(group.representative);
+      group.representative = row;
     } else {
       group.copies.push(row);
     }

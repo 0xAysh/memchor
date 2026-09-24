@@ -103,6 +103,27 @@ describe("provenance and independent roots", () => {
     expect(byId.get(codex.recordId)).toMatchObject({ host: "codex", attribution: "direct_observation", independentRoot: `record:${codex.recordId}`, corroboration: { independentRoots: 1, records: 1 } });
   });
 
+  test("a newer restatement never displaces the observation it copies: the item keeps the original's host, kind and attribution", () => {
+    const e = env();
+    installTranscript(e.config, "2.1.281/basic.jsonl", { cwd: e.repo });
+    const claude = open(e);
+    claude.bootstrap({ importChoice: "current_project" });
+    const imported = itemsStating(claude.recall({ query: "double charges gateway times out" }), USER_ASK)[0];
+    // The decision rests on the imported ask, so it and its restatement share the ask's root and neither is the root itself.
+    const decision = claude.record({ kind: "decision", body: "Charge with a server-side idempotency key per order.", attribution: "user_direction", supportedBy: [imported?.recordId ?? ""] });
+    const codex = open(e, "codex");
+    const restatedDecision = codex.record({ kind: "note", body: "Charge with a server-side idempotency key per order.", attribution: "agent_inference", links: [{ to: decision.recordId, relation: "derived_from" }] });
+    const restatedAsk = codex.record({ kind: "note", body: USER_ASK, attribution: "agent_inference", supportedBy: [imported?.recordId ?? ""] });
+
+    const pack = codex.recall({ query: "idempotency key per order double charges", maxTokens: 8_000 });
+    expect(itemsStating(pack, "Charge with a server-side idempotency key per order.")).toEqual([
+      expect.objectContaining({ recordId: decision.recordId, kind: "decision", attribution: "user_direction", host: "claude-code", copies: [expect.objectContaining({ recordId: restatedDecision.recordId, host: "codex" })] }),
+    ]);
+    expect(itemsStating(pack, USER_ASK)).toEqual([
+      expect.objectContaining({ recordId: imported?.recordId, attribution: "user_direction", source: expect.objectContaining({ host: "claude-code" }) as unknown, copies: [expect.objectContaining({ recordId: restatedAsk.recordId })] }),
+    ]);
+  });
+
   test("copies folded into a returned item are never returned again on later pages", () => {
     const e = env();
     const memory = open(e);

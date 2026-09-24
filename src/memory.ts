@@ -795,7 +795,12 @@ class LocalMemory implements Memory {
       const citations = citationsFor(db, scope.workstreamId, [...rows.map((r) => r.id), ...(checkpointRow ? [checkpointRow.id] : [])]);
       const sources = importedFrom(db, rows.map((r) => r.id));
       const roots = independentRoots(db, scope.workstreamId, rows.map((r) => r.id));
-      const groups = groupClaims(rows, (row) => normalizeClaim(row.body), (row) => roots.get(row.id) ?? `record:${row.id}`);
+      const groups = groupClaims(
+        rows,
+        (row) => normalizeClaim(row.body),
+        (row) => roots.get(row.id) ?? `record:${row.id}`,
+        (a, b) => a.created_at < b.created_at || (a.created_at === b.created_at && a.seq < b.seq),
+      );
 
       const checkpointPackable = (freshness: RecordFreshness): Packable<PackCheckpoint> | null =>
         checkpointRow === null
