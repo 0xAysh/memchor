@@ -75,7 +75,13 @@ export type ReviewState = z.infer<typeof ReviewState>;
 export const LinkRelation = z.enum(["supported_by", "derived_from", "references", "related_to"]);
 export type LinkRelation = z.infer<typeof LinkRelation> | "supersedes";
 
-/** Only "unknown" is produced until freshness validation ships (#21). */
+/**
+ * Whether what a record observed still holds. Computed at recall/read time against the live
+ * worktree (src/retrieval/freshness.ts), never trusted from storage: the stored column stays
+ * "unknown". Local code references compare commit, dirty state and a bounded file hash;
+ * issue/PR/URL/document references are always "unknown" (historical). Test-result and
+ * document applicability arrive with #21.
+ */
 export const Freshness = z.enum(["current", "stale", "unknown"]);
 export type Freshness = z.infer<typeof Freshness>;
 
@@ -89,7 +95,12 @@ export const ExternalRef = z.strictObject({
   locator: z.string().min(1).max(500),
   path: z.string().min(1).max(500).optional(),
   lines: z.tuple([z.int().min(1), z.int().min(1)]).optional(),
+  /**
+   * Pins the reference to a version. Leave `commit` and `observedHash` out for code as it is
+   * on disk now: Memchor then records the commit, dirty state and a `sha256:` hash itself.
+   */
   commit: z.string().min(4).max(64).optional(),
+  /** `sha256:<hex>` of the whole file; any other format cannot be compared (freshness stays unknown). */
   observedHash: z.string().min(1).max(200).optional(),
   observedAt: z.iso.datetime({ offset: true }).optional(),
 });

@@ -25,8 +25,8 @@ The adapters contain no memory policy. The MCP server forwards raw tool argument
 | `continueImport({maxMs?})` | One bounded step of the remaining approved import (current project first, then other projects' own workspaces). The MCP server calls it between requests while alive. Not an agent tool |
 | `record({kind, body, attribution, …})` | Appends one record with its links and search chunks; `operationKey` makes it idempotent |
 | `checkpoint({expectedRevision, goal, status, …})` | Appends revision `expectedRevision + 1` only if the head still equals `expectedRevision` |
-| `recall({query?, kinds?, maxTokens?, maxBytes?, continuation?})` | A bounded pack: head checkpoint first, then ranked eligible items |
-| `read({recordId, maxTokens?, maxBytes?, offset?})` | A slice of one visible record's body, with its visible links. Offsets count UTF-16 code units; an offset inside a surrogate pair snaps back to that code point's start |
+| `recall({query?, kinds?, maxTokens?, maxBytes?, continuation?})` | A bounded pack: head checkpoint first, then ranked eligible items, each with live freshness, provenance, independent root and corroboration (see [Recall applicability](#recall-applicability)) |
+| `read({recordId, maxTokens?, maxBytes?, offset?})` | A slice of one visible record's body, with its visible links, live freshness and independent root. Offsets count UTF-16 code units; an offset inside a surrogate pair snaps back to that code point's start |
 | `status()` | Runtime, storage, the scope bootstrap *would* bind, and counts. Strictly read-only: no registry entry, rows or migrations. Never throws for scope or storage problems |
 | `rebuildSearchIndex()` | Regenerates the derived index inside one write transaction |
 | `checkIntegrity()` | Read-only `integrity_check`, `foreign_key_check` and FTS index-vs-content check. It reports a damaged, foreign or unmigrated file and never repairs or migrates it |
@@ -99,13 +99,41 @@ Every write is one `BEGIN IMMEDIATE` transaction, so it never upgrades from read
 
 **Reads.** Recall reads in one deferred transaction, so the head, candidates and citations share a snapshot. Scope and eligibility sit in the WHERE clause, ahead of bm25 ranking. Ties are broken by `created_at DESC, seq DESC`. Query words are individually quoted, so FTS syntax cannot be injected.
 
-**Budgets.** A pack's size is the sum of the UTF-8 JSON bytes of the checkpoint and items, and never exceeds `min(maxBytes, 4 × maxTokens)`. Tokens are estimated as `ceil(bytes / 4)`.
+**Budgets.** A pack's size is the sum of the UTF-8 JSON bytes of the checkpoint and items, and never exceeds `min(maxBytes, 4 × maxTokens)`. Tokens are estimated as `ceil(bytes / 4)`. The bootstrap pack is `recall({})` and has the same budget (2,000 tokens / 8,000 bytes by default). Each entry is measured with its fixed metadata (warning, per-reference freshness, citations, provenance, copies) before its body, so under pressure the body is cut, and a cut body ends with an explicit `[… cut by Memchor …; memory_read …]` marker. Warnings and citations are never dropped: an entry whose metadata alone exceeds the whole budget is left out and listed by id in `omissions` (`exceeds_budget`); what did not fit is counted as `budget` and reachable through `continuation`.
 
 **Continuations** freeze the sequence. Page 1 ranks up to 500 eligible records, and the token carries the unreturned `seq`s in rank order. The token is HMAC-signed with a per-workspace secret and bound to the workspace, workstream, query and kinds. Later pages load records by `seq` and re-check scope and eligibility, without re-ranking. So writes between pages, which shift bm25 statistics, can neither reorder nor inject records, and no eligible page-1 record is skipped or repeated. Matches beyond the cap are reported as `candidate_limit`. This design keeps recall read-only, with no server-side snapshot table to expire.
 
 **Ranking caveat.** bm25's corpus statistics (IDF, average length) are computed by FTS5 over *all* chunks, including retracted and other-workstream records. Ineligible rows can therefore change scores, but never eligibility: they are filtered in the WHERE clause and cannot be returned, cited or counted.
 
 **Durability.** Connections run with `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON` and a bounded `busy_timeout` (default 5 s). The one-time switch to WAL retries when SQLite answers `SQLITE_BUSY` immediately.
+
+## Recall applicability
+
+Memory is knowledge *about* the repository; the repository stays the source of truth (PRD §11). Recall therefore labels what it returns instead of vouching for it.
+
+**Freshness** (`src/retrieval/freshness.ts`). When an agent writes a record or checkpoint with a local code reference that pins nothing (`commit` and `observedHash` omitted), Memchor observes the file itself, outside the write transaction: the worktree's HEAD, whether the file was dirty, and the SHA-256 of the whole file (≤ 1 MiB), stamped `observedAt`. The content is never stored. At recall and read, each returned reference is labelled:
+
+| Reference | Label | Why |
+|---|---|---|
+| Same bytes (hash), or clean at the observed commit and still clean at HEAD | `current` / `unchanged` | Equal bytes mean the observation still describes the file. The commit shortcut is sound only when the file was clean then and now: then Git guarantees identical bytes, even for files too large to hash |
+| Different bytes / file gone | `stale` / `changed`, `missing` | The record may describe code that no longer exists |
+| Imported Read/Edit path | `unknown` / `transcript_reference` | The transcript never fingerprinted what it saw; hashing at import would certify the version on disk *then*, not the one read |
+| No fingerprint (caller-pinned, sensitive path, file absent when written) | `unknown` / `not_observed` (`unknown_commit` if a pinned commit is not in the repository) | Nothing to compare against |
+| Path outside this worktree (another repository or worktree, a symlink escaping it, `..`) | `unknown` / `outside_worktree` | Never read. Repository identity needs no stored field: each repository has its own database |
+| Over 1 MiB and its Git state changed | `unknown` / `too_large` | Reading it would be unbounded work |
+| Issue, PR, URL, document | `unknown` / `remote_unverified` | Remote state changes without a local trace, and Memchor makes no network call |
+
+The whole file is hashed, not the cited line range: line numbers shift with any edit above them, so a range hash would misfire both ways, while a whole-file change only costs the agent a re-read. A record's `freshness` is the worst of its references (stale > unknown > current, `unknown` when it has none). A stale or unknown item carries a short `warning` telling the agent to read the current file or verify the remote source.
+
+Validation is bounded. Packing first selects the prefix the budget can hold, sizing every code reference at its smallest possible label. Only that prefix is checked, then repacked with the real labels, which can only shrink it, so no unchecked record is ever returned. Per recall: one path-limited `git status --porcelain=v2` (only the selected paths, never a repository scan), a `git cat-file --batch-check` only when a caller-pinned commit must be checked, at most 64 references (the rest `check_limit`), and 8 MiB hashed. Files are opened non-blocking and must be regular files, so a named pipe cannot hang recall.
+
+**Independent roots** (`independentRoots` in `src/integrity/provenance.ts`). Repetition is not evidence (PRD §13.5): a claim copied five times is still one observation. Every item has an `independentRoot`:
+
+- An imported record's root is its source event, `event:<host>/<eventId>`. The transcript id and branch are deliberately excluded: a Claude Code `/branch` or resumed session re-stores the same entries under a new transcript id, and an edited event keeps its id, so all copies and versions of one host event share a root.
+- A record `derived_from` or `supported_by` a visible record takes that record's root (derived_from first, then the earliest target): restating or resting on a claim is not a second observation of it.
+- Otherwise the root is the record itself, `record:<recordId>`. Memchor does not infer derivation from similar text. An uncited restatement cannot be told apart from an independent observation, so agents are instructed to cite instead of re-recording, and Memchor's own output in a transcript is never imported as a record.
+
+Among the loaded candidates, records with the same claim (body, whitespace-normalised) and the same root are collapsed into the first-ranked one, which lists up to five `copies` (id, host, session, source, time); the copies leave the recall sequence with it, so later pages never return them again. Records with the same claim but different roots are never collapsed. Each stays its own item, and `corroboration: { independentRoots, records }` says how many distinct observations and how many records state it. Different claims are never merged either, so conflicting Claude and Codex observations both appear, each with its `host`, `sessionId`, `source` and `createdAt`. Counting is limited to the page's candidates, which can only under-count roots, never over-count them.
 
 ## Transcript import
 
