@@ -214,6 +214,27 @@ export function checkIntegrity(path: string): IntegrityReport {
   return report;
 }
 
+const statements = new WeakMap<Db, Map<string, Database.Statement>>();
+
+/**
+ * A statement prepared once per connection. better-sqlite3 does not cache statements, and
+ * each one holds native SQLite memory until V8 collects its wrapper; preparing per call in a
+ * hot write path (thousands of records per import) grows the process by hundreds of MB.
+ */
+export function prepared(db: Db, sql: string): Database.Statement {
+  let cache = statements.get(db);
+  if (cache === undefined) {
+    cache = new Map();
+    statements.set(db, cache);
+  }
+  let statement = cache.get(sql);
+  if (statement === undefined) {
+    statement = db.prepare(sql);
+    cache.set(sql, statement);
+  }
+  return statement;
+}
+
 /** Throws unless called inside an open transaction; guards helpers whose atomicity depends on the caller's. */
 export function requireTransaction(db: Db, what: string): void {
   if (!db.inTransaction) throw new Error(`${what} must run inside the caller's write transaction`);

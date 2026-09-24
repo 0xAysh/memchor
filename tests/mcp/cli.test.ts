@@ -6,7 +6,7 @@ import { CLI, spawnServer } from "./harness.js";
 function memchor(cwd: string, home: string, ...args: string[]) {
   const run = spawnSync(process.execPath, [CLI, ...args], {
     cwd,
-    env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: home },
+    env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: home, CLAUDE_CONFIG_DIR: process.env["CLAUDE_CONFIG_DIR"] ?? "" },
     encoding: "utf8",
   });
   return { code: run.status, stdout: run.stdout, stderr: run.stderr };
@@ -33,7 +33,7 @@ describe("memchor CLI", () => {
     expect(JSON.parse(memchor(repo, home, "diag", "reindex").stdout)).toEqual({ records: 2, chunks: 4 });
     const integrity = memchor(repo, home, "diag", "integrity");
     expect(integrity.code).toBe(0);
-    expect(JSON.parse(integrity.stdout)).toMatchObject({ exists: true, schemaVersion: 1, ok: true, sqlite: ["ok"], searchIndex: "ok", foreignKeyViolations: 0 });
+    expect(JSON.parse(integrity.stdout)).toMatchObject({ exists: true, schemaVersion: 2, ok: true, sqlite: ["ok"], searchIndex: "ok", foreignKeyViolations: 0 });
   });
 
   test("diag status is read-only: the first real bootstrap afterwards still creates the workstream", async () => {
@@ -78,7 +78,7 @@ describe("memchor CLI", () => {
   test("the MCP server closes and exits cleanly on SIGTERM", async () => {
     const child = spawn(process.execPath, [CLI, "mcp"], {
       cwd: initRepo(),
-      env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: tempDir() },
+      env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: tempDir(), CLAUDE_CONFIG_DIR: process.env["CLAUDE_CONFIG_DIR"] ?? "" },
       stdio: ["pipe", "pipe", "pipe"],
     });
     await new Promise<void>((resolve) => child.stderr.on("data", (chunk: Buffer) => {

@@ -20,14 +20,34 @@ export interface ServerHandle {
   close(): Promise<void>;
 }
 
-/** Spawns `node dist/cli.js mcp` in `cwd` with an isolated MEMCHOR_HOME and connects an SDK client. */
-export async function spawnServer(options: { cwd: string; home: string; host?: string; clientName?: string }): Promise<ServerHandle> {
-  const args = [CLI, "mcp", ...(options.host === undefined ? [] : ["--host", options.host])];
+export const NO_NETWORK = resolve(import.meta.dirname, "no-network.mjs");
+
+/**
+ * Spawns `node dist/cli.js mcp` in `cwd` with an isolated MEMCHOR_HOME (and, if given, an
+ * isolated Claude config dir) and connects an SDK client. `networkLog` preloads a guard that
+ * records and refuses every network attempt.
+ */
+export async function spawnServer(options: {
+  cwd: string;
+  home: string;
+  host?: string;
+  clientName?: string;
+  claudeConfigDir?: string;
+  networkLog?: string;
+}): Promise<ServerHandle> {
+  const args = [...(options.networkLog === undefined ? [] : ["--import", NO_NETWORK]), CLI, "mcp", ...(options.host === undefined ? [] : ["--host", options.host])];
   const transport = new StdioClientTransport({
     command: process.execPath,
     args,
     cwd: options.cwd,
-    env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: options.home },
+    env: {
+      PATH: process.env["PATH"] ?? "",
+      HOME: process.env["HOME"] ?? "",
+      MEMCHOR_HOME: options.home,
+      // Never let a spawned server read the developer's real transcripts.
+      CLAUDE_CONFIG_DIR: options.claudeConfigDir ?? resolve(options.home, "no-claude-config"),
+      ...(options.networkLog === undefined ? {} : { MEMCHOR_NETWORK_LOG: options.networkLog }),
+    },
     stderr: "pipe",
   });
   const client = new Client({ name: options.clientName ?? "memchor-test", version: "0.0.0" });

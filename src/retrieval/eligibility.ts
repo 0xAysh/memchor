@@ -1,5 +1,5 @@
 import { MemchorError } from "../errors.js";
-import type { Db } from "../storage/database.js";
+import { type Db, prepared } from "../storage/database.js";
 
 /**
  * The single definition of which records a workstream may see. Workspace isolation is
@@ -43,7 +43,7 @@ export interface RecordRow {
  * unknown id or retracted → `not_found`; another workstream's record → `scope_denied`.
  */
 export function requireVisibleRecord(db: Db, workstreamId: string, recordId: string): RecordRow {
-  const row = db.prepare("SELECT * FROM records WHERE id = ?").get(recordId) as RecordRow | undefined;
+  const row = prepared(db, "SELECT * FROM records WHERE id = ?").get(recordId) as RecordRow | undefined;
   if (row === undefined || row.review_state === "retracted") {
     throw new MemchorError("not_found", `No eligible record ${recordId} exists in this workspace.`, {
       details: { recordId },

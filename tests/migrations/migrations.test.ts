@@ -3,6 +3,7 @@ import Database from "better-sqlite3";
 import { describe, expect, test } from "vitest";
 import { openMemory } from "../../src/memory.js";
 import { openDatabase, SCHEMA_VERSION } from "../../src/storage/database.js";
+import { sql as schemaV1 } from "../../src/storage/migrations/0001-initial.js";
 import { catchMemchorError, initRepo, tempDir } from "../helpers.js";
 
 const CANONICAL_TABLES = [
@@ -11,6 +12,7 @@ const CANONICAL_TABLES = [
   "chunks_fts",
   "consents",
   "import_cursors",
+  "import_events",
   "links",
   "operations",
   "records",
@@ -46,8 +48,28 @@ function atVersionZero(setup = ""): string {
 }
 
 describe("migrations", () => {
-  test("this build introduces schema version 1", () => {
-    expect(SCHEMA_VERSION).toBe(1);
+  test("this build introduces schema version 2", () => {
+    expect(SCHEMA_VERSION).toBe(2);
+  });
+
+  test("a version-1 database with memory upgrades to version 2 and keeps every row", () => {
+    const path = join(tempDir(), "memory.sqlite");
+    const v1 = new Database(path);
+    v1.exec(schemaV1);
+    v1.pragma("user_version = 1");
+    v1.exec(`INSERT INTO workstreams (id, label, created_at) VALUES ('wst_1', 'main', 'now');
+      INSERT INTO sessions (id, host, workstream_id, started_at) VALUES ('ses_1', 'codex', 'wst_1', 'now');
+      INSERT INTO records (id, kind, body, workstream_id, session_id, host, attribution, content_hash, created_at)
+        VALUES ('rec_1', 'note', 'kept across the upgrade', 'wst_1', 'ses_1', 'codex', 'agent_inference', 'h', 'now');`);
+    v1.close();
+
+    openDatabase(path).close();
+    expect(inspect(path)).toEqual({ version: 2, tables: CANONICAL_TABLES });
+    const db = new Database(path, { readonly: true });
+    expect(db.prepare("SELECT id, body FROM records").all()).toEqual([{ id: "rec_1", body: "kept across the upgrade" }]);
+    const cursorColumns = (db.pragma("table_info(import_cursors)") as { name: string }[]).map((c) => c.name);
+    expect(cursorColumns).toEqual(expect.arrayContaining(["transcript_id", "byte_offset", "anchor_hash", "state", "gap", "stats"]));
+    db.close();
   });
 
   test("a new database is created at the current schema version", () => {

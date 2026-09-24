@@ -6,6 +6,7 @@ Memchor stores knowledge *about* the work: goals, status, decisions, failed atte
 
 - Stored locally in one SQLite database per repository, under `~/.memchor` (or `$MEMCHOR_HOME`). Nothing is written into the repository.
 - No daemon, no network, no embeddings. Several host processes share the database through SQLite WAL.
+- On first use with Claude Code, Memchor offers to seed memory from local Claude Code transcripts (`all projects`, `current project only`, or `none`). Imported passages are bounded, attributed and cited back to their transcript; hidden reasoning, binaries, recognised secrets, file contents and Memchor's own output are left out.
 
 ## Development
 
@@ -17,7 +18,12 @@ npm run build       # tsc → dist/
 npm run typecheck
 npm run lint
 npm test            # builds dist/, then runs all suites against real SQLite, Git and server processes
+
+# Opt-in: check the importer against your real Claude Code history, read in place (nothing is copied or committed)
+MEMCHOR_REAL_CLAUDE_DIR=~/.claude npx vitest run tests/import/real-history.test.ts
 ```
+
+Tests never read your real transcripts otherwise: `vitest.config.ts` points `CLAUDE_CONFIG_DIR` at an empty directory, and every fixture under `tests/import/fixtures/` is hand-written.
 
 ## Commands
 
@@ -29,7 +35,12 @@ memchor diag reindex                                # rebuild the search index f
 memchor diag integrity                              # SQLite, foreign-key and FTS integrity checks (read-only)
 memchor diag demo [--temp-home]                     # run the tracer flow here and print the pack
                                                     # (writes demo records: set MEMCHOR_HOME or pass --temp-home)
+memchor diag consent [--set all|current_project|none]
+                                                    # show or change Claude Code's transcript-import decision
+memchor diag import                                 # import approved transcripts to completion; print progress and timing
 ```
+
+Claude Code transcripts are read from `$CLAUDE_CONFIG_DIR/projects` (default `~/.claude/projects`). The import decision is stored per host in `$MEMCHOR_HOME/consent.json`.
 
 Scope always comes from the current directory's Git worktree. No command or tool accepts a workspace id or path.
 

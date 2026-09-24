@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveHome } from "./bootstrap/workspace-resolution.js";
 import { MemchorError } from "./errors.js";
-import { openMemory, type Memory } from "./memory.js";
-import { LIMITS } from "./schemas.js";
+import { type ImportStatus, openMemory, type Memory } from "./memory.js";
+import { IMPORT_CHOICES, type ImportChoice, LIMITS } from "./schemas.js";
 import { assertEmbeddedRuntime } from "./storage/database.js";
 import { runStdioServer } from "./transports/mcp.js";
 
@@ -18,6 +18,9 @@ const USAGE = `Usage:
   memchor diag integrity                              SQLite, foreign-key and search-index checks
   memchor diag demo [--temp-home]                     Run bootstrap → record → checkpoint → recall here and print the pack
                                                       (writes demo records to $MEMCHOR_HOME, or to a new temp home)
+  memchor diag consent [--set all|current_project|none] [--host claude-code]
+                                                      Show (or change) the host's transcript-import decision
+  memchor diag import [--host claude-code]            Import approved transcripts to completion and print progress
 
 Scope is always the Git worktree of the current directory. Storage: $MEMCHOR_HOME or ~/.memchor.`;
 
@@ -36,11 +39,21 @@ async function main(argv: string[]): Promise<number> {
   if (command === "diag" && subcommand !== undefined) {
     const { values } = parseArgs({
       args: argv.slice(2),
-      options: { query: { type: "string" }, kind: { type: "string", multiple: true }, "temp-home": { type: "boolean" } },
+      options: {
+        query: { type: "string" },
+        kind: { type: "string", multiple: true },
+        "temp-home": { type: "boolean" },
+        set: { type: "string" },
+        host: { type: "string" },
+      },
       strict: true,
     });
     const home = values["temp-home"] === true ? mkdtempSync(join(tmpdir(), "memchor-demo-")) : resolveHome(undefined);
-    const memory = openMemory({ cwd: process.cwd(), host: "memchor-diag", home });
+    // Transcript commands act as the host whose history they manage; the rest as a diagnostic tool.
+    const transcripts = subcommand === "consent" || subcommand === "import";
+    const host = values.host ?? (transcripts ? "claude-code" : "memchor-diag");
+    if (values.set !== undefined && !IMPORT_CHOICES.includes(values.set as ImportChoice)) return usage(`--set must be one of ${IMPORT_CHOICES.join(", ")}`);
+    const memory = openMemory({ cwd: process.cwd(), host, home });
     try {
       return diag(memory, subcommand, values, home);
     } finally {
@@ -50,8 +63,27 @@ async function main(argv: string[]): Promise<number> {
   return usage(command === undefined || command === "--help" || command === "help" ? undefined : `unknown command ${argv.join(" ")}`);
 }
 
-function diag(memory: Memory, subcommand: string, values: { query?: string | undefined; kind?: string[] | undefined }, home: string): number {
+function diag(memory: Memory, subcommand: string, values: { query?: string | undefined; kind?: string[] | undefined; set?: string | undefined }, home: string): number {
   switch (subcommand) {
+    case "consent": {
+      const status = values.set === undefined ? memory.status().import : memory.bootstrap({ importChoice: values.set as ImportChoice }).import;
+      print({ consent: status?.consent ?? null, state: status?.state ?? null, transcripts: status?.transcripts ?? null, transcriptsRoot: status?.transcriptsRoot ?? null });
+      return 0;
+    }
+    case "import": {
+      const started = performance.now();
+      let peakRss = process.memoryUsage().rss;
+      let status: ImportStatus = memory.bootstrap().import;
+      const afterBootstrapMs = Math.round(performance.now() - started);
+      for (let done = status.state !== "in_progress"; !done; ) {
+        const step = memory.continueImport({ maxMs: 1_000 });
+        peakRss = Math.max(peakRss, process.memoryUsage().rss);
+        status = step;
+        done = step.done || step.problem !== null;
+      }
+      print({ elapsedMs: Math.round(performance.now() - started), afterBootstrapMs, peakRssMB: Math.round(peakRss / 1e6), import: status });
+      return status.problem === null ? 0 : 1;
+    }
     case "status":
       print(memory.status());
       return 0;

@@ -133,7 +133,7 @@ function readRegistry(path: string): Registry {
 }
 
 /** Write to a unique temp file in the same directory, fsync, then rename over the target. */
-function writeFileAtomic(path: string, content: string): void {
+export function writeFileAtomic(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   const fd = openSync(tmp, "wx", 0o600);

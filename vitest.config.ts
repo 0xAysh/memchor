@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { delimiter, dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { delimiter, dirname, join } from "node:path";
 import { defineConfig } from "vitest/config";
 
 /**
@@ -19,12 +20,14 @@ function pathWithRealGit(): string | undefined {
 }
 
 const PATH = pathWithRealGit();
+/** Tests never read the developer's real Claude Code history unless a test passes its own config dir. */
+const CLAUDE_CONFIG_DIR = join(tmpdir(), "memchor-tests-no-claude-config");
 
 export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
     globalSetup: ["tests/global-setup.ts"],
-    ...(PATH === undefined ? {} : { env: { PATH } }),
+    env: { CLAUDE_CONFIG_DIR, ...(PATH === undefined ? {} : { PATH }) },
     // Storage tests open real SQLite files and spawn `git` and server processes; give them headroom.
     testTimeout: 30_000,
     hookTimeout: 30_000,
