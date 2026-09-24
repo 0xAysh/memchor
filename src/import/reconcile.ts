@@ -195,6 +195,12 @@ export class TranscriptImporter {
    * them is stored; they are retried when the file changes or at the next bootstrap.
    */
   private readonly held = new Map<string, { size: number; mtimeMs: number; gap: ImportGap }>();
+  /**
+   * Transcripts that stop at their very first line (e.g. a Codex rollout created by an
+   * unsupported version): nothing is readable, so nothing is stored for them, not even a cursor.
+   * They are reported as stopped with their gap, and read again on every pass.
+   */
+  private readonly unreadable = new Map<string, ImportGap>();
   /** Fingerprint of the other projects' approved transcripts when this process last finished reconciling them. */
   private reconciledOthers: string | null = null;
   private batches = 0;
@@ -378,7 +384,12 @@ export class TranscriptImporter {
       // Nothing complete past the cursor right now (EOF, or a line still being written).
       const caughtUp = chunk.stop === null && (!progressed || chunk.end >= file.size);
       if (!progressed && !rewritten) {
-        if (known === null) return "done"; // a new transcript with no complete line yet: nothing to record
+        if (known === null) {
+          // A new transcript with no complete line yet, or one unreadable from its first line: nothing to record.
+          if (chunk.stop === null) this.unreadable.delete(file.transcriptId);
+          else this.unreadable.set(file.transcriptId, unsupportedGap(file.transcriptId, this.options.adapter.displayName, chunk.stop.hostVersion));
+          return "done";
+        }
         if (chunk.stop === null && known.state === "active" && known.finished) return "done";
         if (chunk.stop !== null && known.state === "stopped") return "done"; // still the same unsupported entry
       }
@@ -427,12 +438,7 @@ export class TranscriptImporter {
           } else if (chunk.stop !== null) {
             state = "stopped";
             newOffset = chunk.stop.offset;
-            gap = {
-              transcriptId: file.transcriptId,
-              reason: "unsupported_version",
-              hostVersion: chunk.stop.hostVersion,
-              message: `${this.options.adapter.displayName} ${chunk.stop.hostVersion} is not in Memchor's compatibility table; this transcript is imported up to that entry and will resume once a Memchor that supports it is installed.`,
-            };
+            gap = unsupportedGap(file.transcriptId, this.options.adapter.displayName, chunk.stop.hostVersion);
           }
           if (state === "active" && caughtUp && epoch > 0) {
             counters.missing = (
@@ -490,6 +496,7 @@ export class TranscriptImporter {
         throw error;
       }
       this.held.delete(file.transcriptId);
+      this.unreadable.delete(file.transcriptId);
       this.batches++;
       expected = { offset: next.offset, epoch };
       known = { state: next.state, finished: next.finished };
@@ -583,14 +590,15 @@ export class TranscriptImporter {
       if (cursor.gap !== null) status.gaps.push(JSON.parse(cursor.gap) as ImportGap);
     }
     const held = (entry: Discovered): boolean => !cursors.has(entry.file.transcriptId) && this.held.has(entry.file.transcriptId);
+    const unreadable = (entry: Discovered): boolean => !cursors.has(entry.file.transcriptId) && this.unreadable.has(entry.file.transcriptId);
     for (const entry of entries) {
-      const gap = held(entry) ? this.held.get(entry.file.transcriptId)?.gap : undefined;
+      const gap = held(entry) ? this.held.get(entry.file.transcriptId)?.gap : unreadable(entry) ? this.unreadable.get(entry.file.transcriptId) : undefined;
       if (gap !== undefined) status.gaps.push(entry.target?.workspaceId === own.workspaceId ? gap : { ...gap, workspace: entry.target?.label ?? "" });
     }
     for (const entry of mine) {
       const cursor = cursors.get(entry.file.transcriptId);
       if (cursor?.state === "quarantined" || held(entry)) progress.quarantined++;
-      else if (cursor?.state === "stopped") progress.stopped++;
+      else if (cursor?.state === "stopped" || unreadable(entry)) progress.stopped++;
       else if (cursor !== undefined && cursor.file_size === entry.file.size && cursor.file_mtime_ms === entry.file.mtimeMs) progress.complete++;
       else progress.pending++;
     }
@@ -606,6 +614,15 @@ export class TranscriptImporter {
     status.state = progress.pending > 0 || !status.backfill.reconciled ? "in_progress" : "complete";
     return status;
   }
+}
+
+function unsupportedGap(transcriptId: string, hostName: string, hostVersion: string): ImportGap {
+  return {
+    transcriptId,
+    reason: "unsupported_version",
+    hostVersion,
+    message: `${hostName} ${hostVersion} is not in Memchor's compatibility table; this transcript is imported up to that entry and will resume once a Memchor that supports it is installed.`,
+  };
 }
 
 function consentQuestion(host: string, counts: NonNullable<ImportStatus["transcripts"]>): string {

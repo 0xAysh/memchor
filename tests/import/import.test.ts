@@ -189,8 +189,9 @@ describe("first-use consent", () => {
     expect(memory.status().import?.consent?.choice).toBe("current_project");
     expect(memory.status().counts?.records).toBeGreaterThan(0);
 
-    const codex = open(repo, e, { host: "codex" });
-    expect(codex.bootstrap().import).toMatchObject({ host: "codex", state: "unsupported_host", consent: null });
+    // Codex has its own decision; a host without an adapter has none to make.
+    expect(open(repo, e, { host: "codex" }).bootstrap().import).toMatchObject({ host: "codex", state: "consent_required", consent: null });
+    expect(open(repo, e, { host: "pi" }).bootstrap().import).toMatchObject({ host: "pi", state: "unsupported_host", consent: null });
   });
 });
 

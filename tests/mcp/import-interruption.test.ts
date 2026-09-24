@@ -12,7 +12,7 @@ interface ImportRun {
 }
 
 function env(home: string, config: string): NodeJS.ProcessEnv {
-  return { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: home, CLAUDE_CONFIG_DIR: config };
+  return { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: home, CLAUDE_CONFIG_DIR: config, CODEX_HOME: process.env["CODEX_HOME"] ?? "" };
 }
 
 function memchor(cwd: string, home: string, config: string, ...args: string[]): ImportRun {

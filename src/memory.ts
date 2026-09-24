@@ -13,6 +13,7 @@ import { headCommit, locateWorkspace, registerWorkspace, resolveHome, type Works
 import { type ErrorCode, MemchorError } from "./errors.js";
 import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integrity/checkpoints.js";
 import { claudeCodeAdapter } from "./import/adapters/claude.js";
+import { codexAdapter } from "./import/adapters/codex.js";
 import type { TranscriptAdapter } from "./import/normalized-event.js";
 import { type ImportStatus, TranscriptImporter, unsupportedHostStatus } from "./import/reconcile.js";
 import { type Citation, citationsFor, importedFrom, type ImportedSource, independentRoots, linksOf } from "./integrity/provenance.js";
@@ -88,6 +89,8 @@ export interface OpenMemoryOptions {
   busyTimeoutMs?: number;
   /** Claude Code's config directory (transcripts live in its `projects/`). Defaults to `$CLAUDE_CONFIG_DIR`, then `~/.claude`. */
   claudeConfigDir?: string;
+  /** Codex's home directory (rollouts live in its `sessions/` and `archived_sessions/`). Defaults to `$CODEX_HOME`, then `~/.codex`. */
+  codexHome?: string;
   /** Alternate host-format adapter, primarily for compatibility and privacy integration tests. */
   transcriptAdapter?: TranscriptAdapter;
   /** How long `bootstrap` may spend importing the current project's transcripts before returning. Default 3000 ms. */
@@ -389,6 +392,18 @@ export function openMemory(options: OpenMemoryOptions): Memory {
 
 // ───────────────────────────── Implementation ─────────────────────────────
 
+/** The host's transcript format, or null for a host Memchor cannot import from (e.g. "pi", "unknown"). */
+function transcriptAdapterFor(host: string, options: OpenMemoryOptions): TranscriptAdapter | null {
+  switch (host) {
+    case "claude-code":
+      return claudeCodeAdapter(options.claudeConfigDir === undefined ? {} : { configDir: options.claudeConfigDir });
+    case "codex":
+      return codexAdapter(options.codexHome === undefined ? {} : { codexHome: options.codexHome });
+    default:
+      return null;
+  }
+}
+
 const OPERATIONS = Object.keys(OPERATION_SCHEMAS);
 const DEFAULT_IMPORT_BUDGET_MS = 3_000;
 
@@ -415,7 +430,7 @@ class LocalMemory implements Memory {
     this.home = resolveHome(options.home);
     this.busyTimeoutMs = options.busyTimeoutMs;
     this.hostSessionId = options.hostSessionId;
-    const adapter = options.transcriptAdapter ?? (this.host === "claude-code" ? claudeCodeAdapter(options.claudeConfigDir === undefined ? {} : { configDir: options.claudeConfigDir }) : null);
+    const adapter = options.transcriptAdapter ?? transcriptAdapterFor(this.host, options);
     this.importer =
       adapter === null
         ? null

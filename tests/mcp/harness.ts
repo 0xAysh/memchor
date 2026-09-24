@@ -24,7 +24,7 @@ export const NO_NETWORK = resolve(import.meta.dirname, "no-network.mjs");
 
 /**
  * Spawns `node dist/cli.js mcp` in `cwd` with an isolated MEMCHOR_HOME (and, if given, an
- * isolated Claude config dir) and connects an SDK client. `networkLog` preloads a guard that
+ * isolated Claude config dir or Codex home) and connects an SDK client. `networkLog` preloads a guard that
  * records and refuses every network attempt.
  */
 export async function spawnServer(options: {
@@ -33,6 +33,7 @@ export async function spawnServer(options: {
   host?: string;
   clientName?: string;
   claudeConfigDir?: string;
+  codexHome?: string;
   networkLog?: string;
 }): Promise<ServerHandle> {
   const args = [...(options.networkLog === undefined ? [] : ["--import", NO_NETWORK]), CLI, "mcp", ...(options.host === undefined ? [] : ["--host", options.host])];
@@ -46,6 +47,7 @@ export async function spawnServer(options: {
       MEMCHOR_HOME: options.home,
       // Never let a spawned server read the developer's real transcripts.
       CLAUDE_CONFIG_DIR: options.claudeConfigDir ?? resolve(options.home, "no-claude-config"),
+      CODEX_HOME: options.codexHome ?? resolve(options.home, "no-codex-home"),
       ...(options.networkLog === undefined ? {} : { MEMCHOR_NETWORK_LOG: options.networkLog }),
     },
     stderr: "pipe",

@@ -1,12 +1,17 @@
 import { spawn, spawnSync } from "node:child_process";
 import { describe, expect, test } from "vitest";
 import { initRepo, tempDir } from "../helpers.js";
+import { codexHome, installCodexRollout } from "../import/fixtures.js";
 import { CLI, spawnServer } from "./harness.js";
 
 function memchor(cwd: string, home: string, ...args: string[]) {
+  return memchorWith({}, cwd, home, ...args);
+}
+
+function memchorWith(env: Record<string, string>, cwd: string, home: string, ...args: string[]) {
   const run = spawnSync(process.execPath, [CLI, ...args], {
     cwd,
-    env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: home, CLAUDE_CONFIG_DIR: process.env["CLAUDE_CONFIG_DIR"] ?? "" },
+    env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: home, CLAUDE_CONFIG_DIR: process.env["CLAUDE_CONFIG_DIR"] ?? "", CODEX_HOME: process.env["CODEX_HOME"] ?? "", ...env },
     encoding: "utf8",
   });
   return { code: run.status, stdout: run.stdout, stderr: run.stderr };
@@ -49,6 +54,25 @@ describe("memchor CLI", () => {
     expect(await server.ok("memory_bootstrap")).toMatchObject({ created: { workspace: true, workstream: true } });
   });
 
+  test("diag consent and diag import manage Codex history with --host codex, reading $CODEX_HOME", () => {
+    const repo = initRepo();
+    const home = tempDir();
+    const codex = codexHome();
+    installCodexRollout(codex, "0.142.5/basic.jsonl", { cwd: repo });
+    const env = { CODEX_HOME: codex };
+
+    const asked = memchorWith(env, repo, home, "diag", "consent", "--host", "codex");
+    expect(asked.code).toBe(0);
+    expect(JSON.parse(asked.stdout)).toMatchObject({ consent: null, state: "consent_required", transcripts: { found: 1, currentProject: 1 }, transcriptsRoot: codex });
+    expect(JSON.parse(memchorWith(env, repo, home, "diag", "consent", "--host", "codex", "--set", "current_project").stdout)).toMatchObject({ consent: { choice: "current_project" } });
+    // Codex's decision is its own: Claude Code's is still unanswered.
+    expect(JSON.parse(memchor(repo, home, "diag", "consent").stdout)).toMatchObject({ consent: null });
+
+    const imported = memchorWith(env, repo, home, "diag", "import", "--host", "codex");
+    expect(imported.code).toBe(0);
+    expect(JSON.parse(imported.stdout)).toMatchObject({ import: { host: "codex", state: "complete", problem: null, currentProject: { complete: 1, counters: { records: 8 } } } });
+  });
+
   test("diag demo runs the tracer flow against MEMCHOR_HOME and prints the recalled pack", () => {
     const repo = initRepo();
     const home = tempDir();
@@ -78,7 +102,7 @@ describe("memchor CLI", () => {
   test("the MCP server closes and exits cleanly on SIGTERM", async () => {
     const child = spawn(process.execPath, [CLI, "mcp"], {
       cwd: initRepo(),
-      env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: tempDir(), CLAUDE_CONFIG_DIR: process.env["CLAUDE_CONFIG_DIR"] ?? "" },
+      env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: tempDir(), CLAUDE_CONFIG_DIR: process.env["CLAUDE_CONFIG_DIR"] ?? "", CODEX_HOME: process.env["CODEX_HOME"] ?? "" },
       stdio: ["pipe", "pipe", "pipe"],
     });
     await new Promise<void>((resolve) => child.stderr.on("data", (chunk: Buffer) => {

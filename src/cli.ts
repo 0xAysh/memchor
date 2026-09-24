@@ -18,9 +18,9 @@ const USAGE = `Usage:
   memchor diag integrity                              SQLite, foreign-key and search-index checks
   memchor diag demo [--temp-home]                     Run bootstrap → record → checkpoint → recall here and print the pack
                                                       (writes demo records to $MEMCHOR_HOME, or to a new temp home)
-  memchor diag consent [--set all|current_project|none] [--host claude-code]
+  memchor diag consent [--set all|current_project|none] [--host claude-code|codex]
                                                       Show (or change) the host's transcript-import decision
-  memchor diag import [--host claude-code]            Import approved transcripts to completion and print progress
+  memchor diag import [--host claude-code|codex]      Import approved transcripts to completion and print progress
 
 Scope is always the Git worktree of the current directory. Storage: $MEMCHOR_HOME or ~/.memchor.`;
 
