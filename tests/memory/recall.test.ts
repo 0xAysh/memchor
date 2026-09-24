@@ -182,7 +182,7 @@ describe("recall", () => {
     const home = tempDir();
     const memory = open(repo, home);
     for (let i = 0; i < 5; i++) memory.record({ kind: "note", body: `item ${i} ${"y ".repeat(200)}`, attribution: "agent_inference" });
-    const { continuation } = memory.recall({ maxTokens: 150 });
+    const { continuation } = memory.recall({ maxTokens: 250 });
     expect(continuation).not.toBeNull();
     const token = continuation ?? "";
 
@@ -203,12 +203,12 @@ describe("recall", () => {
     memory.record({ kind: "note", body: "some later item", attribution: "agent_inference" });
     memory.checkpoint({ expectedRevision: 0, goal: "big", status: "s ".repeat(1500) });
 
-    const pack = memory.recall({ maxTokens: 100 });
+    const pack = memory.recall({ maxTokens: 250 });
     expect(pack.checkpoint?.truncated).toBe(true);
     expect(pack.items).toEqual([]);
     expect(pack.truncated).toBe(true);
-    expect(pack.budget.usedBytes).toBeLessThanOrEqual(400);
-    const next = memory.recall({ continuation: pack.continuation ?? "", maxTokens: 100 });
+    expect(pack.budget.usedBytes).toBeLessThanOrEqual(1_000);
+    const next = memory.recall({ continuation: pack.continuation ?? "", maxTokens: 250 });
     expect(next.checkpoint).toBeNull();
     expect(next.items).toHaveLength(1);
   });

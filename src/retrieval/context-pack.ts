@@ -182,3 +182,62 @@ export function packPage<C, I>(budget: Budget, checkpoint: Packable<C> | null, c
 export function usage(usedBytes: number): { usedBytes: number; usedTokens: number } {
   return { usedBytes, usedTokens: estimateTokens(usedBytes) };
 }
+
+/** Appended to an excerpt that was cut to fit, so a clipped body never reads as the whole record. */
+export const CUT_MARKER = " [… cut by Memchor to fit the budget; memory_read this recordId for the rest]";
+
+/** At most this many collapsed copies are listed on an item; `corroboration.records` counts them all. */
+export const LISTED_COPIES = 5;
+
+/**
+ * Records that state one claim from one independent root, collapsed into one entry.
+ *
+ * A claim is the record body with whitespace normalised; two records share a root when
+ * provenance says one repeats the other (see `independentRoots`). Copies are folded into
+ * the first-ranked record of their (claim, root) group. Records with the same claim but
+ * different roots are never folded together: each stays its own entry, and
+ * `independentRoots` tells how many distinct observations back the claim.
+ */
+export interface ClaimGroup<R> {
+  representative: R;
+  /** Other records with the same claim and root, in rank order. */
+  copies: R[];
+  /** Distinct roots among the loaded records carrying this claim. */
+  independentRoots: number;
+  /** Loaded records carrying this claim, across all roots (copies included). */
+  records: number;
+}
+
+export function groupClaims<R>(rows: readonly R[], claimOf: (row: R) => string, rootOf: (row: R) => string): ClaimGroup<R>[] {
+  const byClaim = new Map<string, { roots: Set<string>; records: number }>();
+  const byKey = new Map<string, ClaimGroup<R>>();
+  const groups: ClaimGroup<R>[] = [];
+  for (const row of rows) {
+    const claim = claimOf(row);
+    const root = rootOf(row);
+    const stats = byClaim.get(claim) ?? { roots: new Set<string>(), records: 0 };
+    stats.roots.add(root);
+    stats.records++;
+    byClaim.set(claim, stats);
+    const key = `${root}\u0000${claim}`;
+    const group = byKey.get(key);
+    if (group === undefined) {
+      const created: ClaimGroup<R> = { representative: row, copies: [], independentRoots: 0, records: 0 };
+      byKey.set(key, created);
+      groups.push(created);
+    } else {
+      group.copies.push(row);
+    }
+  }
+  for (const group of groups) {
+    const stats = byClaim.get(claimOf(group.representative));
+    group.independentRoots = stats?.roots.size ?? 1;
+    group.records = stats?.records ?? 1;
+  }
+  return groups;
+}
+
+/** The claim a body states, for grouping copies: whitespace-insensitive, otherwise exact. */
+export function normalizeClaim(body: string): string {
+  return body.trim().replace(/\s+/gu, " ");
+}

@@ -7,9 +7,23 @@ import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integ
 import { claudeCodeAdapter } from "./import/adapters/claude.js";
 import type { TranscriptAdapter } from "./import/normalized-event.js";
 import { type ImportStatus, TranscriptImporter, unsupportedHostStatus } from "./import/reconcile.js";
-import { type Citation, citationsFor, importedFrom, type ImportedSource, linksOf } from "./integrity/provenance.js";
-import { type ContinuationState, ITEM_EXCERPT_BYTES, openContinuation, packPage, type Packable, sealContinuation, usage } from "./retrieval/context-pack.js";
+import { type Citation, citationsFor, importedFrom, type ImportedSource, independentRoots, linksOf } from "./integrity/provenance.js";
+import {
+  type ClaimGroup,
+  type ContinuationState,
+  CUT_MARKER,
+  groupClaims,
+  ITEM_EXCERPT_BYTES,
+  LISTED_COPIES,
+  normalizeClaim,
+  openContinuation,
+  packPage,
+  type Packable,
+  sealContinuation,
+  usage,
+} from "./retrieval/context-pack.js";
 import { requireVisibleRecord, type RecordRow } from "./retrieval/eligibility.js";
+import { captureObservations, type CheckedRef, checkFreshness, freshnessFloor, type RecordFreshness, type StoredRef } from "./retrieval/freshness.js";
 import { type Candidate, clipToBytes, loadCandidates, PAGE_CANDIDATES, rankSequence, rebuildSearchIndex, SEQUENCE_CAP, toFtsQuery } from "./retrieval/search.js";
 import {
   type Applicability,
@@ -19,7 +33,6 @@ import {
   ContinueImportInput,
   effectiveBudget,
   estimateTokens,
-  type ExternalRef,
   type Freshness,
   LIMITS,
   type LinkRelation,
@@ -46,6 +59,7 @@ import {
 import { appendRecord, recordFields } from "./storage/records.js";
 
 export type { ImportedSource, Citation } from "./integrity/provenance.js";
+export type { CheckedRef, FreshnessReason } from "./retrieval/freshness.js";
 export type { ImportCounters, ImportGap, ImportStatus } from "./import/reconcile.js";
 export type { IntegrityReport } from "./storage/database.js";
 
@@ -88,20 +102,54 @@ export interface PackItem {
   recordId: string;
   kind: RecordKind;
   title: string | null;
-  /** A passage of the body (the best-matching one for a query). Use `read` for the rest. */
+  /**
+   * A passage of the body (the best-matching one for a query). Use `read` for the rest.
+   * A passage cut to fit the budget ends with an explicit "cut by Memchor" marker.
+   */
   excerpt: string;
   /** True when `excerpt` is not the whole body. */
   truncated: boolean;
   attribution: Attribution;
   reviewState: ReviewState;
-  /** Always "unknown" until freshness validation ships; verify live artifacts before acting. */
+  /**
+   * Checked now, against the live worktree: the worst of `externalRefs` (stale > unknown >
+   * current); "unknown" for a record without references. Memory never replaces live code.
+   */
   freshness: Freshness;
+  /** What to do before relying on this record (read the current file, verify remote state); null when every reference is current or there are none. */
+  warning: string | null;
   applicability: Applicability;
   citations: Citation[];
-  externalRefs: ExternalRef[];
+  /** Each reference with its own freshness and reason (see `FreshnessReason`). */
+  externalRefs: CheckedRef[];
   workspaceLevel: boolean;
   host: string;
+  /** Memchor session that wrote (or imported) the record. */
+  sessionId: string | null;
   /** Where an imported record came from (host, transcript, event); null for records agents wrote. */
+  source: ImportedSource | null;
+  /** When the content was observed (the event time for imported records). */
+  createdAt: string;
+  /**
+   * The observation this claim comes from: `event:<host>/<eventId>` for imported records
+   * (shared by every transcript copy of that event), else `record:<recordId>` of the
+   * record it was derived from or rests on, else its own.
+   */
+  independentRoot: string;
+  /**
+   * `independentRoots`: distinct roots among the loaded records stating this same claim;
+   * `records`: how many records state it. Copies of one root never count twice.
+   */
+  corroboration: { independentRoots: number; records: number };
+  /** Other records with the same claim and root, collapsed into this item (at most 5 listed). */
+  copies: PackCopy[];
+}
+
+/** A record folded into an item because it repeats the item's claim from the same root. */
+export interface PackCopy {
+  recordId: string;
+  host: string;
+  sessionId: string | null;
   source: ImportedSource | null;
   createdAt: string;
 }
@@ -111,9 +159,12 @@ export interface PackCheckpoint {
   revision: number;
   excerpt: string;
   truncated: boolean;
+  freshness: Freshness;
+  warning: string | null;
   citations: Citation[];
-  externalRefs: ExternalRef[];
+  externalRefs: CheckedRef[];
   host: string;
+  sessionId: string | null;
   createdAt: string;
 }
 
@@ -191,9 +242,12 @@ export interface ReadResult {
   totalLength: number;
   attribution: Attribution;
   reviewState: ReviewState;
+  /** Checked now against the live worktree, as in a pack item. */
   freshness: Freshness;
+  warning: string | null;
   applicability: Applicability;
-  externalRefs: ExternalRef[];
+  externalRefs: CheckedRef[];
+  independentRoot: string;
   /** Links in both directions whose other end is visible in this scope. */
   links: { recordId: string; relation: LinkRelation; direction: "outgoing" | "incoming" }[];
   workspaceLevel: boolean;
@@ -234,6 +288,7 @@ export interface StatusResult {
   counts: { records: number; checkpoints: number; workstreams: number; sessions: number } | null;
   /** Set when scope or storage could not be resolved; status itself never throws for these. */
   problem: { code: ErrorCode; message: string } | null;
+  /** `freshnessValidation`: recall and read check local code references against the live worktree. */
   capabilities: { operations: string[]; freshnessValidation: boolean; transcriptImport: boolean };
   /** Consent, discovered transcripts, this project's import progress and capture gaps; null when scope is unresolved. */
   import: ImportStatus | null;
@@ -367,6 +422,9 @@ class LocalMemory implements Memory {
       const parsed = parse(RecordInput, input);
       const { db, scope } = this.bind();
       const applicability = withHeadCommit(parsed.applicability, scope.worktree);
+      // Observed outside the write transaction (Git and file reads must not hold the lock),
+      // and not part of the idempotency hash, which covers only what the caller sent.
+      const externalRefs = captureObservations(scope.worktree, parsed.externalRefs);
       const links: Citation[] = [
         ...parsed.supportedBy.map((recordId) => ({ recordId, relation: "supported_by" as const })),
         ...parsed.links.map((link) => ({ recordId: link.to, relation: link.relation })),
@@ -382,7 +440,7 @@ class LocalMemory implements Memory {
           attribution: parsed.attribution,
           reviewState: parsed.reviewState,
           applicability,
-          externalRefs: parsed.externalRefs,
+          externalRefs,
           links,
         });
         return {
@@ -401,10 +459,11 @@ class LocalMemory implements Memory {
       const parsed = parse(CheckpointInput, input);
       const { db, scope } = this.bind();
       const applicability = withHeadCommit({}, scope.worktree);
+      const externalRefs = captureObservations(scope.worktree, parsed.externalRefs);
       // Replay is checked before the revision compare, so retrying a checkpoint that
       // already succeeded returns its result instead of a spurious conflict.
       return this.idempotent(db, scope, "checkpoint", parsed, () =>
-        publishCheckpoint(db, scope, parsed.expectedRevision, parsed, applicability),
+        publishCheckpoint(db, scope, parsed.expectedRevision, { ...parsed, externalRefs }, applicability),
       );
     });
   }
@@ -442,6 +501,9 @@ class LocalMemory implements Memory {
         const end = offset + body.length;
         const nextOffset = end < row.body.length ? end : null;
         const revision = db.prepare("SELECT revision FROM checkpoints WHERE record_id = ?").get(row.id) as { revision: number } | undefined;
+        const source = importedFrom(db, [row.id]).get(row.id) ?? null;
+        const fields = recordFields(row);
+        const checked = checkFreshness(scope.worktree, [{ recordId: row.id, refs: fields.externalRefs, imported: source !== null }]).get(row.id);
         return {
           recordId: row.id,
           title: row.title,
@@ -450,12 +512,16 @@ class LocalMemory implements Memory {
           nextOffset,
           truncated: nextOffset !== null,
           totalLength: row.body.length,
-          ...recordFields(row),
+          ...fields,
+          freshness: checked?.freshness ?? "unknown",
+          warning: checked?.warning ?? null,
+          externalRefs: checked?.externalRefs ?? [],
+          independentRoot: independentRoots(db, scope.workstreamId, [row.id]).get(row.id) ?? `record:${row.id}`,
           links: linksOf(db, scope.workstreamId, row.id),
           checkpointRevision: revision?.revision ?? null,
           host: row.host,
           sessionId: row.session_id,
-          source: importedFrom(db, [row.id]).get(row.id) ?? null,
+          source,
           contentHash: row.content_hash,
           createdAt: row.created_at,
           budget: { ...budget, ...usage(Buffer.byteLength(body, "utf8")) },
@@ -473,7 +539,7 @@ class LocalMemory implements Memory {
         scope: null,
         counts: null,
         problem: null,
-        capabilities: { operations: OPERATIONS, freshnessValidation: false, transcriptImport: this.importer !== null },
+        capabilities: { operations: OPERATIONS, freshnessValidation: true, transcriptImport: this.importer !== null },
         import: null,
       };
       let db: Db | null = null;
@@ -674,8 +740,10 @@ class LocalMemory implements Memory {
       const rows = loadCandidates(db, { workstreamId: scope.workstreamId, match, seqs: window });
       const citations = citationsFor(db, scope.workstreamId, [...rows.map((r) => r.id), ...(checkpointRow ? [checkpointRow.id] : [])]);
       const sources = importedFrom(db, rows.map((r) => r.id));
+      const roots = independentRoots(db, scope.workstreamId, rows.map((r) => r.id));
+      const groups = groupClaims(rows, (row) => normalizeClaim(row.body), (row) => roots.get(row.id) ?? `record:${row.id}`);
 
-      const checkpointPackable: Packable<PackCheckpoint> | null =
+      const checkpointPackable = (freshness: RecordFreshness): Packable<PackCheckpoint> | null =>
         checkpointRow === null
           ? null
           : {
@@ -685,19 +753,48 @@ class LocalMemory implements Memory {
               build: (excerpt, truncated) => ({
                 recordId: checkpointRow.id,
                 revision: view.headRevision,
-                excerpt,
+                excerpt: truncated ? excerpt + CUT_MARKER : excerpt,
                 truncated,
+                freshness: freshness.freshness,
+                warning: freshness.warning,
                 citations: citations.get(checkpointRow.id) ?? [],
-                externalRefs: recordFields(checkpointRow).externalRefs,
+                externalRefs: freshness.externalRefs,
                 host: checkpointRow.host,
+                sessionId: checkpointRow.session_id,
                 createdAt: checkpointRow.created_at,
               }),
             };
-      const page = packPage(budget, checkpointPackable, rows.map((row) => itemPackable(row, citations.get(row.id) ?? [], sources.get(row.id) ?? null)));
+      const itemPackables = (count: number, freshnessOf: (row: Candidate) => RecordFreshness): Packable<PackItem>[] =>
+        groups.slice(0, count).map((group) => itemPackable(group, freshnessOf(group.representative), citations, sources, roots));
 
-      // Resume at the first unconsumed row; records dropped as ineligible leave the sequence.
-      const next = rows[page.consumed];
-      const remaining = next === undefined ? sequence.slice(window.length) : sequence.slice(sequence.indexOf(next.seq));
+      // Two passes keep validation to what the budget can return. The first selects with
+      // the smallest annotation freshness could produce; only that prefix is checked
+      // against the live worktree; the second packs the prefix with the real annotations,
+      // which can only shrink it, so no unchecked record is ever returned.
+      const refsOf = (row: RecordRow): StoredRef[] => recordFields(row).externalRefs;
+      const selection = packPage(
+        budget,
+        checkpointPackable(freshnessFloor(checkpointRow === null ? [] : refsOf(checkpointRow))),
+        itemPackables(groups.length, (row) => freshnessFloor(refsOf(row))),
+      );
+      const selected = groups.slice(0, selection.consumed).map((group) => group.representative);
+      const checked = checkFreshness(scope.worktree, [
+        ...(checkpointRow === null ? [] : [{ recordId: checkpointRow.id, refs: refsOf(checkpointRow), imported: false }]),
+        ...selected.map((row) => ({ recordId: row.id, refs: refsOf(row), imported: sources.has(row.id) })),
+      ]);
+      const freshnessOf = (row: RecordRow): RecordFreshness => {
+        const result = checked.get(row.id);
+        if (result === undefined) throw new Error(`record ${row.id} was packed without a freshness check`);
+        return result;
+      };
+      const page = packPage(budget, checkpointRow === null ? null : checkpointPackable(freshnessOf(checkpointRow)), itemPackables(selection.consumed, freshnessOf));
+
+      // Resume at the first unconsumed group. Copies folded into a returned item leave the
+      // sequence with it; records dropped as ineligible leave it too.
+      const loaded = new Set(rows.map((row) => row.seq));
+      const windowed = new Set(window);
+      const consumed = new Set(groups.slice(0, page.consumed).flatMap((group) => [group.representative, ...group.copies].map((row) => row.seq)));
+      const remaining = sequence.filter((seq) => (windowed.has(seq) ? loaded.has(seq) && !consumed.has(seq) : true));
       const omissions: Omission[] = [];
       if (page.oversized.length > 0) omissions.push({ reason: "exceeds_budget", count: page.oversized.length, recordIds: page.oversized });
       if (remaining.length > 0) omissions.push({ reason: "budget", count: remaining.length });
@@ -753,28 +850,52 @@ class LocalMemory implements Memory {
   }
 }
 
-function itemPackable(row: Candidate, citations: Citation[], source: ImportedSource | null): Packable<PackItem> {
+/**
+ * One pack entry per claim group. Everything but the excerpt (freshness, warning,
+ * citations, provenance, copies) is fixed-size metadata that `fit` measures first, so
+ * a tight budget cuts the body, never the warnings or citations.
+ */
+function itemPackable(
+  group: ClaimGroup<Candidate>,
+  freshness: RecordFreshness,
+  citations: ReadonlyMap<string, Citation[]>,
+  sources: ReadonlyMap<string, ImportedSource>,
+  roots: ReadonlyMap<string, string>,
+): Packable<PackItem> {
+  const row = group.representative;
   const fields = recordFields(row);
+  const copies = group.copies.slice(0, LISTED_COPIES).map((copy) => ({
+    recordId: copy.id,
+    host: copy.host,
+    sessionId: copy.session_id,
+    source: sources.get(copy.id) ?? null,
+    createdAt: copy.created_at,
+  }));
   return {
     recordId: row.id,
     source: row.excerpt_source,
     maxExcerptBytes: ITEM_EXCERPT_BYTES,
-    build: (excerpt, truncated) => ({
+    build: (excerpt, cut) => ({
       recordId: row.id,
       kind: fields.kind,
       title: row.title,
-      excerpt,
-      truncated: truncated || row.excerpt_source !== row.body,
+      excerpt: cut ? excerpt + CUT_MARKER : excerpt,
+      truncated: cut || row.excerpt_source !== row.body,
       attribution: fields.attribution,
       reviewState: fields.reviewState,
-      freshness: fields.freshness,
+      freshness: freshness.freshness,
+      warning: freshness.warning,
       applicability: fields.applicability,
-      citations,
-      externalRefs: fields.externalRefs,
+      citations: citations.get(row.id) ?? [],
+      externalRefs: freshness.externalRefs,
       workspaceLevel: fields.workspaceLevel,
       host: row.host,
-      source,
+      sessionId: row.session_id,
+      source: sources.get(row.id) ?? null,
       createdAt: row.created_at,
+      independentRoot: roots.get(row.id) ?? `record:${row.id}`,
+      corroboration: { independentRoots: group.independentRoots, records: group.records },
+      copies,
     }),
   };
 }
