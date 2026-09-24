@@ -14,6 +14,7 @@ import type {
   TranscriptFile,
   TranscriptHead,
 } from "../normalized-event.js";
+import { shellCall } from "../shell-reads.js";
 import { inCompatibility } from "../versions.js";
 
 /**
@@ -34,7 +35,7 @@ import { inCompatibility } from "../versions.js";
  *   session_meta{id, cwd, cli_version, history_mode, forked_from_id, source, thread_source, git.branch}
  *   turn_context{cwd} · event_msg{user_message{message, images, local_images, audio, local_audio},
  *   agent_message{message}} · response_item{message.role/content, function_call{name, namespace,
- *   arguments, call_id}, custom_tool_call{name, input, call_id}, local_shell_call{action.command},
+ *   arguments{cmd, command, workdir, …}, call_id}, custom_tool_call{name, input, call_id}, local_shell_call{action.command},
  *   web_search_call{id, action}, *_output{call_id, output}} · compacted{message}
  *
  * Messages come from one source per role: `event_msg/user_message` (Codex's own record of what the
@@ -547,15 +548,17 @@ function describeCall(tool: string, input: unknown, raw: unknown, cwd: string): 
       const path = str("path");
       return { summary: `view_image ${path === null ? "(no path)" : at(path)}`, paths: path === null ? [] : [at(path)], urls: [], toolKind: "artifact_access" };
     }
+    // A command that only prints files is a file read (see shell-reads.ts); its paths resolve
+    // against the call's own workdir, which Codex runs it in, else the turn's cwd.
     case "exec_command":
-      // Shell text is never parsed for paths: telling reads from writes in free-form commands is guesswork.
-      return { summary: `$ ${str("cmd") ?? ""}`, paths: [], urls: [], toolKind: "other" };
+      return { summary: `$ ${str("cmd") ?? ""}`, urls: [], ...shellCall(str("cmd"), at(str("workdir") ?? cwd)) };
     case "shell": {
       const command = args["command"];
-      return { summary: `$ ${Array.isArray(command) ? command.filter((c) => typeof c === "string").join(" ") : ""}`, paths: [], urls: [], toolKind: "other" };
+      const argv = Array.isArray(command) ? (command as unknown[]) : null;
+      return { summary: `$ ${argv === null ? "" : argv.filter((c) => typeof c === "string").join(" ")}`, urls: [], ...shellCall(argv, at(str("workdir") ?? cwd)) };
     }
     case "shell_command":
-      return { summary: `$ ${str("command") ?? ""}`, paths: [], urls: [], toolKind: "other" };
+      return { summary: `$ ${str("command") ?? ""}`, urls: [], ...shellCall(str("command"), at(str("workdir") ?? cwd)) };
     case "write_stdin": {
       // What was typed into a running process can be a password; only the session is described.
       const session = args["session_id"];

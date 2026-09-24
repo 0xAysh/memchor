@@ -130,6 +130,27 @@ describe("Codex transcript import through the memory interface", () => {
     expect(excerpts.join("\n")).not.toContain("Earlier decision");
   });
 
+  test("file contents read through shell commands are not stored: only the paths, as code references; other command output is kept", () => {
+    const e = env();
+    const repo = initRepo();
+    installCodexRollout(e.codex, "0.142.5/shell-reads.jsonl", { cwd: repo });
+    const memory = open(repo, e);
+    const boot = memory.bootstrap({ importChoice: "current_project" });
+    // Ten reads (one of a missing file, whose error is kept as an error passage).
+    expect(boot.import.currentProject?.counters).toMatchObject({ fileContents: 10, withheld: 0 });
+
+    const stored = allItems(memory)
+      .map((item) => memory.read({ recordId: item.recordId, maxBytes: 32_000 }))
+      .map((read) => `${read.title ?? ""}\n${read.body}`)
+      .join("\n");
+    expect(stored).not.toContain("SYNTHETIC-FILE-CONTENT");
+    expect(stored).toContain("SYNTHETIC-COMMAND-OUTPUT 12 passed");
+    expect(stored).toContain("No such file or directory");
+    const read = allItems(memory).find((item) => item.externalRefs.some((ref) => ref.path === "docs/idempotency.md"));
+    expect(read?.externalRefs.map((ref) => ref.path)).toEqual(["README.md", "docs/idempotency.md"]);
+    expect(read?.excerpt).toMatch(/file content not stored/);
+  });
+
   test("a turn that moves the thread into another worktree quarantines the rollout from that line", () => {
     const e = env();
     const repo = initRepo();

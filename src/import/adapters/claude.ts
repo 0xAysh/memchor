@@ -13,6 +13,7 @@ import type {
   TranscriptHead,
 } from "../normalized-event.js";
 import { asObject, type JsonObject, listDir, parseObject, readLines } from "../jsonl.js";
+import { shellCall } from "../shell-reads.js";
 import { inCompatibility } from "../versions.js";
 
 /**
@@ -236,7 +237,7 @@ function normalizeEntry(entry: Entry, line: { start: number; end: number }, out:
       return;
     }
     if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string") {
-      out.push({ ...origin, eventId: eventId(index), type: "tool_call", callId: b.id, tool: b.name, ...describeCall(b.name, asObject(b.input)) });
+      out.push({ ...origin, eventId: eventId(index), type: "tool_call", callId: b.id, tool: b.name, ...describeCall(b.name, asObject(b.input), cwd) });
       return;
     }
     exclude("unsupported_entry");
@@ -254,7 +255,7 @@ function normalizeEntry(entry: Entry, line: { start: number; end: number }, out:
 }
 
 /** One-line description, touched paths and semantic kind of a tool call, from its input. */
-function describeCall(name: string, input: Entry): { summary: string; paths: string[]; urls: string[]; toolKind: ToolKind; inputDigest?: string } {
+function describeCall(name: string, input: Entry, cwd: string): { summary: string; paths: string[]; urls: string[]; toolKind: ToolKind; inputDigest?: string } {
   const str = (key: string): string | null => (typeof input[key] === "string" ? input[key] : null);
   const memchor = MEMCHOR_TOOL.exec(name);
   if (memchor !== null) return { summary: `${memchor[1] ?? name} ${JSON.stringify(input)}`, paths: [], urls: [], toolKind: "memchor" };
@@ -267,7 +268,8 @@ function describeCall(name: string, input: Entry): { summary: string; paths: str
   }
   switch (name) {
     case "Bash":
-      return { summary: `$ ${str("command") ?? ""}`, paths: [], urls: [], toolKind: "other" };
+      // A command that only prints files is a file read, like Read (see shell-reads.ts).
+      return { summary: `$ ${str("command") ?? ""}`, urls: [], ...shellCall(str("command"), cwd) };
     case "Grep":
     case "Glob": {
       const path = str("path");

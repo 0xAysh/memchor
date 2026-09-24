@@ -34,6 +34,7 @@ Placeholders, substituted by `renderCodexFixture` in `tests/import/fixtures.ts`:
 | `0.142.5/cwd-change.jsonl` | 0.142.5 | a second turn whose `turn_context.cwd` is `{{CWD2}}` |
 | `0.142.5/malformed.jsonl` | 0.142.5 | an unparseable line, an unknown item type, an unknown `event_msg` type, non-JSON `arguments`, a partial trailing line |
 | `0.142.5/large-and-sensitive.jsonl` | 0.142.5 | oversized exec output, `cat .env`, `apply_patch` on `.env`, a token in assistant text, `write_stdin` keystrokes |
+| `0.142.5/shell-reads.jsonl` | 0.142.5 | shell commands that only print files (`sed -n`, `nl -ba … \| sed -n`, `&&`/`;` chains, `cd`, a sub-directory `workdir`, `bash -lc`/`zsh -lc` wrappers) and ones that do not (a test run, `grep`, `sed -i`, a sed `w`, a redirect, `$…`, `$(…)`, `\|\|`, `$0` arguments). The `shell` (argv) and `shell_command` argument shapes follow `openai/codex` source; local history only has `exec_command` |
 | `0.125.0-alpha.3/basic.jsonl` | 0.125.0-alpha.3 (oldest supported) | the pre-0.142 key sets (no `session_id`, item ids, passthrough metadata or `client_id`; `turn_context` with instructions and truncation policy) |
 | `0.133.0-alpha.1/subagent.jsonl` | 0.133.0-alpha.1 | a `thread_spawn` subagent (never listed by discovery) |
 | `0.148.0-alpha.21/basic.jsonl` | 0.148.0-alpha.21, legacy | `history_mode`, `context_window`, `world_state`, `thread_settings_applied`, `user_message.audio`, the MCP call triple exactly as Codex writes it |
