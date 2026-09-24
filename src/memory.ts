@@ -4,7 +4,9 @@ import { bindScope, type BoundScope, findBinding } from "./bootstrap/workstream-
 import { headCommit, locateWorkspace, registerWorkspace, resolveHome, type WorkspaceLocation } from "./bootstrap/workspace-resolution.js";
 import { type ErrorCode, MemchorError } from "./errors.js";
 import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integrity/checkpoints.js";
-import { type Citation, citationsFor, linksOf } from "./integrity/provenance.js";
+import { claudeCodeAdapter } from "./import/adapters/claude.js";
+import { type ImportStatus, TranscriptImporter, unsupportedHostStatus } from "./import/reconcile.js";
+import { type Citation, citationsFor, importedFrom, type ImportedSource, linksOf } from "./integrity/provenance.js";
 import { type ContinuationState, ITEM_EXCERPT_BYTES, openContinuation, packPage, type Packable, sealContinuation, usage } from "./retrieval/context-pack.js";
 import { requireVisibleRecord, type RecordRow } from "./retrieval/eligibility.js";
 import { type Candidate, clipToBytes, loadCandidates, PAGE_CANDIDATES, rankSequence, rebuildSearchIndex, SEQUENCE_CAP, toFtsQuery } from "./retrieval/search.js";
@@ -13,6 +15,7 @@ import {
   type Attribution,
   BootstrapInput,
   CheckpointInput,
+  ContinueImportInput,
   effectiveBudget,
   estimateTokens,
   type ExternalRef,
@@ -41,7 +44,8 @@ import {
 } from "./storage/database.js";
 import { appendRecord, recordFields } from "./storage/records.js";
 
-export type { Citation } from "./integrity/provenance.js";
+export type { ImportedSource, Citation } from "./integrity/provenance.js";
+export type { ImportCounters, ImportGap, ImportStatus } from "./import/reconcile.js";
 export type { IntegrityReport } from "./storage/database.js";
 
 // ───────────────────────────── Public interface ─────────────────────────────
@@ -57,6 +61,10 @@ export interface OpenMemoryOptions {
   hostSessionId?: string;
   /** Bounded wait for another process's write lock before `storage_busy`. Default 5000 ms. */
   busyTimeoutMs?: number;
+  /** Claude Code's config directory (transcripts live in its `projects/`). Defaults to `$CLAUDE_CONFIG_DIR`, then `~/.claude`. */
+  claudeConfigDir?: string;
+  /** How long `bootstrap` may spend importing the current project's transcripts before returning. Default 3000 ms. */
+  importBudgetMs?: number;
 }
 
 /** The scope this Memory instance is bound to. Fixed for the instance's lifetime. */
@@ -90,6 +98,8 @@ export interface PackItem {
   externalRefs: ExternalRef[];
   workspaceLevel: boolean;
   host: string;
+  /** Where an imported record came from (host, transcript, event); null for records agents wrote. */
+  source: ImportedSource | null;
   createdAt: string;
 }
 
@@ -140,7 +150,9 @@ export interface BootstrapResult {
   /** Whether this instance's binding created the workspace database / workstream. */
   created: { workspace: boolean; workstream: boolean };
   runtime: { sqliteVersion: string; fts5: boolean; schemaVersion: number };
-  /** Same as `recall({})`: head checkpoint plus the most recent eligible records. */
+  /** Transcript import: the consent question on first use, else progress and capture gaps. */
+  import: ImportStatus;
+  /** Same as `recall({})` after this bootstrap's import: head checkpoint plus the most recent eligible records. */
   context: ContextPack;
 }
 
@@ -185,6 +197,7 @@ export interface ReadResult {
   checkpointRevision: number | null;
   host: string;
   sessionId: string | null;
+  source: ImportedSource | null;
   contentHash: string;
   createdAt: string;
   /** The budget applies to `body` only. */
@@ -219,6 +232,8 @@ export interface StatusResult {
   /** Set when scope or storage could not be resolved; status itself never throws for these. */
   problem: { code: ErrorCode; message: string } | null;
   capabilities: { operations: string[]; freshnessValidation: boolean; transcriptImport: boolean };
+  /** Consent, discovered transcripts, this project's import progress and capture gaps; null when scope is unresolved. */
+  import: ImportStatus | null;
 }
 
 /**
@@ -238,8 +253,19 @@ export interface StatusResult {
  * - Methods are synchronous and throw only `MemchorError` for expected failures.
  */
 export interface Memory {
-  /** Binds scope (if not yet bound), records the host session id, and returns scope plus initial context. */
+  /**
+   * Binds scope (if not yet bound), records the host session id, reconciles the current
+   * project's approved transcripts within a time budget, and returns scope plus initial
+   * context. On a host's first use it returns the import consent question instead of
+   * importing; `importChoice` records (or changes) the answer.
+   */
   bootstrap(input?: BootstrapInput): BootstrapResult;
+  /**
+   * Continues importing approved transcripts (the current project first, then other approved
+   * projects) for up to `maxMs`. Adapters call it between requests while the process is
+   * alive; `done` is true once nothing approved remains. Each batch is one transaction.
+   */
+  continueImport(input?: ContinueImportInput): ImportStatus & { done: boolean };
   /** Appends one attributed record with provenance links and external references. */
   record(input: RecordInput): RecordResult;
   /** Publishes the next checkpoint revision iff the head is still `expectedRevision`. */
@@ -279,6 +305,7 @@ export function openMemory(options: OpenMemoryOptions): Memory {
 // ───────────────────────────── Implementation ─────────────────────────────
 
 const OPERATIONS = Object.keys(OPERATION_SCHEMAS);
+const DEFAULT_IMPORT_BUDGET_MS = 3_000;
 
 interface Bound {
   db: Db;
@@ -294,6 +321,8 @@ class LocalMemory implements Memory {
   private hostSessionId: string | undefined;
   private bound: Bound | undefined;
   private closed = false;
+  /** Null for hosts without a transcript adapter. */
+  private readonly importer: TranscriptImporter | null;
 
   constructor(options: OpenMemoryOptions) {
     this.cwd = options.cwd;
@@ -301,6 +330,15 @@ class LocalMemory implements Memory {
     this.home = resolveHome(options.home);
     this.busyTimeoutMs = options.busyTimeoutMs;
     this.hostSessionId = options.hostSessionId;
+    this.importer =
+      this.host === "claude-code"
+        ? new TranscriptImporter({
+            home: this.home,
+            adapter: claudeCodeAdapter(options.claudeConfigDir === undefined ? {} : { configDir: options.claudeConfigDir }),
+            bootstrapBudgetMs: options.importBudgetMs ?? DEFAULT_IMPORT_BUDGET_MS,
+            ...(options.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: options.busyTimeoutMs }),
+          })
+        : null;
   }
 
   bootstrap(input: BootstrapInput = {}): BootstrapResult {
@@ -309,10 +347,12 @@ class LocalMemory implements Memory {
       if (parsed.hostSessionId !== undefined) this.adoptHostSessionId(parsed.hostSessionId);
       const { db, scope, location } = this.bind();
       const runtime = probeRuntime();
+      const imported = this.importer === null ? unsupportedHostStatus(this.host) : this.importer.bootstrap({ location, db }, parsed.importChoice);
       return {
         scope: scopeView(db, scope),
         created: { workspace: location.isNew, workstream: scope.createdWorkstream },
         runtime: { sqliteVersion: runtime.sqliteVersion, fts5: runtime.fts5, schemaVersion: SCHEMA_VERSION },
+        import: imported,
         context: this.pack(db, scope, parse(RecallInput, {})),
       };
     });
@@ -365,6 +405,14 @@ class LocalMemory implements Memory {
     });
   }
 
+  continueImport(input: ContinueImportInput = {}): ImportStatus & { done: boolean } {
+    return this.guard(() => {
+      const parsed = parse(ContinueImportInput, input);
+      const { db, location } = this.bind();
+      return this.importer === null ? { ...unsupportedHostStatus(this.host), done: true } : this.importer.continue({ location, db }, parsed.maxMs);
+    });
+  }
+
   recall(input: RecallInput = {}): ContextPack {
     return this.guard(() => {
       const parsed = parse(RecallInput, input);
@@ -403,6 +451,7 @@ class LocalMemory implements Memory {
           checkpointRevision: revision?.revision ?? null,
           host: row.host,
           sessionId: row.session_id,
+          source: importedFrom(db, [row.id]).get(row.id) ?? null,
           contentHash: row.content_hash,
           createdAt: row.created_at,
           budget: { ...budget, ...usage(Buffer.byteLength(body, "utf8")) },
@@ -420,7 +469,8 @@ class LocalMemory implements Memory {
         scope: null,
         counts: null,
         problem: null,
-        capabilities: { operations: OPERATIONS, freshnessValidation: false, transcriptImport: false },
+        capabilities: { operations: OPERATIONS, freshnessValidation: false, transcriptImport: this.importer !== null },
+        import: null,
       };
       let db: Db | null = null;
       try {
@@ -438,8 +488,15 @@ class LocalMemory implements Memory {
           sessionId: this.bound?.scope.sessionId ?? null,
           host: this.host,
         };
+        const importer = this.importer;
+        const reportImport = (current: Db | null): void => {
+          result.import = importer === null ? unsupportedHostStatus(this.host) : importer.status({ location, db: current });
+        };
         db = openReadOnly(location.dbPath);
-        if (db === null) return result;
+        if (db === null) {
+          reportImport(null);
+          return result;
+        }
         const schemaVersion = db.pragma("user_version", { simple: true }) as number;
         result.storage.schemaVersion = schemaVersion;
         result.storage.journalMode = db.pragma("journal_mode", { simple: true }) as string;
@@ -450,7 +507,11 @@ class LocalMemory implements Memory {
           };
           return result;
         }
-        if (schemaVersion < SCHEMA_VERSION) return result; // migrated by the next bootstrap
+        if (schemaVersion < SCHEMA_VERSION) {
+          reportImport(null);
+          return result; // migrated by the next bootstrap
+        }
+        reportImport(db);
         const workstream = findBinding(db, location.worktree);
         if (workstream !== null) {
           result.scope.workstreamId = workstream.id;
@@ -483,6 +544,7 @@ class LocalMemory implements Memory {
 
   close(): void {
     this.closed = true;
+    this.importer?.close();
     this.bound?.db.close();
     this.bound = undefined;
   }
@@ -607,6 +669,7 @@ class LocalMemory implements Memory {
       const window = sequence.slice(0, PAGE_CANDIDATES);
       const rows = loadCandidates(db, { workstreamId: scope.workstreamId, match, seqs: window });
       const citations = citationsFor(db, scope.workstreamId, [...rows.map((r) => r.id), ...(checkpointRow ? [checkpointRow.id] : [])]);
+      const sources = importedFrom(db, rows.map((r) => r.id));
 
       const checkpointPackable: Packable<PackCheckpoint> | null =
         checkpointRow === null
@@ -626,7 +689,7 @@ class LocalMemory implements Memory {
                 createdAt: checkpointRow.created_at,
               }),
             };
-      const page = packPage(budget, checkpointPackable, rows.map((row) => itemPackable(row, citations.get(row.id) ?? [])));
+      const page = packPage(budget, checkpointPackable, rows.map((row) => itemPackable(row, citations.get(row.id) ?? [], sources.get(row.id) ?? null)));
 
       // Resume at the first unconsumed row; records dropped as ineligible leave the sequence.
       const next = rows[page.consumed];
@@ -686,7 +749,7 @@ class LocalMemory implements Memory {
   }
 }
 
-function itemPackable(row: Candidate, citations: Citation[]): Packable<PackItem> {
+function itemPackable(row: Candidate, citations: Citation[], source: ImportedSource | null): Packable<PackItem> {
   const fields = recordFields(row);
   return {
     recordId: row.id,
@@ -706,6 +769,7 @@ function itemPackable(row: Candidate, citations: Citation[]): Packable<PackItem>
       externalRefs: fields.externalRefs,
       workspaceLevel: fields.workspaceLevel,
       host: row.host,
+      source,
       createdAt: row.created_at,
     }),
   };

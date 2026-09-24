@@ -107,8 +107,18 @@ const utf8Bytes = (s: string): number => Buffer.byteLength(s, "utf8");
 const MaxTokens = z.int().min(LIMITS.minTokens).max(LIMITS.maxTokens);
 const MaxBytes = z.int().min(LIMITS.minBytes).max(LIMITS.maxBytes);
 
+/** Transcript-import decisions a host's user can make (stored per host; see src/import/consent.ts). */
+export const IMPORT_CHOICES = ["all", "current_project", "none"] as const;
+export type ImportChoice = (typeof IMPORT_CHOICES)[number];
+
 export const BootstrapInput = z.strictObject({
   hostSessionId: z.string().min(1).max(LIMITS.hostSessionIdChars).optional(),
+  importChoice: z
+    .enum(IMPORT_CHOICES)
+    .optional()
+    .describe(
+      "Only after asking the user the question in import.question (or when they ask to change it): all = import every project's local transcripts, current_project = only this repository's, none = import nothing. Stored per host; pass it again to change it.",
+    ),
 });
 export type BootstrapInput = z.input<typeof BootstrapInput>;
 
@@ -184,6 +194,12 @@ export type ReadInput = z.input<typeof ReadInput>;
 
 export const StatusInput = z.strictObject({});
 export type StatusInput = z.input<typeof StatusInput>;
+
+/** Background import step (adapters call it between requests; not an agent tool). */
+export const ContinueImportInput = z.strictObject({
+  maxMs: z.int().min(0).max(60_000).default(250),
+});
+export type ContinueImportInput = z.input<typeof ContinueImportInput>;
 
 /**
  * Every operation the memory module offers to agents, with its input schema. Adapters

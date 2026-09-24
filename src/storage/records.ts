@@ -3,7 +3,7 @@ import { type Citation, insertLinks } from "../integrity/provenance.js";
 import { indexRecord } from "../retrieval/search.js";
 import type { RecordRow } from "../retrieval/eligibility.js";
 import type { Applicability, Attribution, ExternalRef, Freshness, RecordKind, ReviewState } from "../schemas.js";
-import { type Db, requireTransaction } from "./database.js";
+import { type Db, prepared, requireTransaction } from "./database.js";
 
 export interface NewRecord {
   kind: RecordKind;
@@ -18,6 +18,10 @@ export interface NewRecord {
   applicability: Applicability;
   externalRefs: readonly ExternalRef[];
   links: readonly Citation[];
+  /** The transcript or external source the record was imported from. */
+  sourceId?: string;
+  /** When the content was observed, if earlier than now (imported history); defaults to now. */
+  createdAt?: string;
 }
 
 /**
@@ -34,7 +38,7 @@ export interface NewRecord {
 export function appendRecord(db: Db, scopeWorkstreamId: string, record: NewRecord): { recordId: string; createdAt: string; links: Citation[] } {
   requireTransaction(db, "appendRecord");
   const recordId = `rec_${randomUUID().replaceAll("-", "")}`;
-  const createdAt = new Date().toISOString();
+  const createdAt = record.createdAt ?? new Date().toISOString();
   const applicability = JSON.stringify(record.applicability);
   const externalRefs = JSON.stringify(record.externalRefs);
   const contentHash =
@@ -42,10 +46,11 @@ export function appendRecord(db: Db, scopeWorkstreamId: string, record: NewRecor
     createHash("sha256")
       .update(JSON.stringify([record.kind, record.title, record.body, externalRefs, applicability]))
       .digest("hex");
-  db.prepare(
-    `INSERT INTO records (id, kind, title, body, workstream_id, session_id, host, attribution, review_state,
+  prepared(
+    db,
+    `INSERT INTO records (id, kind, title, body, workstream_id, session_id, source_id, host, attribution, review_state,
        applicability, external_refs, content_hash, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     recordId,
     record.kind,
@@ -53,6 +58,7 @@ export function appendRecord(db: Db, scopeWorkstreamId: string, record: NewRecor
     record.body,
     record.workstreamId,
     record.sessionId,
+    record.sourceId ?? null,
     record.host,
     record.attribution,
     record.reviewState,

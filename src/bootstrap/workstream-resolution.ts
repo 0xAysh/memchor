@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { MemchorError } from "../errors.js";
-import { type Db, writeTransaction } from "../storage/database.js";
+import { type Db, requireTransaction, writeTransaction } from "../storage/database.js";
 import type { WorkspaceLocation } from "./workspace-resolution.js";
 
 export interface BoundScope {
@@ -34,42 +34,8 @@ export interface BoundScope {
 export function bindScope(db: Db, location: WorkspaceLocation, host: string, hostSessionId: string | undefined): BoundScope {
   return writeTransaction(db, () => {
     const now = new Date().toISOString();
-    const workspaces = db.prepare("SELECT id, label, repository_key, continuation_secret FROM workspaces").all() as {
-      id: string;
-      label: string;
-      repository_key: string;
-      continuation_secret: Buffer;
-    }[];
-    if (workspaces.length === 0) {
-      const secret = randomBytes(32);
-      db.prepare(
-        "INSERT INTO workspaces (id, label, repository_key, root_commit, continuation_secret, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-      ).run(location.workspaceId, location.label, location.repositoryKey, location.rootCommit, secret, now);
-      workspaces.push({ id: location.workspaceId, label: location.label, repository_key: location.repositoryKey, continuation_secret: secret });
-    }
-    const workspace = workspaces[0];
-    if (workspaces.length !== 1 || workspace === undefined || workspace.id !== location.workspaceId || workspace.repository_key !== location.repositoryKey) {
-      throw new MemchorError(
-        "storage_unavailable",
-        `The database at ${location.dbPath} belongs to a different repository or workspace; refusing to use it for ${location.worktree}.`,
-        {
-          details: {
-            dbPath: location.dbPath,
-            expected: { workspaceId: location.workspaceId, repositoryKey: location.repositoryKey },
-            found: workspaces.map((w) => ({ workspaceId: w.id, repositoryKey: w.repository_key })),
-          },
-        },
-      );
-    }
-
-    let createdWorkstream = false;
-    let workstream = findBinding(db, location.worktree);
-    if (workstream === null) {
-      workstream = { id: `wst_${randomUUID().replaceAll("-", "")}`, label: location.branch };
-      db.prepare("INSERT INTO workstreams (id, label, created_at) VALUES (?, ?, ?)").run(workstream.id, workstream.label, now);
-      db.prepare("INSERT INTO worktree_bindings (worktree_path, workstream_id, bound_at) VALUES (?, ?, ?)").run(location.worktree, workstream.id, now);
-      createdWorkstream = true;
-    }
+    const workspace = ensureWorkspace(db, location, now);
+    const { workstream, created: createdWorkstream } = ensureWorkstream(db, location, now);
 
     const sessionId = `ses_${randomUUID().replaceAll("-", "")}`;
     db.prepare("INSERT INTO sessions (id, host, host_session_id, workstream_id, started_at) VALUES (?, ?, ?, ?, ?)").run(
@@ -89,10 +55,65 @@ export function bindScope(db: Db, location: WorkspaceLocation, host: string, hos
       worktree: location.worktree,
       sessionId,
       host,
-      continuationSecret: workspace.continuation_secret,
+      continuationSecret: workspace.continuationSecret,
       createdWorkstream,
     };
   });
+}
+
+/**
+ * The database's one `workspaces` row, created on first use. Fails closed with
+ * `storage_unavailable` when the file belongs to a different workspace or repository.
+ * Call inside a write transaction.
+ */
+export function ensureWorkspace(db: Db, location: WorkspaceLocation, now: string): { label: string; continuationSecret: Buffer } {
+  requireTransaction(db, "ensureWorkspace");
+  const workspaces = db.prepare("SELECT id, label, repository_key, continuation_secret FROM workspaces").all() as {
+    id: string;
+    label: string;
+    repository_key: string;
+    continuation_secret: Buffer;
+  }[];
+  if (workspaces.length === 0) {
+    const secret = randomBytes(32);
+    db.prepare(
+      "INSERT INTO workspaces (id, label, repository_key, root_commit, continuation_secret, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(location.workspaceId, location.label, location.repositoryKey, location.rootCommit, secret, now);
+    workspaces.push({ id: location.workspaceId, label: location.label, repository_key: location.repositoryKey, continuation_secret: secret });
+  }
+  const workspace = workspaces[0];
+  if (workspaces.length !== 1 || workspace === undefined || workspace.id !== location.workspaceId || workspace.repository_key !== location.repositoryKey) {
+    throw new MemchorError(
+      "storage_unavailable",
+      `The database at ${location.dbPath} belongs to a different repository or workspace; refusing to use it for ${location.worktree}.`,
+      {
+        details: {
+          dbPath: location.dbPath,
+          expected: { workspaceId: location.workspaceId, repositoryKey: location.repositoryKey },
+          found: workspaces.map((w) => ({ workspaceId: w.id, repositoryKey: w.repository_key })),
+        },
+      },
+    );
+  }
+  return { label: workspace.label, continuationSecret: workspace.continuation_secret };
+}
+
+/**
+ * The workstream bound to the location's worktree, creating one (labelled with the
+ * worktree's current branch) when the worktree has none. Call inside a write transaction.
+ */
+export function ensureWorkstream(
+  db: Db,
+  location: Pick<WorkspaceLocation, "worktree" | "branch">,
+  now: string,
+): { workstream: { id: string; label: string }; created: boolean } {
+  requireTransaction(db, "ensureWorkstream");
+  const existing = findBinding(db, location.worktree);
+  if (existing !== null) return { workstream: existing, created: false };
+  const workstream = { id: `wst_${randomUUID().replaceAll("-", "")}`, label: location.branch };
+  db.prepare("INSERT INTO workstreams (id, label, created_at) VALUES (?, ?, ?)").run(workstream.id, workstream.label, now);
+  db.prepare("INSERT INTO worktree_bindings (worktree_path, workstream_id, bound_at) VALUES (?, ?, ?)").run(location.worktree, workstream.id, now);
+  return { workstream, created: true };
 }
 
 /** The workstream bound to a worktree, or null. Read-only. */

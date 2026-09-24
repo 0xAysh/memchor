@@ -5,8 +5,12 @@ memchor mcp (src/transports/mcp.ts)   memchor diag (src/cli.ts)
             └──────────────┬──────────────┘
                  src/memory.ts  ← all policy
    scope · idempotency · CAS · eligibility · budgets · citations
-                           │
-       one SQLite file per workspace (WAL, FTS5)
+            │                              │
+            │               src/import/reconcile.ts  ← discover · order · batch · cursor · dedupe
+            │                              │ NormalizedEvent only
+            │               src/import/adapters/claude.ts  ← the only code that knows Claude's JSON
+            │                              │ (read-only)
+       one SQLite file per workspace (WAL, FTS5)      $CLAUDE_CONFIG_DIR/projects/*/*.jsonl
 ```
 
 The adapters contain no memory policy. The MCP server forwards raw tool arguments to the module. The module parses them with the zod schemas in `src/schemas.ts`, which are also the source of the tools' JSON Schemas. Each `MemchorError` becomes `isError: true` with `{ error: { code, message, retryable, details } }`.
@@ -17,7 +21,8 @@ The adapters contain no memory policy. The MCP server forwards raw tool argument
 
 | Method | Contract |
 |---|---|
-| `bootstrap({hostSessionId?})` | Binds scope and returns it, the created flags, the runtime, and `recall({})` |
+| `bootstrap({hostSessionId?, importChoice?})` | Binds scope, records an import choice if given, imports the current project's approved transcripts within `importBudgetMs` (default 3 s), and returns scope, `import` status (or the consent question), and `recall({})` |
+| `continueImport({maxMs?})` | One bounded step of the remaining approved import (current project first, then other projects' own workspaces). The MCP server calls it between requests while alive. Not an agent tool |
 | `record({kind, body, attribution, …})` | Appends one record with its links and search chunks; `operationKey` makes it idempotent |
 | `checkpoint({expectedRevision, goal, status, …})` | Appends revision `expectedRevision + 1` only if the head still equals `expectedRevision` |
 | `recall({query?, kinds?, maxTokens?, maxBytes?, continuation?})` | A bounded pack: head checkpoint first, then ranked eligible items |
@@ -48,7 +53,10 @@ Payload schemas are strict, so `workspaceId`, `cwd` and `path` are rejected.
 | `operations` | Idempotency keys | The hash covers operation + workstream + normalised input |
 | `worktree_bindings`, `sessions` | Scope binding | One workstream per worktree path |
 | `chunks`, `chunks_fts` | **Derived** search projection | A pure function of `records`; rebuildable |
-| `sources`, `consents`, `import_cursors` | Reserved for later slices | Created now to avoid a migration |
+| `sources` | One row per imported transcript | `records.source_id` points here |
+| `import_cursors` (v2) | Per-transcript reconciliation position | Advances only in the transaction that stores the batch's records; `anchor_hash` detects rewrites |
+| `import_events` (v2) | Event identity → record | PK = host + transcript + branch + event id + content hash, so replay is a no-op and an edit is a new version |
+| `consents` | Reserved | The import decision is host-level, so it lives in `$MEMCHOR_HOME/consent.json`, not in a workspace |
 
 **Eligibility** (`src/retrieval/eligibility.ts`) is one SQL predicate used for reads, links, citations and ranking. A record must be in this workstream or workspace-level, and not retracted. Recall additionally excludes checkpoint records: the head is returned separately.
 
@@ -69,6 +77,47 @@ Every write is one `BEGIN IMMEDIATE` transaction, so it never upgrades from read
 
 **Durability.** Connections run with `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON` and a bounded `busy_timeout` (default 5 s). The one-time switch to WAL retries when SQLite answers `SQLITE_BUSY` immediately.
 
+## Transcript import
+
+**Consent.** On a host's first bootstrap, Memchor discovers transcripts and reads only their head (≤ 64 KiB, for the first cwd and version). It then returns counts, including how many were written by versions it cannot read, and the exact question: `all`, `current_project` or `none`. Nothing else is read until the user answers through `bootstrap({importChoice})`. The decision is per host, in `$MEMCHOR_HOME/consent.json` (atomic write). `current_project` approves the repository it was chosen in, adding to any approved earlier; it never revokes one. `none` imports nothing and does not even inventory transcripts; cooperative memory is untouched. `memory_status` and `memchor diag consent` show or change it.
+
+**Adapter seam.** `TranscriptAdapter` (`src/import/normalized-event.ts`) is the one host-format boundary: `discover`, `inspect`, and `read(file, offset, maxBytes)` returning `NormalizedEvent`s (message, host summary, tool call with its output policy, tool result), exclusion counts, and a `stop` for an unsupported version. The importer never sees host JSON.
+
+**Claude Code format** (`src/import/adapters/claude.ts`). The docs say the entry format "is internal to Claude Code and changes between versions", so the adapter reads a pinned field list and uses an explicit table:
+
+| Claude Code versions | Format | Basis |
+|---|---|---|
+| ≥ 2.1.183, < 2.2.0 | `claude-code-jsonl-v1` | 72 local transcripts from 2.1.183–2.1.281; fixtures for 2.1.183 and 2.1.281 |
+
+An entry from any other version stops that transcript at that line (`stopped`, gap `unsupported_version`, cursor held). The transcript resumes once a Memchor that knows the version runs. Unknown entry or block types inside a supported version are skipped and counted, never interpreted. Not read at all: subagent transcripts (their final report is the parent's Agent tool result), `toolUseResult`, usage, snapshots and every other field.
+
+**What is stored.** User text → `evidence` / `user_direction`. Assistant text → `evidence` / `agent_inference`. Tool call and its result → one `evidence` / `direct_observation` record with the call summary and a bounded output. Host summaries (compaction, away summary) → `note`. Records carry `createdAt` = the event time and `source` = {host, transcript, branch, event}. Privacy rules (`src/import/privacy.ts`):
+
+| Content | Handling |
+|---|---|
+| Thinking, injected context (`isMeta`, non-human origin, `<system-reminder>`), attachments, metadata entries, images | Excluded and counted |
+| File reads and edits (Read, Write, Edit, NotebookEdit) | Reference only: path as a code `externalRef`, no content |
+| Output of a call touching `.env`, keys, credential files | Withheld |
+| Credentials (AWS, GitHub, Anthropic/OpenAI-style, Slack, Google, JWT, private keys, URL passwords, `secret=` assignments) | `[redacted:<kind>]`; pattern-based, so best-effort |
+| Messages > 4 KB, tool output > 1.5 KB, summaries > 8 KB | Head + tail with `[… N bytes omitted by Memchor …]` |
+| Memchor's own tool calls and results | Never records; the existing record ids they mention are kept as references |
+| A tool result whose call could not be read | Output withheld (fails closed: its path is unknown) |
+
+**Batches and cursors.** Each batch (≈1 MiB of transcript) is one `BEGIN IMMEDIATE` transaction:
+
+```text
+re-read cursor (CAS: another process moved it → give up this transcript for now)
+  → first batch: ensure workspace row, worktree binding, session, source, cursor
+  → per event: scope check → identity lookup (same hash: replay; other hash: new linked version) → record + links + chunks + import_events row
+  → update cursor: offset, anchor hash, state, gap, counters (file size/mtime only once caught up)
+```
+
+A kill mid-batch rolls the whole batch back. The cursor never passes evidence that is not durable, and the retry re-reads the same lines (tested with a real `SIGKILL`). Unchanged file → skipped without reading. Grown with a matching anchor → append. Otherwise (rewritten or truncated) → a new pass from byte 0 under a new epoch, reconciled by identity. Identities not seen again are reported as `missing` and never deleted. A partial trailing line (the host is still writing) is left for later. Known limit: an edit that keeps the file's size and falls before the 4 KiB anchor is not detected. Claude Code only appends, so this needs an outside rewrite.
+
+**Scope.** A transcript binds to the workstream of its first event's worktree, creating the binding exactly as a live bootstrap there would. Every distinct cwd is resolved through Git (once per process). There is no path-prefix shortcut, because a directory inside the worktree can be a nested worktree, a submodule or another clone. Two things quarantine it from that line on (`scope_ambiguous`, cursor held, nothing after it imported): a later event whose cwd is in another worktree or repository, or Memchor output in it naming a different existing workstream. Transcripts whose cwd is gone or not in Git are counted as `unassigned`. `all projects` imports each repository into its own workspace database. Retrieval never mixes them.
+
+**Order and budget.** Bootstrap imports only the current repository (newest transcript first) until its budget. The MCP server then calls `continueImport` in 200 ms steps with 25 ms pauses until every approved transcript is reconciled. Expected failures (`storage_busy`, `storage_full`, `storage_unavailable`, an unreadable `consent.json` → state `unavailable`) are reported as `import.problem` and never fail bootstrap. The MCP loop retries a failed step with backoff (2 s … 32 s, five times). Any other error is a bug: the batch rolls back and the error propagates. Gaps met while backfilling other projects are reported in this process's status, labelled with their workspace. No model call and no network access are involved; the e2e test preloads a guard that fails on any socket, DNS lookup or fetch.
+
 ## Runtime gate
 
 At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix for the [WAL-reset bug](https://sqlite.org/wal.html#walresetbug). It also requires FTS5: the compile option must be present and creating an FTS5 table must succeed. If either check fails, it throws `unsupported_runtime` with the version it found. The rule is the pure function `assertSupportedRuntime`, which has no override. `memchor mcp` runs it at process start and exits non-zero with the message on stderr before serving. Every database open runs it again.
@@ -78,7 +127,7 @@ At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix f
 | Code | Meaning |
 |---|---|
 | `scope_unresolved` | cwd is not inside a Git worktree |
-| `scope_ambiguous` | Reserved and not raised in #18: an unbound worktree always gets its own workstream. It is meant for the later PRD §9.2 steps (session or imported-history bindings, task identity) |
+| `scope_ambiguous` | Not thrown. Used as the gap reason for a quarantined transcript whose scope signals conflict |
 | `scope_denied` | The target belongs to another workstream |
 | `not_found` | Unknown or ineligible (e.g. retracted) record |
 | `invalid_input` | Schema violation, unknown key, oversized content, or a bad continuation |

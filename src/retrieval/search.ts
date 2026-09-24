@@ -1,6 +1,6 @@
 import { MemchorError } from "../errors.js";
 import type { ExternalRef } from "../schemas.js";
-import { type Db, requireTransaction } from "../storage/database.js";
+import { type Db, prepared, requireTransaction } from "../storage/database.js";
 import { RECALL_ELIGIBLE_SQL, type RecordRow, VISIBLE_SQL } from "./eligibility.js";
 
 /**
@@ -39,8 +39,8 @@ function chunksFor(record: IndexableRecord): { field: ChunkField; text: string }
 /** Adds a record's chunks to the projection. Call inside the transaction that inserts the record. */
 export function indexRecord(db: Db, record: IndexableRecord): void {
   requireTransaction(db, "indexRecord");
-  const insertChunk = db.prepare("INSERT INTO chunks (record_id, ordinal, field, text) VALUES (?, ?, ?, ?)");
-  const insertFts = db.prepare("INSERT INTO chunks_fts (rowid, text) VALUES (?, ?)");
+  const insertChunk = prepared(db, "INSERT INTO chunks (record_id, ordinal, field, text) VALUES (?, ?, ?, ?)");
+  const insertFts = prepared(db, "INSERT INTO chunks_fts (rowid, text) VALUES (?, ?)");
   chunksFor(record).forEach((chunk, ordinal) => {
     const { lastInsertRowid } = insertChunk.run(record.id, ordinal, chunk.field, chunk.text);
     insertFts.run(lastInsertRowid, chunk.text);

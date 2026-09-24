@@ -14,7 +14,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "snapshot:transcripts": "node scripts/snapshot-real-transcripts.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.1",
