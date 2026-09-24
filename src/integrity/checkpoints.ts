@@ -99,6 +99,23 @@ export function headCheckpointRecordId(db: Db, workstreamId: string): string | n
   return row?.record_id ?? null;
 }
 
+/** A bounded glimpse of a checkpoint, enough to tell workstreams apart when choosing one. */
+export interface CheckpointSummary {
+  goal: string;
+  status: string;
+  /** The first next step, if any. */
+  next: string | null;
+}
+
+/** Reads back the sections {@link renderCheckpoint} wrote, each clipped (goal 200, status 300, next 200 characters). */
+export function summarizeCheckpoint(body: string): CheckpointSummary {
+  const clip = (text: string, chars: number): string => (text.length <= chars ? text : `${text.slice(0, chars - 1)}…`);
+  const goal = /^Goal: (.*)$/m.exec(body)?.[1] ?? "";
+  const status = /^Status: ([\s\S]*?)(?:\n\n[A-Z][a-z]+(?: [a-z]+)?:\n- |$)/.exec(body.slice(body.indexOf("\n\nStatus: ") + 2))?.[1] ?? "";
+  const next = /\n\nNext steps:\n- (.*)/.exec(body)?.[1] ?? null;
+  return { goal: clip(goal, 200), status: clip(status.trim(), 300), next: next === null ? null : clip(next, 200) };
+}
+
 /** Canonical checkpoint body: stable section order, one bullet per entry, empty sections omitted. */
 function renderCheckpoint(content: CheckpointContent): string {
   const section = (heading: string, entries: readonly string[]): string =>

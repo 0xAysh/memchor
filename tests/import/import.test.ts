@@ -497,12 +497,13 @@ describe("capture safety", () => {
     expect(open(other, e).status().counts).toBeNull(); // nothing leaked into the other workspace
   });
 
-  test("a Memchor echo naming another workstream of the workspace quarantines the transcript", () => {
+  test("Memchor output naming another workstream of the workspace binds the transcript there: session metadata outranks the worktree binding", () => {
     const e = env();
     const repo = initRepo();
     const sibling = tempDir("memchor-worktree-");
     git(repo, "worktree", "add", "--quiet", "-b", "feature/other", sibling + "/wt");
-    const siblingWs = open(sibling + "/wt", e).bootstrap({ importChoice: "none" }).scope.workstreamId;
+    const siblingMemory = open(sibling + "/wt", e);
+    const siblingWs = siblingMemory.bootstrap({ importChoice: "none" }).scope.workstreamId;
     const sessionId = "33333333-3333-4333-8333-333333333333";
     const content = renderFixture("2.1.281/basic.jsonl", { cwd: repo, sessionId }).replace(
       '{\\"items\\":[',
@@ -512,8 +513,10 @@ describe("capture safety", () => {
 
     const memory = open(repo, e);
     const boot = memory.bootstrap({ importChoice: "current_project" });
-    expect(boot.import.gaps).toEqual([expect.objectContaining({ reason: "scope_ambiguous" })]);
-    expect(boot.import.currentProject).toMatchObject({ quarantined: 1, counters: { records: 4, echoes: 0 } });
+    expect(boot.import.gaps).toEqual([]);
+    expect(boot.import.currentProject).toMatchObject({ quarantined: 0, complete: 1, counters: { records: 7, echoes: 1 } });
+    expect(visibleText(memory)).not.toMatch(/double-charges/);
+    expect(visibleText(siblingMemory)).toMatch(/double-charges/);
   });
 
   test("an unsupported Claude Code version stops only that transcript, preserves its cursor and shows as a gap", () => {

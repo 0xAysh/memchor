@@ -21,7 +21,7 @@ The adapters contain no memory policy. The MCP server forwards raw tool argument
 
 | Method | Contract |
 |---|---|
-| `bootstrap({hostSessionId?, importChoice?})` | Binds scope, records an import choice if given, imports the current project's approved transcripts within `importBudgetMs` (default 3 s), and returns scope, `import` status (or the consent question), and `recall({})` |
+| `bootstrap({hostSessionId?, importChoice?, task?, workstream?})` | Binds scope (or returns `scope.ambiguity`), records an import choice if given, imports the current project's approved transcripts within `importBudgetMs` (default 3 s), and returns scope, `import` status (or the consent question), and `recall({})`. `workstream` (`<id>` or `"new"`) answers an ambiguity; `task` names the task explicitly |
 | `continueImport({maxMs?})` | One bounded step of the remaining approved import (current project first, then other projects' own workspaces). The MCP server calls it between requests while alive. Not an agent tool |
 | `record({kind, body, attribution, …})` | Appends one record with its links and search chunks; `operationKey` makes it idempotent |
 | `checkpoint({expectedRevision, goal, status, …})` | Appends revision `expectedRevision + 1` only if the head still equals `expectedRevision` |
@@ -31,27 +31,57 @@ The adapters contain no memory policy. The MCP server forwards raw tool argument
 | `rebuildSearchIndex()` | Regenerates the derived index inside one write transaction |
 | `checkIntegrity()` | Read-only `integrity_check`, `foreign_key_check` and FTS index-vs-content check. It reports a damaged, foreign or unmigrated file and never repairs or migrates it |
 
-**Scope** is resolved once per instance from the trusted `cwd`:
+## Scope
 
-1. Git toplevel and common dir give the workspace (id = hash of the common dir's realpath).
-2. For the workstream, an existing worktree binding wins, whatever branch is checked out.
-3. Otherwise the worktree gets a new workstream, labelled with its branch. The branch is only a label and never selects another worktree's workstream (PRD §9.2).
-4. `bindScope` fails closed with `storage_unavailable` if the database's `workspaces` row names a different workspace id or repository key, for example when a registry entry points at another repository's database.
+Scope is resolved from the trusted `cwd` on the first operation. Payload schemas are strict, so `workspaceId`, `workstreamId`, `cwd` and `path` are rejected. The one scope input is bootstrap's `workstream`, the user's answer to an ambiguity. It can only name a workstream in the database already chosen from `cwd`, so an id from another workspace is `not_found` and can never widen scope.
 
-Payload schemas are strict, so `workspaceId`, `cwd` and `path` are rejected.
+**Workspace = repository identity** (`src/bootstrap/workspace-resolution.ts`). `locateWorkspace` reads Git and the registry and writes nothing. `registerWorkspace` records the result.
+
+| Signal | Weight | Why |
+|---|---|---|
+| Repository key: realpath of the Git common dir | Authoritative while the repository stays put | Every worktree of one repository shares it, and unrelated repositories never do, however similar their names. The workspace id is `ws_` + its hash, salted only if the registry already gives that id to another workspace |
+| Recorded root commit absent from this object store | Proves "different repository" | A path reused by an unrelated repository must not inherit memory. The old entry is retired, and the newcomer gets its own id |
+| Unregistered key, old key gone from disk, recorded root commit present here, exactly one such workspace | A move | The registry entry and the database's `repository_key` are re-pointed. Worktree bindings under the old main worktree are rewritten to the same relative position, and linked worktrees outside it keep their paths. Consent for the old path still applies |
+| Root commit alone | Evidence, never identity | Clones and forks share it. A clone whose original still exists stays separate. Two vanished candidates are never guessed between. An unborn repository never matches |
+
+Known limit: a fresh clone made after the original was deleted is indistinguishable from a move, because Memchor keeps no marker inside the repository. It continues the original's memory. A linked worktree moved with `git worktree move` loses its binding, and its orphaned workstream is then offered as a branch candidate. Transcripts recorded at a moved repository's old path, and not imported before the move, count as `unassigned`, because their cwd no longer resolves through Git.
+
+**Workstream: one deep operation.** `resolveWorkstream` (`src/bootstrap/workstream-resolution.ts`) is used by live bootstrap and by the transcript importer. It returns a bound workstream (created and bound if needed) or an explicit ambiguity, inside the caller's write transaction, so Claude, Codex and Pi cannot drift apart:
+
+| # (PRD §9.2) | Signal | Effect | Why |
+|---|---|---|---|
+| – | Explicit choice: `workstream: <id> \| "new"` | Binds, and rebinds the worktree to it | The user answered the question |
+| 1 | Session metadata: this host + host session id already bound in `sessions`, or an imported transcript's Memchor output reporting `scope.workstreamId` of an existing workstream | Binds. A session binding never rebinds another workstream's worktree; an unbound worktree adopts it | Memchor itself bound that very session. Nothing is closer evidence. Ids not in this database are ignored |
+| 2 | Existing binding of this Git worktree | Binds, whatever branch is checked out | The worktree is where the work physically happens. Bindings survive branch switches |
+| 3 | Explicit task (`task` → task key: `#20`; `host/owner/repo#20` for an issue or PR URL; `PROJ-7`) | Binds the one active workstream with that key. A workstream without a key adopts it | The user named the task. A task that *contradicts* the task of the bound workstream from steps 1–2 is a conflict and is asked about, never overridden |
+| 4 | Strong match to one active workstream | – | V1 has no strong signal beyond 1–3. Branch similarity is not one. An issue reference on a checkpoint is a citation, not an identity claim, so it sets no task key |
+| 5 | Branch | Labels new workstreams. Lists active workstreams last seen on this branch whose every bound worktree is gone as candidates. Never binds | Branches are renamed, reused and shared by unrelated work. A workstream bound to a live worktree is never offered to another. A detached HEAD is no evidence |
+| 6 | Conversational choice | More than one credible candidate, conflicting signals, or branch-only evidence: `scope.ambiguity`, nothing bound | Guessing would silently merge unrelated work |
+
+One confident candidate binds automatically. With no candidate at all, the worktree gets a new workstream.
+
+**Ambiguity UX.** `scope.ambiguity = { question, candidates, omittedCandidates }`. Each candidate carries `workstreamId`, `label`, `branch`, `taskKey`, `headRevision`, `lastCheckpoint` (goal, status and first next step, clipped), `lastActiveAt` and `reasons` (`session_binding` / `worktree_binding` / `task` / `branch`, with a sentence). At most 5 are listed, the most recently active first. While ambiguous:
+
+- the session row has `workstream_id NULL` (workspace-level);
+- `recall` and `read` see only workspace-level records, because eligibility binds a key no workstream has, and the pack notice says why;
+- `record` without `workspaceLevel: true` and `checkpoint` throw `scope_ambiguous`.
+
+The agent shows `question`, then calls `bootstrap({workstream})`. That choice becomes the session's workstream and the worktree's binding. Bootstrap re-resolves an existing session only while it is ambiguous or when given `workstream` or `task`.
+
+`ensureWorkspace` still fails closed with `storage_unavailable` when the database's `workspaces` row names a different workspace id or repository key that is not a recorded former key. An example is a registry entry pointing at another repository's database.
 
 ## Storage and invariants
 
-`$MEMCHOR_HOME/registry.json` (atomic tmp+rename) maps each repository to a workspace. Each workspace has `workspaces/<id>/memory.sqlite` and `config.json`.
+`$MEMCHOR_HOME/registry.json` (atomic tmp+rename) maps each repository key to a workspace (id, label, root commit, former keys after moves). A `retired` section keeps workspaces whose path now holds another repository, so the moved original can reclaim them. Each workspace has `workspaces/<id>/memory.sqlite` and `config.json`.
 
 | Table | Role | Invariant |
 |---|---|---|
 | `records` | Canonical, append-only knowledge | Body ≤ 16 KiB; `attribution`, `review_state` and `freshness` are CHECKed enums; `workstream_id NULL` means workspace-level |
 | `links` | Provenance (`supported_by`, …) | Both ends visible to the writer's workstream at write time |
-| `workstreams` | Label, lifecycle, `head_revision` | The head only moves inside the CAS transaction |
+| `workstreams` | Label, lifecycle, `head_revision`, `task_key`, `branch` (v4) | The head only moves inside the CAS transaction; `branch` (last seen) is evidence, never identity |
 | `checkpoints` | Revision history | `PRIMARY KEY (workstream_id, revision)` backs the CAS |
 | `operations` | Idempotency keys | The hash covers operation + workstream + normalised input |
-| `worktree_bindings`, `sessions` | Scope binding | One workstream per worktree path |
+| `worktree_bindings`, `sessions` | Scope binding | One workstream per worktree path; `sessions.workstream_id NULL` (v4) = a workspace-level session awaiting a choice |
 | `chunks`, `chunks_fts` | **Derived** search projection | A pure function of `records`; rebuildable |
 | `sources` | One row per imported transcript | `records.source_id` points here |
 | `import_cursors` (v2) | Per-transcript reconciliation position | Advances only in the transaction that stores the batch's records; `anchor_hash` detects rewrites |
@@ -118,7 +148,12 @@ re-read cursor (CAS: another process moved it → give up this transcript for no
 
 A kill mid-batch rolls the whole batch back. The cursor never passes evidence that is not durable, and the retry re-reads the same lines (tested with a real `SIGKILL`). Unchanged file → skipped without reading. Grown with a matching anchor → append. Otherwise (rewritten or truncated) → a new pass from byte 0 under a new epoch, reconciled by identity. Identities not seen again are reported as `missing` and never deleted. A partial trailing line (the host is still writing) is left for later. Known limit: an edit that keeps the file's size and falls before the 4 KiB anchor is not detected. Claude Code only appends, so this needs an outside rewrite.
 
-**Scope.** A transcript binds to the workstream of its first event's worktree, creating the binding exactly as a live bootstrap there would. Every distinct cwd is resolved through Git (once per process). There is no path-prefix shortcut, because a directory inside the worktree can be a nested worktree, a submodule or another clone. Two things quarantine it from that line on (`scope_ambiguous`, cursor held, nothing after it imported): a later event whose cwd is in another worktree or repository, or Memchor output in it naming a different existing workstream. Transcripts whose cwd is gone or not in Git are counted as `unassigned`. `all projects` imports each repository into its own workspace database. Retrieval never mixes them.
+**Scope.** Before its first batch, a transcript is resolved by the same `resolveWorkstream` a live bootstrap uses. The inputs are its first event's worktree and current branch, its transcript id as the host session id, and the `scope.workstreamId` reported by Memchor output in that batch before the transcript leaves its first worktree. So Memchor output naming an existing workstream of this workspace is authoritative (step 1), even over the worktree's binding. A live session with the same host session id is authoritative too. Every distinct cwd is resolved through Git (once per process). There is no path-prefix shortcut, because a directory inside the worktree can be a nested worktree, a submodule or another clone.
+
+- **Held.** When resolution is ambiguous (conflicting session metadata, or a worktree whose only evidence is an orphaned workstream's branch), nothing is written. The transcript counts as `quarantined` and is reported as a `scope_ambiguous` gap. It is re-resolved when its file changes or at the next bootstrap, for example after the user chose that worktree's workstream. It is *not* imported workspace-level: workspace-level records are recalled in every workstream, so ambiguous history would enter current guidance.
+- **Quarantined.** After the first batch, two things quarantine a transcript from that line on (`scope_ambiguous`, cursor held, nothing after it imported): a later event whose cwd is in another worktree or repository, or Memchor output naming a different existing workstream.
+
+Transcripts whose cwd is gone or not in Git are counted as `unassigned`. `all projects` imports each repository into its own workspace database. Retrieval never mixes them.
 
 **Order and budget.** Bootstrap imports only the current repository (newest transcript first) until its budget. The MCP server then calls `continueImport` in 200 ms steps with 25 ms pauses until every approved transcript is reconciled. Expected failures (`storage_busy`, `storage_full`, `storage_unavailable`, an unreadable `consent.json` → state `unavailable`) are reported as `import.problem` and never fail bootstrap. The MCP loop retries a failed step with backoff (2 s … 32 s, five times). Any other error is a bug: the batch rolls back and the error propagates. Gaps met while backfilling other projects are reported in this process's status, labelled with their workspace. No model call and no network access are involved; the e2e test preloads a guard that fails on any socket, DNS lookup or fetch.
 
@@ -131,9 +166,9 @@ At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix f
 | Code | Meaning |
 |---|---|
 | `scope_unresolved` | cwd is not inside a Git worktree |
-| `scope_ambiguous` | Not thrown. Used as the gap reason for a quarantined transcript whose scope signals conflict |
+| `scope_ambiguous` | No workstream is chosen yet (`scope.ambiguity`): thrown by `record` without `workspaceLevel` and by `checkpoint`; `details.candidates` lists the ids. Also the gap reason for a held or quarantined transcript |
 | `scope_denied` | The target belongs to another workstream |
-| `not_found` | Unknown or ineligible (e.g. retracted) record |
+| `not_found` | Unknown or ineligible (e.g. retracted) record, or a chosen `workstream` that is not in this workspace |
 | `invalid_input` | Schema violation, unknown key, oversized content, or a bad continuation |
 | `idempotency_conflict` | The operation key was reused with a different request |
 | `checkpoint_conflict` | The head ≠ `expectedRevision`; `details.currentRevision` gives the head |
@@ -147,6 +182,7 @@ At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix f
 `src/storage/migrations/` holds an append-only ordered list, and `PRAGMA user_version` is the applied count:
 
 - Each step runs in its own `BEGIN IMMEDIATE` transaction together with the version bump, so a failed step leaves the previous version intact.
+- Steps run with foreign keys off, as SQLite's documented table-rebuild procedure requires. v4 rebuilds `sessions` to make `workstream_id` nullable. Each step runs `foreign_key_check` before committing, and rolls back on any violation.
 - Concurrent openers serialise, and the second finds nothing to do.
 - A database newer than the build fails closed before any pragma changes it.
 - A shipped migration is never edited.

@@ -1,6 +1,14 @@
 import { createHash } from "node:crypto";
 import { ZodError, type z } from "zod";
-import { bindScope, type BoundScope, findBinding } from "./bootstrap/workstream-resolution.js";
+import {
+  bindScope,
+  type BoundScope,
+  findBinding,
+  requireWorkstream,
+  type ResolutionBasis,
+  type ScopeAmbiguity,
+  type ScopeHints,
+} from "./bootstrap/workstream-resolution.js";
 import { headCommit, locateWorkspace, registerWorkspace, resolveHome, type WorkspaceLocation } from "./bootstrap/workspace-resolution.js";
 import { type ErrorCode, MemchorError } from "./errors.js";
 import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integrity/checkpoints.js";
@@ -48,6 +56,8 @@ import { appendRecord, recordFields } from "./storage/records.js";
 export type { ImportedSource, Citation } from "./integrity/provenance.js";
 export type { ImportCounters, ImportGap, ImportStatus } from "./import/reconcile.js";
 export type { IntegrityReport } from "./storage/database.js";
+export type { CandidateSignal, ResolutionBasis, ScopeAmbiguity, WorkstreamCandidate } from "./bootstrap/workstream-resolution.js";
+export type { CheckpointSummary } from "./integrity/checkpoints.js";
 
 // ───────────────────────────── Public interface ─────────────────────────────
 
@@ -70,15 +80,25 @@ export interface OpenMemoryOptions {
   importBudgetMs?: number;
 }
 
-/** The scope this Memory instance is bound to. Fixed for the instance's lifetime. */
+/**
+ * The scope this Memory instance is bound to. The workspace is fixed for the instance's
+ * lifetime; the workstream changes only through `bootstrap({ workstream | task })`.
+ */
 export interface Scope {
   workspaceId: string;
   workspaceLabel: string;
-  workstreamId: string;
-  workstreamLabel: string;
+  /** Null while `ambiguity` is set: the session is workspace-level until the user chooses. */
+  workstreamId: string | null;
+  workstreamLabel: string | null;
+  /** The workstream's normalised explicit task identity (e.g. "#20"), if it has one. */
+  taskKey: string | null;
+  /** Which signal chose the workstream (see docs/architecture.md, "Scope"); null while ambiguous. */
+  resolvedBy: ResolutionBasis | null;
+  /** Set when more than one workstream could continue here, or signals conflict: ask the user (`question`). */
+  ambiguity: ScopeAmbiguity | null;
   branch: string;
   worktree: string;
-  /** Current head checkpoint revision (0 = none yet); pass it as `expectedRevision`. */
+  /** Current head checkpoint revision (0 = none yet, or no workstream); pass it as `expectedRevision`. */
   headRevision: number;
   sessionId: string;
   host: string;
@@ -245,7 +265,9 @@ export interface StatusResult {
  * Invariants callers can rely on:
  * - **Scope is not an input.** It is resolved once from the trusted `cwd` (lazily on the
  *   first operation, or by `bootstrap`) and enforced inside every operation. Payloads are
- *   strict: unknown keys such as `workspaceId` or `path` are `invalid_input`.
+ *   strict: unknown keys such as `workspaceId` or `path` are `invalid_input`. The only scope
+ *   input is bootstrap's `workstream`, the user's answer to `scope.ambiguity`, which can only
+ *   name a workstream of the already-resolved workspace.
  * - **Every write is one IMMEDIATE transaction**: record + provenance links + search
  *   chunks + idempotency row commit together or not at all. An acknowledged write is
  *   durable (WAL, synchronous=FULL).
@@ -261,6 +283,11 @@ export interface Memory {
    * project's approved transcripts within a time budget, and returns scope plus initial
    * context. On a host's first use it returns the import consent question instead of
    * importing; `importChoice` records (or changes) the answer.
+   *
+   * When more than one workstream could continue here, `scope.ambiguity` lists them and no
+   * workstream is bound: recall shows only workspace-level memory and workstream-scoped
+   * writes fail with `scope_ambiguous`. `workstream` (an id from the candidates, or "new")
+   * answers it and becomes this worktree's binding; `task` names the task explicitly.
    */
   bootstrap(input?: BootstrapInput): BootstrapResult;
   /**
@@ -349,7 +376,7 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(BootstrapInput, input);
       if (parsed.hostSessionId !== undefined) this.adoptHostSessionId(parsed.hostSessionId);
-      const { db, scope, location } = this.bind();
+      const { db, scope, location } = this.bind({ task: parsed.task, workstream: parsed.workstream });
       const runtime = probeRuntime();
       const imported = this.importer === null ? unsupportedHostStatus(this.host) : this.importer.bootstrap({ location, db }, parsed.importChoice);
       return {
@@ -357,7 +384,7 @@ class LocalMemory implements Memory {
         created: { workspace: location.isNew, workstream: scope.createdWorkstream },
         runtime: { sqliteVersion: runtime.sqliteVersion, fts5: runtime.fts5, schemaVersion: SCHEMA_VERSION },
         import: imported,
-        context: this.pack(db, scope, parse(RecallInput, {})),
+        context: withScopeNotice(scope, this.pack(db, scope, parse(RecallInput, {}))),
       };
     });
   }
@@ -366,6 +393,7 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(RecordInput, input);
       const { db, scope } = this.bind();
+      if (!parsed.workspaceLevel) requireWorkstream(scope, "memory_record");
       const applicability = withHeadCommit(parsed.applicability, scope.worktree);
       const links: Citation[] = [
         ...parsed.supportedBy.map((recordId) => ({ recordId, relation: "supported_by" as const })),
@@ -400,6 +428,7 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(CheckpointInput, input);
       const { db, scope } = this.bind();
+      requireWorkstream(scope, "memory_checkpoint");
       const applicability = withHeadCommit({}, scope.worktree);
       // Replay is checked before the revision compare, so retrying a checkpoint that
       // already succeeded returns its result instead of a spurious conflict.
@@ -421,7 +450,7 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(RecallInput, input);
       const { db, scope } = this.bind();
-      return this.pack(db, scope, parsed);
+      return withScopeNotice(scope, this.pack(db, scope, parsed));
     });
   }
 
@@ -555,15 +584,25 @@ class LocalMemory implements Memory {
 
   // ── internals ──
 
-  /** Resolves and binds scope exactly once per instance; later calls reuse it. */
-  private bind(): Bound {
+  /**
+   * Resolves and binds scope once per instance; later calls reuse it. Only bootstrap passes
+   * `hints`: it re-resolves this session when it is still ambiguous, or when the agent gives an
+   * explicit choice or task.
+   */
+  private bind(hints?: ScopeHints): Bound {
     if (this.closed) throw new MemchorError("storage_unavailable", "This Memory has been closed.");
-    if (this.bound !== undefined) return this.bound;
+    if (this.bound !== undefined) {
+      const { db, location, scope } = this.bound;
+      if (hints !== undefined && (hints.task !== undefined || hints.workstream !== undefined || scope.workstream === null)) {
+        this.bound.scope = bindScope(db, location, { host: this.host, hostSessionId: this.hostSessionId, sessionId: scope.sessionId }, hints);
+      }
+      return this.bound;
+    }
     const location = locateWorkspace(this.cwd, this.home);
     registerWorkspace(location);
     const db = openDatabase(location.dbPath, this.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: this.busyTimeoutMs });
     try {
-      const scope = bindScope(db, location, this.host, this.hostSessionId);
+      const scope = bindScope(db, location, { host: this.host, hostSessionId: this.hostSessionId }, hints);
       this.bound = { db, scope, location };
       return this.bound;
     } catch (error) {
@@ -791,14 +830,25 @@ function scopeView(db: Db, scope: BoundScope): Scope {
   return {
     workspaceId: scope.workspaceId,
     workspaceLabel: scope.workspaceLabel,
-    workstreamId: scope.workstreamId,
-    workstreamLabel: scope.workstreamLabel,
+    workstreamId: scope.workstream?.id ?? null,
+    workstreamLabel: scope.workstream?.label ?? null,
+    taskKey: scope.workstream?.taskKey ?? null,
+    resolvedBy: scope.resolvedBy,
+    ambiguity: scope.ambiguity,
     branch: scope.branch,
     worktree: scope.worktree,
-    headRevision: headRevision(db, scope.workstreamId),
+    headRevision: scope.workstream === null ? 0 : headRevision(db, scope.workstream.id),
     sessionId: scope.sessionId,
     host: scope.host,
   };
+}
+
+/** While no workstream is bound, a pack says why it holds only workspace-level memory. */
+function withScopeNotice(scope: BoundScope, pack: ContextPack): ContextPack {
+  if (scope.ambiguity === null) return pack;
+  const why =
+    "No workstream is bound yet (scope.ambiguity lists the candidates), so this holds only workspace-level memory. Ask the user which workstream to continue, then call memory_bootstrap with workstream set to its id or \"new\".";
+  return { ...pack, notice: pack.empty || pack.notice === null ? why : `${why} ${pack.notice}` };
 }
 
 function withHeadCommit(applicability: Applicability, worktree: string): Applicability {
