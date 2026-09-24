@@ -37,6 +37,8 @@ Real transcripts hold account ids, file contents and credentials, so they never 
 
 `tests/mcp/codex-connection.test.ts` (and the Codex step of `tests/handoff/handoff-real-codex.test.ts`) drives the real Codex CLI (`codex mcp add/list/get`, `codex app-server`) in a temporary `CODEX_HOME`. It runs only against the pinned build, `codex-cli 0.148.0-alpha.21` (bundled at `/Applications/ChatGPT.app/Contents/Resources/codex`; override with `MEMCHOR_TEST_CODEX_BIN`), and is skipped, with the reason on stderr, when that binary is missing or reports another version.
 
+`tests/mcp/claude-connection.test.ts` drives the real Claude Code CLI: `claude mcp add/list/get`, and a `claude -p` session against a localhost stub of the Messages API that makes it call `memory_bootstrap` and `memory_status`. `HOME` and `CLAUDE_CONFIG_DIR` are temporary directories. On macOS each `claude` process also runs under `sandbox-exec` with a profile that denies `~/.claude.json`, `~/.claude`, Claude's cache, `~/.memchor` and every connection except to localhost. It runs only against the pinned build, Claude Code `2.1.281` (the first `claude` on `PATH`, else `~/.local/bin/claude`; override with `MEMCHOR_TEST_CLAUDE_BIN`), and is skipped, with the reason on stderr, when that binary is missing or reports another version.
+
 ## Commands
 
 ```sh
@@ -96,13 +98,32 @@ codex mcp get memchor     # command, args, env (masked), timeouts
 
 Codex rollouts written by 0.125.0-alpha.3 – 0.142.x and by 0.148.0-alpha.21 (legacy history mode) are imported; see [Transcript import](docs/architecture.md#transcript-import) for the table and known gaps.
 
-### Connect Claude Code (illustrative, untested)
+### Connect Claude Code (verified with Claude Code 2.1.281)
 
-This command shape follows the PRD. It has not been verified against a pinned Claude Code release yet.
+Tested against Claude Code `2.1.281` (native install) by `tests/mcp/claude-connection.test.ts`, with `HOME` and `CLAUDE_CONFIG_DIR` in temporary directories.
 
 ```sh
-claude mcp add memchor -- memchor mcp --host claude-code
+# With memchor installed on PATH (npm install -g); run by hand against 2.1.281 with memchor installed into a temporary prefix:
+claude mcp add memchor -s user -- memchor mcp --host claude-code
+# From a checkout (after npm run build); the test registers this form, plus a test-only no-network preload:
+claude mcp add memchor -s user -- "$(command -v node)" /abs/path/to/memchor/dist/cli.js mcp --host claude-code
+
+claude mcp list            # memchor: … - ✔ Connected
+claude mcp get memchor     # Scope: User config …, Status: ✔ Connected, command, args, env
 ```
+
+- **Use user scope (`-s user`).** Memchor serves every repository and finds the repository from its working directory. Claude Code starts a user-scope stdio server in the directory the session runs in: the test sees Memchor log `MCP server ready (cwd <repo>)`, and in a `claude -p` session its `memory_bootstrap` resolves that repository and branch. User and local scope are both stored in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when that is set). The default, `-s local`, registers Memchor for the current directory only. Avoid `-s project`: it writes `.mcp.json` into the repository, with your local paths, and Memchor otherwise writes nothing there.
+- **`--host claude-code` is explicit, not required.** Claude Code 2.1.281 identifies itself as `claude-code` in the MCP handshake, which Memchor would accept. The flag keeps the host from depending on it.
+- **Environment is inherited.** Unlike Codex, Claude Code passes its own environment to the servers it starts (adding `CLAUDE_PROJECT_DIR`, `CLAUDE_CODE_SESSION_ID`, …), so a `MEMCHOR_HOME` or `CLAUDE_CONFIG_DIR` set when you launch `claude` reaches Memchor. To pin one however Claude is launched, add `-e` after the server name (`-e` takes several values, so a name placed after it is read as another pair):
+
+  ```sh
+  claude mcp add memchor -s user -e MEMCHOR_HOME="$MEMCHOR_HOME" -- "$(command -v memchor)" mcp --host claude-code
+  ```
+
+  A bare `memchor` is looked up on the `PATH` Claude runs with, and the installed script needs `node` on that `PATH` (`#!/usr/bin/env node`). If Claude is started from an IDE or with another `PATH` (nvm, for instance), use the node/dist form with absolute paths.
+- **`claude mcp list` really connects.** `list` and `get` start each server, complete the handshake and stop it. A server that cannot start shows `✘ Failed to connect`, and both commands still exit 0, so read the status. The check creates no Memchor database: Memchor answers the handshake before touching storage. Server stderr lands in Claude Code's MCP logs (`~/Library/Caches/claude-cli-nodejs/<project>/mcp-logs-memchor/` on macOS).
+- **Startup timeout.** Claude Code waits 30 s for a stdio server by default (its log: `Starting connection with timeout of 30000ms`). Start it with `MCP_TIMEOUT=<ms>` to change that (verified with `20000`). `memory_bootstrap` bounds its transcript import to 3 s and continues in the background.
+- **Known limit: instructions are cut at 2048 characters.** Claude Code 2.1.281 keeps only the first 2048 characters of a server's MCP `instructions` and logs `Server instructions truncated from 2603 to 2048 chars` for Memchor. Everything from the middle of the `memory_record` rule on (honest attribution and `supportedBy`, never re-record recall output, checkpoint with `expectedRevision` before finishing, an empty pack is an honest miss) does not reach the agent through the handshake.
 
 MCP tools: `memory_bootstrap`, `memory_recall`, `memory_read`, `memory_record`, `memory_checkpoint`, `memory_status`. The server's MCP `instructions` carry the agent protocol: bootstrap first, verify live state, record with honest attribution, cite evidence, and checkpoint with `expectedRevision` before finishing.
 
