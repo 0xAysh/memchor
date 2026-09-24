@@ -6,24 +6,16 @@
 .env.*
 !.env.example
 
-# Python environments and generated files
-.venv/
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-.coverage
-.coverage.*
-htmlcov/
-
 # Node.js dependencies
 node_modules/
 
-# Build output
-/build/
+# Build and test output
 /dist/
+/coverage/
+*.tsbuildinfo
 
 # macOS metadata
 .DS_Store
+
+# Sample outputs written by the MCP end-to-end test
+/tests/mcp/__artifacts__/
