@@ -1,4 +1,6 @@
+import { readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
+import Database from "better-sqlite3";
 import { describe, expect, test } from "vitest";
 import { openMemory, type Memory } from "../../src/memory.js";
 import { catchMemchorError, git, initRepo, onCleanup, tempDir } from "../helpers.js";
@@ -182,5 +184,90 @@ describe("workstream resolution", () => {
     // The same id from another host is another session.
     const third = addWorktree(repo, "third", true);
     expect(open(third, home, { host: "claude-code", hostSessionId: "thread-1" }).bootstrap().scope.resolvedBy).toBe("new_workstream");
+  });
+});
+
+/** Every row of every table, plus the registry: the "status wrote nothing" check. */
+function storageState(home: string, dbPath: string): string {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    const tables = (db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all() as { name: string }[]).map((t) => t.name);
+    const rows = tables.map((name) => [name, db.prepare(`SELECT * FROM "${name}"`).all()]);
+    return JSON.stringify({ rows, version: db.pragma("user_version", { simple: true }), registry: readFileSync(join(home, "registry.json"), "utf8") });
+  } finally {
+    db.close();
+  }
+}
+
+describe("status reports what bootstrap would resolve, and writes nothing", () => {
+  test("a host session bound elsewhere: status names its workstream although this worktree has no binding", () => {
+    const home = tempDir();
+    const repo = initRepo();
+    const first = open(repo, home, { host: "codex", hostSessionId: "thread-1" }).bootstrap().scope;
+    const elsewhere = addWorktree(repo, "other", true);
+
+    const memory = open(elsewhere, home, { host: "codex", hostSessionId: "thread-1" });
+    const dbPath = memory.status().storage.dbPath ?? "";
+    const before = storageState(home, dbPath);
+    const status = memory.status();
+    expect(storageState(home, dbPath)).toBe(before);
+    expect(status.problem).toBeNull();
+    expect(status.scope).toMatchObject({ workstreamId: first.workstreamId, workstreamLabel: "main", resolvedBy: "session_binding", ambiguity: null, sessionId: null });
+
+    const booted = memory.bootstrap().scope;
+    expect(booted).toMatchObject({ workstreamId: status.scope?.workstreamId, resolvedBy: status.scope?.resolvedBy });
+  });
+
+  test("an ambiguous worktree: status lists the same candidates bootstrap asks about, and binds nothing", () => {
+    const home = tempDir();
+    const repo = initRepo();
+    const firstPath = addWorktree(repo, "feat/retry", true);
+    const orphan = open(firstPath, home);
+    orphan.bootstrap();
+    orphan.checkpoint({ expectedRevision: 0, goal: "Make retries idempotent", status: "outbox drafted", nextSteps: ["wire the outbox"] });
+    orphan.close();
+    git(repo, "worktree", "remove", "--force", firstPath);
+
+    const memory = open(addWorktree(repo, "feat/retry"), home);
+    const dbPath = memory.status().storage.dbPath ?? "";
+    const before = storageState(home, dbPath);
+    const status = memory.status();
+    expect(storageState(home, dbPath)).toBe(before);
+    expect(status.scope).toMatchObject({ workstreamId: null, resolvedBy: null });
+    expect(status.scope?.ambiguity?.candidates).toHaveLength(1);
+
+    const booted = memory.bootstrap().scope;
+    expect(status.scope?.ambiguity).toEqual(booted.ambiguity);
+  });
+
+  test("a worktree with no candidate: status says bootstrap would start a new workstream", () => {
+    const home = tempDir();
+    const repo = initRepo();
+    open(repo, home).bootstrap();
+    const status = open(addWorktree(repo, "fresh", true), home).status();
+    expect(status.scope).toMatchObject({ workstreamId: null, workstreamLabel: null, resolvedBy: "new_workstream", ambiguity: null, headRevision: null });
+  });
+
+  test("after a repository move status claims no resolution it cannot preview, and bootstrap still re-binds", () => {
+    const home = tempDir();
+    const repo = initRepo({ branch: "feat/moves" });
+    const before = open(repo, home);
+    const boot = before.bootstrap().scope;
+    before.close();
+    const moved = join(tempDir("memchor-moved-"), "renamed");
+    renameSync(repo, moved);
+
+    const status = open(moved, home).status();
+    expect(status.problem).toBeNull();
+    expect(status.scope).toMatchObject({ workspaceId: boot.workspaceId, workstreamId: null, resolvedBy: null, ambiguity: null });
+    expect(open(moved, home).bootstrap().scope).toMatchObject({ workstreamId: boot.workstreamId, resolvedBy: "worktree_binding" });
+  });
+
+  test("an instance already bound reports its own binding", () => {
+    const home = tempDir();
+    const repo = initRepo();
+    const memory = open(repo, home);
+    const booted = memory.bootstrap({ task: "#7" }).scope;
+    expect(memory.status().scope).toMatchObject({ workstreamId: booted.workstreamId, taskKey: "#7", resolvedBy: "new_workstream", sessionId: booted.sessionId });
   });
 });

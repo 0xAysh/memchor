@@ -3,9 +3,10 @@ import { ZodError, type z } from "zod";
 import {
   bindScope,
   type BoundScope,
-  findBinding,
+  previewScope,
   requireWorkstream,
   type ResolutionBasis,
+  type ResolutionPreview,
   type ScopeAmbiguity,
   type ScopeHints,
 } from "./bootstrap/workstream-resolution.js";
@@ -289,8 +290,14 @@ export interface StatusScope {
   workspaceLabel: string;
   worktree: string;
   branch: string;
+  /** Null when bootstrap would create a new workstream (`resolvedBy: "new_workstream"`) or ask (`ambiguity`). */
   workstreamId: string | null;
   workstreamLabel: string | null;
+  taskKey: string | null;
+  /** The signal bootstrap would bind by; null while ambiguous or when the database cannot be read yet. */
+  resolvedBy: ResolutionBasis | null;
+  /** The candidates bootstrap would ask the user to choose from, exactly as it would list them. */
+  ambiguity: ScopeAmbiguity | null;
   headRevision: number | null;
   /** This instance's session, once an operation other than status has bound scope. */
   sessionId: string | null;
@@ -306,7 +313,7 @@ export interface StatusResult {
     supportedSchemaVersion: number;
     journalMode: string | null;
   };
-  /** What bootstrap would bind; `workstreamId` is null while this worktree has no workstream yet. */
+  /** What bootstrap (without `task` or `workstream`) would resolve, by the same rules, without binding anything. */
   scope: StatusScope | null;
   counts: { records: number; checkpoints: number; workstreams: number; sessions: number } | null;
   /** Set when scope or storage could not be resolved; status itself never throws for these. */
@@ -598,6 +605,9 @@ class LocalMemory implements Memory {
           branch: location.branch,
           workstreamId: null,
           workstreamLabel: null,
+          taskKey: null,
+          resolvedBy: null,
+          ambiguity: null,
           headRevision: null,
           sessionId: this.bound?.scope.sessionId ?? null,
           host: this.host,
@@ -608,6 +618,8 @@ class LocalMemory implements Memory {
         };
         db = openReadOnly(location.dbPath);
         if (db === null) {
+          // No database yet: the first bootstrap can only start a new workstream.
+          result.scope.resolvedBy = "new_workstream";
           reportImport(null);
           return result;
         }
@@ -626,11 +638,23 @@ class LocalMemory implements Memory {
           return result; // migrated by the next bootstrap
         }
         reportImport(db);
-        const workstream = findBinding(db, location.worktree);
-        if (workstream !== null) {
-          result.scope.workstreamId = workstream.id;
-          result.scope.workstreamLabel = workstream.label;
-          result.scope.headRevision = headRevision(db, workstream.id);
+        // A bound instance keeps its workstream (bootstrap re-resolves it only while ambiguous);
+        // otherwise preview the resolution bootstrap would run, with this instance's session.
+        const bound = this.bound?.scope;
+        const resolution: ResolutionPreview | null =
+          bound?.workstream != null && bound.resolvedBy !== null
+            ? { status: "bound", workstream: bound.workstream, basis: bound.resolvedBy }
+            : previewScope(db, location, { host: this.host, hostSessionId: this.hostSessionId, ...(bound === undefined ? {} : { sessionId: bound.sessionId }) });
+        if (resolution?.status === "ambiguous") {
+          result.scope.ambiguity = resolution.ambiguity;
+        } else if (resolution !== null) {
+          result.scope.resolvedBy = resolution.basis;
+          if (resolution.workstream !== null) {
+            result.scope.workstreamId = resolution.workstream.id;
+            result.scope.workstreamLabel = resolution.workstream.label;
+            result.scope.taskKey = resolution.workstream.taskKey;
+            result.scope.headRevision = headRevision(db, resolution.workstream.id);
+          }
         }
         const count = (table: string): number => (db?.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
         result.counts = { records: count("records"), checkpoints: count("checkpoints"), workstreams: count("workstreams"), sessions: count("sessions") };

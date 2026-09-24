@@ -30,7 +30,7 @@ The adapters contain no memory policy. `openMemory` picks the transcript adapter
 | `checkpoint({expectedRevision, goal, status, …})` | Appends revision `expectedRevision + 1` only if the head still equals `expectedRevision` |
 | `recall({query?, kinds?, maxTokens?, maxBytes?, continuation?})` | A bounded pack: head checkpoint first, then ranked eligible items, each with live freshness, provenance, independent root and corroboration (see [Recall applicability](#recall-applicability)) |
 | `read({recordId, maxTokens?, maxBytes?, offset?})` | A slice of one visible record's body, with its visible links, live freshness and independent root. Offsets count UTF-16 code units; an offset inside a surrogate pair snaps back to that code point's start |
-| `status()` | Runtime, storage, the scope bootstrap *would* bind, and counts. Strictly read-only: no registry entry, rows or migrations. Never throws for scope or storage problems |
+| `status()` | Runtime, storage, the scope bootstrap *would* resolve (`workstreamId`, `resolvedBy`, `taskKey`, or the `ambiguity` it would ask), and counts. It runs the same resolution rules as bootstrap without their writes (`previewWorkstream`); after a repository move it reports no resolution until bootstrap re-points the bindings. Strictly read-only: no registry entry, rows or migrations. Never throws for scope or storage problems |
 | `rebuildSearchIndex()` | Regenerates the derived index inside one write transaction |
 | `checkIntegrity()` | Read-only `integrity_check`, `foreign_key_check` and FTS index-vs-content check. It reports a damaged, foreign or unmigrated file and never repairs or migrates it |
 
@@ -49,7 +49,7 @@ Scope is resolved from the trusted `cwd` on the first operation. Payload schemas
 
 Known limit: a fresh clone made after the original was deleted is indistinguishable from a move, because Memchor keeps no marker inside the repository. It continues the original's memory. A linked worktree moved with `git worktree move` loses its binding, and its orphaned workstream is then offered as a branch candidate. Transcripts recorded at a moved repository's old path, and not imported before the move, count as `unassigned`, because their cwd no longer resolves through Git.
 
-**Workstream: one deep operation.** `resolveWorkstream` (`src/bootstrap/workstream-resolution.ts`) is used by live bootstrap and by the transcript importer. It returns a bound workstream (created and bound if needed) or an explicit ambiguity, inside the caller's write transaction, so Claude, Codex and Pi cannot drift apart:
+**Workstream: one deep operation.** `resolveWorkstream` (`src/bootstrap/workstream-resolution.ts`) is used by live bootstrap and by the transcript importer. It returns a bound workstream (created and bound if needed) or an explicit ambiguity, inside the caller's write transaction, so Claude, Codex and Pi cannot drift apart. The rules decide first and write second; `previewWorkstream` runs only the decision, which is how `status` reports what bootstrap would do on a read-only connection:
 
 | # (PRD §9.2) | Signal | Effect | Why |
 |---|---|---|---|
