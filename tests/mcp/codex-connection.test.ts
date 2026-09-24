@@ -66,7 +66,10 @@ describe.skipIf(SKIP !== null)(`real Codex ${CODEX_PINNED_VERSION} connection`, 
   test("a thread's memchor runs in the thread's cwd, and its legacy rollout imports into that workstream with the thread id as transcript id", async () => {
     const { env, codexHome, memchorHome, networkLog } = setup();
     const repo = initRepo({ branch: "feat/codex" });
-    const stub = await startStubResponses({ calls: [{ tool: "memory_bootstrap", arguments: {} }], reply: "Bootstrapped; nothing to continue yet." });
+    const stub = await startStubResponses({ calls: [
+        { tool: "memory_bootstrap", arguments: {} },
+        { tool: "memory_status", arguments: {} },
+      ], reply: "Bootstrapped; nothing to continue yet." });
     useStubProvider(codexHome, stub.port);
 
     // app-server runs outside any repository: Memchor can only resolve scope from the thread's cwd.
@@ -78,7 +81,7 @@ describe.skipIf(SKIP !== null)(`real Codex ${CODEX_PINNED_VERSION} connection`, 
     const rollout = readFileSync(path, "utf8");
     expect(rollout).toContain('"history_mode":"legacy"');
     // The bootstrap ran in the repository: a scope error would mean it ran in app-server's directory.
-    expect(rollout).toContain(`"namespace":"mcp__memchor"`);
+    expect(rollout.match(/"type":"mcp_tool_call_end"/g)).toHaveLength(2);
     expect(rollout).not.toContain("scope_unresolved");
     const live = /\\"workstreamId\\":\\"(wst_[0-9a-f]{32})\\",\\"workstreamLabel\\":\\"feat\/codex\\"/.exec(rollout)?.[1];
     expect(live).toBeDefined();
@@ -89,7 +92,7 @@ describe.skipIf(SKIP !== null)(`real Codex ${CODEX_PINNED_VERSION} connection`, 
     });
     const boot: BootstrapResult = memory.bootstrap({ importChoice: "current_project" });
     expect(boot.scope).toMatchObject({ workstreamId: live, workstreamLabel: "feat/codex" });
-    expect(boot.import).toMatchObject({ state: "complete", currentProject: { complete: 1, counters: { echoes: 1 } } });
+    expect(boot.import).toMatchObject({ state: "complete", currentProject: { complete: 1, counters: { echoes: 2 } } });
     const items = memory.recall({ maxTokens: 8_000 }).items;
     const ask = items.find((item) => item.excerpt === "Continue the codex handoff work.");
     expect(ask).toMatchObject({ host: "codex", source: { transcriptId: threadId } });

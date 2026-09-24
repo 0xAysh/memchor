@@ -80,9 +80,10 @@ export interface StubCall {
 }
 
 /**
- * A localhost Responses API: for each turn, it first asks for the next queued Memchor call
- * (as a function_call in the `mcp__memchor` namespace Codex advertises), then answers with a
- * plain assistant message once the call's output is in the input.
+ * A localhost Responses API: while Memchor calls remain queued, each model request is answered
+ * with the next one (a function_call in the `mcp__memchor` namespace Codex advertises, so one
+ * turn can chain several calls); once the queue is empty, with a plain assistant message that
+ * ends the turn.
  */
 export async function startStubResponses(script: { calls: StubCall[]; reply: string }): Promise<{ port: number; requests: number }> {
   const state = { port: 0, requests: 0 };
@@ -96,10 +97,9 @@ export async function startStubResponses(script: { calls: StubCall[]; reply: str
         res.writeHead(404).end("{}");
         return;
       }
-      const json = JSON.parse(body) as { input?: { type?: string }[]; tools?: { type?: string; name?: string }[] };
-      const lastIsOutput = json.input?.at(-1)?.type === "function_call_output";
+      const json = JSON.parse(body) as { tools?: { type?: string; name?: string }[] };
       const namespace = json.tools?.find((t) => t.type === "namespace" && t.name?.startsWith("mcp__memchor"))?.name;
-      const next = !lastIsOutput && namespace !== undefined ? queue.shift() : undefined;
+      const next = namespace !== undefined ? queue.shift() : undefined;
       const n = state.requests;
       const item =
         next === undefined
@@ -181,10 +181,12 @@ export class CodexAppServer {
     this.notify("initialized");
   }
 
-  /** Starts a legacy-history thread in `cwd` and runs one turn to completion; returns the thread id and rollout path. */
-  async runTurn(cwd: string, text: string): Promise<{ threadId: string; path: string }> {
-    const started = await this.request("thread/start", { cwd, approvalPolicy: "never", sandbox: "danger-full-access" });
-    const thread = started["thread"] as { id: string; path: string };
+  /**
+   * Runs one turn to completion, in a new legacy-history thread started in `cwd` unless `thread`
+   * continues an earlier one; returns the thread id and rollout path.
+   */
+  async runTurn(cwd: string, text: string, thread?: { id: string; path: string }): Promise<{ threadId: string; path: string }> {
+    thread ??= (await this.request("thread/start", { cwd, approvalPolicy: "never", sandbox: "danger-full-access" }))["thread"] as { id: string; path: string };
     const done = this.waitFor("turn/completed");
     await this.request("turn/start", { threadId: thread.id, input: [{ type: "text", text }] });
     await done;
