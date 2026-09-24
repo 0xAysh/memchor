@@ -214,6 +214,29 @@ Transcripts whose cwd is gone or not in Git are counted as `unassigned`. `all pr
 
 **Order and budget.** Bootstrap imports only the current repository (newest transcript first) until its budget. The MCP server then calls `continueImport` in 200 ms steps with 25 ms pauses until every approved transcript is reconciled. Expected failures (`storage_busy`, `storage_full`, `storage_unavailable`, an unreadable `consent.json` → state `unavailable`) are reported as `import.problem` and never fail bootstrap. The MCP loop retries a failed step with backoff (2 s … 32 s, five times). Any other error is a bug: the batch rolls back and the error propagates. Gaps met while backfilling other projects are reported in this process's status, labelled with their workspace. No model call and no network access are involved; the e2e test preloads a guard that fails on any socket, DNS lookup or fetch.
 
+## Handoff
+
+The V1 story (Claude Code → a fresh Codex session → a fresh Claude Code session in one worktree) needs no handoff-specific code: each host runs its own `memchor mcp` process, and they meet only in `$MEMCHOR_HOME` through the pieces above.
+
+```text
+Claude  memchor mcp --host claude-code   bootstrap (consent, import its transcripts) → record → checkpoint r1
+                                              │ same repository key → same workspace database
+Codex   memchor mcp --host codex         bootstrap (consent, import its rollouts; _meta.threadId = the thread)
+                                              │ worktree binding → same workstream; the rollout joins it by session binding
+                                              → pack: r1 + Claude and Codex records, each with host/session/source,
+                                                live freshness (unchanged file current, edited file stale + "read the current file"),
+                                                independent roots; conflicting claims both kept → checkpoint r2 (CAS on r1)
+Claude  memchor mcp --host claude-code   bootstrap → r2 from Codex, with the same freshness warnings
+```
+
+The proof is `tests/handoff/`:
+
+- `handoff.test.ts` (always runs): separate server processes with the no-network preload, hand-written Claude and Codex (`0.148.0-alpha.21/handoff.jsonl`) histories, and a second repository with the same directory name in the same `MEMCHOR_HOME`. It checks the three sessions, a stale concurrent Claude checkpoint (`checkpoint_conflict`), the root rule (a `/branch` copy and a Memchor echo add nothing, Codex's own repeat of Claude's claim is a second root, a cited restatement is a copy), no leakage into any pack or `memory_read`, truncation, and a worktree two earlier sessions could continue (`scope.ambiguity` until the user chooses).
+- `handoff-real-codex.test.ts`: the Codex step through the pinned `codex app-server` and a localhost stub model (skipped like `codex-connection.test.ts`).
+- `matrix.test.ts`: the repository/worktree identity and freshness matrix.
+
+Each run writes the packs and the matrix, with temporary paths replaced by placeholders, to the git-ignored `tests/mcp/__artifacts__/handoff/`.
+
 ## Runtime gate
 
 At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix for the [WAL-reset bug](https://sqlite.org/wal.html#walresetbug). It also requires FTS5: the compile option must be present and creating an FTS5 table must succeed. If either check fails, it throws `unsupported_runtime` with the version it found. The rule is the pure function `assertSupportedRuntime`, which has no override. `memchor mcp` runs it at process start and exits non-zero with the message on stderr before serving. Every database open runs it again.

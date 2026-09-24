@@ -26,13 +26,16 @@ npm run benchmark:import
 npm run snapshot:transcripts    # then `npm test` also runs tests/import/real-history.test.ts against it
 MEMCHOR_REAL_CLAUDE_DIR=~/.claude npx vitest run tests/import/real-history.test.ts   # or read a config dir in place
 MEMCHOR_REAL_CODEX_HOME=~/.codex npx vitest run tests/import/real-history.test.ts   # (Codex: only sessions/ and archived_sessions/ are read)
+
+# Handoff evidence: the Claude → Codex → Claude packs and the identity/freshness matrix, written to tests/mcp/__artifacts__/handoff/
+npx vitest run tests/handoff
 ```
 
 `npm run benchmark:import` generates sanitized JSONL in a temporary directory, imports it without network/model calls, and reports stable `small`/`large` scenario fields: transcript, turn, event and record counts; elapsed milliseconds; RSS delta and process peak RSS; and database bytes. Values are evidence for the machine running the command, not flaky pass/fail thresholds. Scenario sizes can be overridden with `-- --small-transcripts N --small-turns N --large-transcripts N --large-turns N`.
 
 Real transcripts hold account ids, file contents and credentials, so they never leave your machine. `.real-transcripts/` is git-ignored, and the snapshot script refuses to run unless git confirms that. It intentionally copies Claude, Codex and Pi `*.jsonl` histories as local product-development fixtures, never settings, Codex's `auth.json`/`config.toml`/SQLite state or Pi's `auth.json`; current product import support remains independently adapter-gated. Every committed fixture under `tests/import/fixtures/` is hand-written. Other tests never read real history: `vitest.config.ts` points `CLAUDE_CONFIG_DIR` and `CODEX_HOME` at empty directories.
 
-`tests/mcp/codex-connection.test.ts` drives the real Codex CLI (`codex mcp add/list/get`, `codex app-server`) in a temporary `CODEX_HOME`. It runs only against the pinned build, `codex-cli 0.148.0-alpha.21` (bundled at `/Applications/ChatGPT.app/Contents/Resources/codex`; override with `MEMCHOR_TEST_CODEX_BIN`), and is skipped, with the reason on stderr, when that binary is missing or reports another version.
+`tests/mcp/codex-connection.test.ts` (and the Codex step of `tests/handoff/handoff-real-codex.test.ts`) drives the real Codex CLI (`codex mcp add/list/get`, `codex app-server`) in a temporary `CODEX_HOME`. It runs only against the pinned build, `codex-cli 0.148.0-alpha.21` (bundled at `/Applications/ChatGPT.app/Contents/Resources/codex`; override with `MEMCHOR_TEST_CODEX_BIN`), and is skipped, with the reason on stderr, when that binary is missing or reports another version.
 
 ## Commands
 
