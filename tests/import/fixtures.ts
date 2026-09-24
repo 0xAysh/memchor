@@ -62,3 +62,59 @@ export function installSyntheticHistory(configDir: string, cwd: string, options:
   }
   return installed;
 }
+
+// ── Codex ──
+
+const CODEX_FIXTURES = resolve(import.meta.dirname, "fixtures/codex");
+
+/** A fresh stand-in for `$CODEX_HOME` (rollouts live under its `sessions/` and `archived_sessions/`). */
+export function codexHome(): string {
+  return tempDir("memchor-codex-");
+}
+
+/** A UUIDv7-shaped thread id, like the ones Codex generates. */
+export function codexThreadId(): string {
+  const hex = randomUUID().replaceAll("-", "");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-7${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+export interface CodexVars {
+  cwd: string;
+  threadId: string;
+  cwd2?: string;
+  parentId?: string;
+  workstreamId?: string;
+  recordId?: string;
+}
+
+/** The Codex fixture's text with its placeholders filled in. */
+export function renderCodexFixture(fixture: string, vars: CodexVars): string {
+  let text = readFileSync(join(CODEX_FIXTURES, fixture), "utf8")
+    .replaceAll("{{CWD2}}", vars.cwd2 ?? `${vars.cwd}-elsewhere`)
+    .replaceAll("{{CWD}}", vars.cwd)
+    .replaceAll("{{THREAD}}", vars.threadId)
+    .replaceAll("{{PARENT}}", vars.parentId ?? "01900000-0000-7000-8000-00000000beef")
+    .replaceAll("{{SHA}}", "0123456789abcdef0123456789abcdef01234567")
+    .replaceAll("{{WORKSTREAM}}", vars.workstreamId ?? "wst_00000000000000000000000000000000")
+    .replaceAll("{{RECORD}}", vars.recordId ?? "rec_00000000000000000000000000000000");
+  for (const [placeholder, value] of Object.entries(GENERATED)) text = text.replaceAll(placeholder, value);
+  return text;
+}
+
+/**
+ * Writes a rendered fixture where Codex keeps a thread's rollout:
+ * `sessions/2026/01/01/rollout-2026-01-01T00-00-00-<thread>.jsonl`, or flat under
+ * `archived_sessions/` once archived.
+ */
+export function installCodexRollout(
+  home: string,
+  fixture: string,
+  options: Omit<CodexVars, "threadId"> & { threadId?: string; archived?: boolean; content?: string },
+): InstalledTranscript {
+  const threadId = options.threadId ?? codexThreadId();
+  const dir = options.archived === true ? join(home, "archived_sessions") : join(home, "sessions", "2026", "01", "01");
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `rollout-2026-01-01T00-00-00-${threadId}.jsonl`);
+  writeFileSync(path, options.content ?? renderCodexFixture(fixture, { ...options, threadId }));
+  return { sessionId: threadId, path };
+}
