@@ -39,5 +39,6 @@ Placeholders, substituted by `renderCodexFixture` in `tests/import/fixtures.ts`:
 | `0.148.0-alpha.21/basic.jsonl` | 0.148.0-alpha.21, legacy | `history_mode`, `context_window`, `world_state`, `thread_settings_applied`, `user_message.audio`, the MCP call triple exactly as Codex writes it |
 | `0.148.0-alpha.21/local-compaction.jsonl` | 0.148.0-alpha.21, legacy | a local compaction: assistant `response_item` without `agent_message`, `compacted.message` with Codex's summary prefix |
 | `0.148.0-alpha.21/fork-parent.jsonl`, `fork.jsonl` | 0.148.0-alpha.21, legacy | a fork (`forked_from_id`) whose file starts with a re-timestamped copy of its parent, then `thread_settings_applied` and its own turn |
+| `0.148.0-alpha.21/handoff.jsonl` | 0.148.0-alpha.21, legacy | the Codex side of `tests/handoff/`: a Memchor recall echoing a Claude claim, a failing `exec_command`, an agent message repeating that claim after its own run, and one contradicting a Claude observation |
 | `0.148.0-alpha.21/paginated.jsonl` | 0.148.0-alpha.21, paginated | `history_mode: "paginated"`, `ordinal` on every line, `item_completed` |
 | `unknown-version.jsonl` | 0.104.0-alpha.1 (not in the table) | stops at line 1 |

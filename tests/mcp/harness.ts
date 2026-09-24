@@ -35,6 +35,8 @@ export async function spawnServer(options: {
   claudeConfigDir?: string;
   codexHome?: string;
   networkLog?: string;
+  /** Sent as `_meta` on every tools/call, as a host does (Codex: `{ threadId }`). */
+  meta?: Record<string, unknown>;
 }): Promise<ServerHandle> {
   const args = [...(options.networkLog === undefined ? [] : ["--import", NO_NETWORK]), CLI, "mcp", ...(options.host === undefined ? [] : ["--host", options.host])];
   const transport = new StdioClientTransport({
@@ -58,7 +60,7 @@ export async function spawnServer(options: {
   if (pid === null) throw new Error("server did not start");
 
   const call = async (name: string, callArgs: Record<string, unknown> = {}): Promise<ToolOutcome> => {
-    const result = await client.callTool({ name, arguments: callArgs });
+    const result = await client.callTool({ name, arguments: callArgs, ...(options.meta === undefined ? {} : { _meta: options.meta }) });
     const content = result.content as { type: string; text?: string }[];
     return {
       isError: result.isError === true,
