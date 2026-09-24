@@ -77,6 +77,21 @@ const TOOL_LIST = (Object.keys(OPERATION_SCHEMAS) as OperationName[]).map((name)
 
 const isOperation = (name: string): name is OperationName => Object.hasOwn(OPERATION_SCHEMAS, name);
 
+/**
+ * The `tools/call` `_meta` key through which a host names its own session. Codex sends
+ * `threadId` on every call, and it equals the id of the thread's rollout (`session_meta.id`), so
+ * it is authoritative: adopting it as the host session id makes the live session and the
+ * thread's imported rollout the same session for workstream resolution (step 1). `initialize`
+ * carries no such id. Hosts not listed here (Claude Code sends none) are unaffected.
+ */
+const SESSION_META_KEY: Readonly<Record<string, string>> = { codex: "threadId" };
+
+function hostSessionFromMeta(host: string | undefined, meta: Record<string, unknown> | undefined): string | undefined {
+  const key = host === undefined ? undefined : SESSION_META_KEY[host];
+  const value = key === undefined ? undefined : meta?.[key];
+  return typeof value === "string" && value.trim() !== "" ? value.trim().slice(0, 200) : undefined;
+}
+
 /** One background import step, and the pause between steps that lets requests through. */
 const BACKFILL_STEP_MS = 200;
 const BACKFILL_PAUSE_MS = 25;
@@ -99,11 +114,14 @@ export function createMcpServer(options: McpServerOptions): { server: Server; cl
   const log = options.log ?? ((message: string) => process.stderr.write(`memchor: ${message}\n`));
   const server = new Server({ name: "memchor", version: "0.0.0" }, { capabilities: { tools: {} }, instructions: INSTRUCTIONS });
   let memory: Memory | undefined;
-  const getMemory = (): Memory => {
+  // The Memory opens on the first call, so a session id the host sends with it is known before
+  // bootstrap binds the session. One process serves one host session: later ids are not adopted.
+  const getMemory = (hostSessionId: string | undefined): Memory => {
     memory ??= openMemory({
       cwd: options.cwd,
       host: options.host ?? server.getClientVersion()?.name ?? "unknown",
       ...(options.home === undefined ? {} : { home: options.home }),
+      ...(hostSessionId === undefined ? {} : { hostSessionId }),
     });
     return memory;
   };
@@ -141,7 +159,7 @@ export function createMcpServer(options: McpServerOptions): { server: Server; cl
     if (!isOperation(name)) throw new McpError(ErrorCode.InvalidParams, `Unknown tool ${name}`);
     const spec = TOOLS[name];
     try {
-      const result = spec.run(getMemory(), request.params.arguments ?? {}) as Record<string, unknown>;
+      const result = spec.run(getMemory(hostSessionFromMeta(options.host, request.params._meta)), request.params.arguments ?? {}) as Record<string, unknown>;
       if (name === "memory_bootstrap" && (result["import"] as { state?: unknown } | undefined)?.state === "in_progress") {
         failures = 0;
         scheduleBackfill(BACKFILL_PAUSE_MS);
