@@ -7,17 +7,20 @@ memchor mcp (src/transports/mcp.ts)   memchor diag (src/cli.ts)
    scope · idempotency · CAS · eligibility · budgets · citations
             │                              │
             │               src/import/reconcile.ts  ← discover · order · batch · cursor · dedupe
-            │                              │ NormalizedEvent only
-            │               src/import/adapters/claude.ts  ← the only code that knows Claude's JSON
-            │                              │ (read-only)
-       one SQLite file per workspace (WAL, FTS5)      $CLAUDE_CONFIG_DIR/projects/*/*.jsonl
+            │                              │ NormalizedEvent only (one TranscriptAdapter, chosen by host)
+            │                 ┌────────────┴─────────────┐
+            │     adapters/claude.ts            adapters/codex.ts     ← the only code that knows each host's JSON
+            │                 │ (read-only)              │ (read-only)
+            │   $CLAUDE_CONFIG_DIR/projects/*/*.jsonl    $CODEX_HOME/{sessions/YYYY/MM/DD,archived_sessions}/rollout-*.jsonl
+            │
+  one SQLite file per workspace (WAL, FTS5)
 ```
 
-The adapters contain no memory policy. The MCP server forwards raw tool arguments to the module. The module parses them with the zod schemas in `src/schemas.ts`, which are also the source of the tools' JSON Schemas. Each `MemchorError` becomes `isError: true` with `{ error: { code, message, retryable, details } }`.
+The adapters contain no memory policy. `openMemory` picks the transcript adapter by host (`claude-code` → Claude Code, `codex` → Codex, anything else → none). The MCP server forwards raw tool arguments to the module. The module parses them with the zod schemas in `src/schemas.ts`, which are also the source of the tools' JSON Schemas. Each `MemchorError` becomes `isError: true` with `{ error: { code, message, retryable, details } }`.
 
 ## Memory module interface
 
-`openMemory({ cwd, host, home?, hostSessionId?, busyTimeoutMs? }): Memory`. All methods are synchronous and throw only `MemchorError` for expected failures.
+`openMemory({ cwd, host, home?, hostSessionId?, busyTimeoutMs?, claudeConfigDir?, codexHome?, importBudgetMs? }): Memory`. All methods are synchronous and throw only `MemchorError` for expected failures.
 
 | Method | Contract |
 |---|---|
@@ -153,12 +156,38 @@ Among the loaded candidates, records with the same claim (body, whitespace-norma
 
 An entry from any other version stops that transcript at that line (`stopped`, gap `unsupported_version`, cursor held). The transcript resumes once a Memchor that knows the version runs. Unknown entry or block types inside a supported version are skipped and counted, never interpreted. Not read at all: subagent transcripts (their final report is the parent's Agent tool result), `toolUseResult`, usage, snapshots and every other field.
 
+**Codex format** (`src/import/adapters/codex.ts`). Rollouts live in `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<local time>-<thread id>.jsonl` and move flat into `archived_sessions/` when archived; the transcript id is the thread id (`session_meta.id`, also in the file name), so archiving is a move, not a new transcript. Nothing else in `CODEX_HOME` is read (`auth.json`, `config.toml`, `session_index.jsonl`, the SQLite state). The only version stamp is `session_meta.cli_version` on line 1, and it records the thread's *creator*: a newer Codex that resumes a thread appends without re-stamping. The table therefore gates whole files, strictly on evidence:
+
+| Codex creator version | Format | Basis |
+|---|---|---|
+| ≥ 0.125.0-alpha.3, < 0.143.0 | `codex-rollout-legacy-v1` | 110 local Codex Desktop rollouts from 0.125.0-alpha.3, 0.126.0-alpha.8, 0.133.0-alpha.1, 0.142.0–0.142.5; `openai/codex` rust-v0.142.5 has no `history_mode`. Fixtures for 0.125.0-alpha.3 and 0.142.5 |
+| ≥ 0.148.0-alpha.21, < 0.148.0-alpha.22 | `codex-rollout-legacy-v1` | Legacy-mode rollouts written by the pinned `codex-cli 0.148.0-alpha.21` (`codex app-server` `thread/start`); its source still persists `user_message`/`agent_message`/`mcp_tool_call_end` in legacy mode. Fixtures for 0.148.0-alpha.21 |
+
+In every row, a paginated rollout (`history_mode` other than `"legacy"`, or any line with a top-level `ordinal`) stops with `hostVersion` `<cli_version>+paginated`: that format drops the message events in favour of `item_completed`. Versions compare by semver precedence (`src/import/versions.ts`), so `0.148.0-beta.21` is not mistaken for `0.148.0-alpha.21`. A rollout that stops at its first line stores nothing, not even a cursor; it is reported as `stopped` with its gap and re-read on every pass.
+
+Mapping. User text comes only from `event_msg/user_message` (Codex's record of what was typed, never injected context) and assistant text only from `event_msg/agent_message`; their `response_item/message` copies would double every message and are counted as metadata, or as `injected_context` for developer messages and Codex's contextual user blocks (`# AGENTS.md instructions`, `<environment_context>`, `<skill>`, …). Reasoning is `hidden_reasoning`. `function_call`/`custom_tool_call`/`local_shell_call`/`web_search_call` are tool calls, joined to `*_output` by `call_id`; Codex's output framing (`Chunk ID`/`Wall time`/`Process exited with code N`/`Exit code: N`) is stripped and a non-zero exit code is the only error signal (Codex does not persist a success flag). `apply_patch` (its `*** Add/Update/Delete File` and `Move to` paths, resolved against the turn's cwd) and `view_image` are artifact access; shell commands are `other` and never parsed for paths. `write_stdin` keeps only the session, never the keystrokes. Memchor's own calls (`mcp__<server>` namespace or the flat `mcp__<server>__memory_*` name, optionally with Codex's `_<12 hex>` collision suffix) are kind `memchor`, and their result is the bare MCP JSON, so echo suppression and the step-1 binding signal work as for Claude. A local compaction's `compacted.message` becomes a host summary without Codex's prompt prefix; a remote (encrypted) one and its `replacement_history` import nothing.
+
+Identity and context. Legacy events carry no ids, and the files are append-only, so an event's id is `<thread id>@<byte offset>` (plus `#k`), globally unique because independent roots use host + event id only. The cwd is per turn: each event gets the cwd of the last `turn_context` before it (a read that starts mid-file scans back up to 1 MiB for it), so a turn that moves to another worktree quarantines the rollout from there. The git branch label follows the last own-id `session_meta` (Codex appends a copy with updated `git`). Subagent threads (`source.subagent`) are not listed: their "user" is the parent agent, which already holds their result.
+
+Forks. A fork's file starts with a verbatim, re-timestamped copy of its parent's rollout. When the parent is on disk, each copied line that equals the parent's line (timestamp ignored), from the parent's first line up to the first difference, keeps the *parent's* event id and time, so the copy is a copy of the same observation in recall, never independent corroboration.
+
+Live binding. Codex sends `_meta.threadId` (the rollout's id) on every `tools/call` and nothing in `initialize`. `memchor mcp --host codex` adopts it as the host session id before the first operation binds the session (a per-host `_meta` key in `src/transports/mcp.ts`; Claude Code sends none), so the thread's rollout, when imported, resolves to the live session's workstream by step 1.
+
+Known Codex limits:
+
+- Not supported, reported as `unsupported_version` gaps: 0.104.x (it writes `user_message` before its turn's `turn_context`), 0.143.0 – 0.148.0-alpha.20 and anything newer than 0.148.0-alpha.21 (no rollouts or build to verify), and every paginated rollout (the 0.148 TUI and `codex exec` create paginated threads by default; the app-server, which Codex Desktop uses, creates legacy ones unless asked otherwise). Compressed `.jsonl.zst` rollouts (an off-by-default feature) are not listed.
+- A resumer newer than the creator appends lines Memchor cannot version-check; unknown types among them are skipped and counted, never guessed.
+- Rolled-back turns (`thread_rolled_back`) stay imported: they were already emitted when the rollback line arrives, and the adapter seam cannot retract (supersession belongs to corrections, #21).
+- A fork whose parent rollout is not on disk keeps its own ids for the copied prefix, so the copy over-counts as an independent observation until the parent reappears (a changed id then counts as a new event, not a replay).
+- If more than 1 MiB of output separates a turn's `turn_context` from a batch boundary, events after the boundary take the thread's initial cwd and branch label (a batch boundary falls there only in very long turns; no local rollout ever changed cwd mid-thread).
+- A web search has no result line, so it is kept as call bookkeeping only, never as a record. MCP results can be truncated by Codex in `function_call_output`; the id extraction then falls back to scanning the text, as for clipped Claude output. MCP `isError` is not read (it lives only in `mcp_tool_call_end`).
+
 **What is stored.** User text → `evidence` / `user_direction`. Assistant text → `evidence` / `agent_inference`. Tool call and its result → one `evidence` / `direct_observation` record with the call summary and a bounded output. Host summaries (compaction, away summary) → `note`. Records carry `createdAt` = the event time and `source` = {host, transcript, branch, event}. Privacy rules (`src/import/privacy.ts`):
 
 | Content | Handling |
 |---|---|
-| Thinking, injected context (`isMeta`, non-human origin, `<system-reminder>`), attachments, metadata entries, images | Excluded and counted |
-| File reads and edits (Read, Write, Edit, NotebookEdit) | Reference only: path as a code `externalRef`, no content |
+| Thinking, injected context (`isMeta`, non-human origin, `<system-reminder>`; Codex developer messages and contextual user blocks), attachments, metadata entries, images and audio | Excluded and counted |
+| File reads and edits (Read, Write, Edit, NotebookEdit; Codex `apply_patch`, `view_image`) | Reference only: path as a code `externalRef`, no content |
 | Output of a call touching `.env`, keys, credential files | Withheld |
 | Credentials (AWS, GitHub, Anthropic/OpenAI-style, Slack, Google, JWT, private keys, URL passwords, `secret=` assignments) | `[redacted:<kind>]`; pattern-based, so best-effort |
 | Messages > 4 KB, tool output > 1.5 KB, summaries > 8 KB | Head + tail with `[… N bytes omitted by Memchor …]` |
@@ -174,9 +203,9 @@ re-read cursor (CAS: another process moved it → give up this transcript for no
   → update cursor: offset, anchor hash, state, gap, counters (file size/mtime only once caught up)
 ```
 
-A kill mid-batch rolls the whole batch back. The cursor never passes evidence that is not durable, and the retry re-reads the same lines (tested with a real `SIGKILL`). Unchanged file → skipped without reading. Grown with a matching anchor → append. Otherwise (rewritten or truncated) → a new pass from byte 0 under a new epoch, reconciled by identity. Identities not seen again are reported as `missing` and never deleted. A partial trailing line (the host is still writing) is left for later. Known limit: an edit that keeps the file's size and falls before the 4 KiB anchor is not detected. Claude Code only appends, so this needs an outside rewrite.
+A kill mid-batch rolls the whole batch back. The cursor never passes evidence that is not durable, and the retry re-reads the same lines (tested with a real `SIGKILL`). Unchanged file → skipped without reading. Grown with a matching anchor → append. Otherwise (rewritten or truncated) → a new pass from byte 0 under a new epoch, reconciled by identity. Identities not seen again are reported as `missing` and never deleted. A partial trailing line (the host is still writing) is left for later. Known limit: an edit that keeps the file's size and falls before the 4 KiB anchor is not detected. Claude Code and Codex (legacy rollouts) only append, so this needs an outside rewrite. Codex's opt-in in-place migration to paginated rollouts is a rewrite: the new pass stops at line 1 (`+paginated`) and the records already imported are kept.
 
-**Scope.** Before its first batch, a transcript is resolved by the same `resolveWorkstream` a live bootstrap uses. The inputs are its first event's worktree and current branch, its transcript id as the host session id, and the `scope.workstreamId` reported by Memchor output in that batch before the transcript leaves its first worktree. So Memchor output naming an existing workstream of this workspace is authoritative (step 1), even over the worktree's binding. A live session with the same host session id is authoritative too. Every distinct cwd is resolved through Git (once per process). There is no path-prefix shortcut, because a directory inside the worktree can be a nested worktree, a submodule or another clone.
+**Scope.** Before its first batch, a transcript is resolved by the same `resolveWorkstream` a live bootstrap uses. The inputs are its first event's worktree and current branch, its transcript id as the host session id (for Codex, the thread id the live server adopted from `_meta.threadId`), and the `scope.workstreamId` reported by Memchor output in that batch before the transcript leaves its first worktree. So Memchor output naming an existing workstream of this workspace is authoritative (step 1), even over the worktree's binding. A live session with the same host session id is authoritative too. Every distinct cwd is resolved through Git (once per process). There is no path-prefix shortcut, because a directory inside the worktree can be a nested worktree, a submodule or another clone.
 
 - **Held.** When resolution is ambiguous (conflicting session metadata, or a worktree whose only evidence is an orphaned workstream's branch), nothing is written. The transcript counts as `quarantined` and is reported as a `scope_ambiguous` gap. It is re-resolved when its file changes or at the next bootstrap, for example after the user chose that worktree's workstream. It is *not* imported workspace-level: workspace-level records are recalled in every workstream, so ambiguous history would enter current guidance.
 - **Quarantined.** After the first batch, two things quarantine a transcript from that line on (`scope_ambiguous`, cursor held, nothing after it imported): a later event whose cwd is in another worktree or repository, or Memchor output naming a different existing workstream.
