@@ -19,3 +19,7 @@ node_modules/
 
 # Sample outputs written by the MCP end-to-end test
 /tests/mcp/__artifacts__/
+
+# Local snapshot of the developer's real agent transcripts (npm run snapshot:transcripts).
+# Holds account ids, file contents and credentials: never commit or push it.
+/.real-transcripts/

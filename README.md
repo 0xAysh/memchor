@@ -19,11 +19,12 @@ npm run typecheck
 npm run lint
 npm test            # builds dist/, then runs all suites against real SQLite, Git and server processes
 
-# Opt-in: check the importer against your real Claude Code history, read in place (nothing is copied or committed)
-MEMCHOR_REAL_CLAUDE_DIR=~/.claude npx vitest run tests/import/real-history.test.ts
+# Local-only: snapshot your real Claude Code and Pi transcripts into the git-ignored .real-transcripts/
+npm run snapshot:transcripts    # then `npm test` also runs tests/import/real-history.test.ts against it
+MEMCHOR_REAL_CLAUDE_DIR=~/.claude npx vitest run tests/import/real-history.test.ts   # or read a config dir in place
 ```
 
-Tests never read your real transcripts otherwise: `vitest.config.ts` points `CLAUDE_CONFIG_DIR` at an empty directory, and every fixture under `tests/import/fixtures/` is hand-written.
+Real transcripts hold account ids, file contents and credentials, so they never leave your machine. `.real-transcripts/` is git-ignored, and the snapshot script refuses to run unless git confirms that. It copies only `*.jsonl` transcripts, never settings or Pi's `auth.json`. Every committed fixture under `tests/import/fixtures/` is hand-written. Other tests never read real history: `vitest.config.ts` points `CLAUDE_CONFIG_DIR` at an empty directory.
 
 ## Commands
 

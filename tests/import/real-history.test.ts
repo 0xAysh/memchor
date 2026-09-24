@@ -8,14 +8,15 @@ import { tempDir } from "../helpers.js";
 import { CLI, NO_NETWORK } from "../mcp/harness.js";
 
 /**
- * Opt-in: validates the importer against the developer's real, unmodified Claude Code
- * history, read in place. Nothing from it is written anywhere but a temporary MEMCHOR_HOME,
- * and nothing is committed.
- *
- *   MEMCHOR_REAL_CLAUDE_DIR=~/.claude npx vitest run tests/import/real-history.test.ts
+ * Validates the importer against the developer's real, unmodified Claude Code history:
+ * the git-ignored local snapshot `.real-transcripts/claude` (`npm run snapshot:transcripts`),
+ * or any config dir named by MEMCHOR_REAL_CLAUDE_DIR (e.g. ~/.claude, read in place).
+ * Skipped where neither exists (a fresh clone, CI). Imports go only to a temporary
+ * MEMCHOR_HOME; nothing from the history is ever committed.
  */
-const REAL = process.env["MEMCHOR_REAL_CLAUDE_DIR"];
 const REPO = resolve(import.meta.dirname, "../..");
+const SNAPSHOT = join(REPO, ".real-transcripts", "claude");
+const REAL = process.env["MEMCHOR_REAL_CLAUDE_DIR"] ?? (existsSync(join(SNAPSHOT, "projects")) ? SNAPSHOT : undefined);
 
 interface Run {
   elapsedMs: number;
@@ -35,7 +36,7 @@ function run(home: string, networkLog: string, ...args: string[]): Run {
   return JSON.parse(out.stdout) as Run;
 }
 
-describe.skipIf(REAL === undefined)("real local Claude Code history (opt-in)", () => {
+describe.skipIf(REAL === undefined)("real local Claude Code history (local snapshot or MEMCHOR_REAL_CLAUDE_DIR)", () => {
   test("every real transcript parses within the compatibility table with no malformed lines", () => {
     const adapter = claudeCodeAdapter({ configDir: REAL ?? "" });
     const files = adapter.discover();

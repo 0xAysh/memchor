@@ -7,12 +7,9 @@ ids, paths and hashes are synthetic.
 
 Nothing here is copied or derived from a real transcript, and none ever should be:
 transcripts hold account ids, file contents and credentials. To check the importer
-against real local history, run the opt-in suite, which reads it in place and commits
-nothing:
-
-```sh
-MEMCHOR_REAL_CLAUDE_DIR=~/.claude npx vitest run tests/import/real-history.test.ts
-```
+against real local history, snapshot it into the git-ignored `.real-transcripts/`
+(`npm run snapshot:transcripts`); `tests/import/real-history.test.ts` then runs against it
+locally. It never reaches the remote.
 
 Placeholders, substituted by `tests/import/fixtures.ts`:
 
