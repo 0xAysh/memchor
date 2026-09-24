@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readdirSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type {
@@ -12,7 +12,7 @@ import type {
   TranscriptFile,
   TranscriptHead,
 } from "../normalized-event.js";
-import { readLines } from "../jsonl.js";
+import { asObject, type JsonObject, listDir, parseObject, readLines } from "../jsonl.js";
 import { inCompatibility } from "../versions.js";
 
 /**
@@ -117,18 +117,10 @@ function discover(root: string): TranscriptFile[] {
   return files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
-function listDir(dir: string): import("node:fs").Dirent[] {
-  try {
-    return readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-}
-
 function inspect(file: TranscriptFile): TranscriptHead {
   for (const line of readLines(file.path, 0, HEAD_BYTES)) {
     if (line.text === null) continue;
-    const entry = parseJson(line.text);
+    const entry = parseObject(line.text);
     if (entry !== null && typeof entry["cwd"] === "string") {
       const hostVersion = typeof entry["version"] === "string" ? entry["version"] : null;
       return { cwd: entry["cwd"], hostVersion, supported: hostVersion !== null && isSupported(hostVersion) };
@@ -148,7 +140,7 @@ function read(file: TranscriptFile, from: number, maxBytes: number): TranscriptC
       chunk.end = line.end;
       continue;
     }
-    const entry = parseJson(line.text);
+    const entry = parseObject(line.text);
     if (entry === null) {
       exclude("malformed");
       chunk.end = line.end;
@@ -166,7 +158,7 @@ function read(file: TranscriptFile, from: number, maxBytes: number): TranscriptC
   return chunk;
 }
 
-type Entry = Record<string, unknown>;
+type Entry = JsonObject;
 type Excluder = (reason: ExclusionReason, n?: number) => void;
 
 function normalizeEntry(entry: Entry, line: { start: number; end: number }, out: NormalizedEvent[], exclude: Excluder): void {
@@ -244,7 +236,7 @@ function normalizeEntry(entry: Entry, line: { start: number; end: number }, out:
       return;
     }
     if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string") {
-      out.push({ ...origin, eventId: eventId(index), type: "tool_call", callId: b.id, tool: b.name, ...describeCall(b.name, asEntry(b.input)) });
+      out.push({ ...origin, eventId: eventId(index), type: "tool_call", callId: b.id, tool: b.name, ...describeCall(b.name, asObject(b.input)) });
       return;
     }
     exclude("unsupported_entry");
@@ -314,19 +306,6 @@ function resultText(content: unknown, exclude: Excluder): string {
     else exclude("unsupported_entry");
   }
   return parts.join("\n");
-}
-
-function asEntry(value: unknown): Entry {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Entry) : {};
-}
-
-function parseJson(text: string): Entry | null {
-  try {
-    const value: unknown = JSON.parse(text);
-    return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Entry) : null;
-  } catch {
-    return null;
-  }
 }
 
 function isSupported(version: string): boolean {
