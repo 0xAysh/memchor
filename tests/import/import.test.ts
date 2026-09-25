@@ -480,6 +480,87 @@ describe("capture safety", () => {
     expect(memory.recall({ query: "outbox" }).items.map((i) => i.recordId)).toEqual([decision.recordId]);
   });
 
+  describe("an agent repeating Memchor memory it was shown", () => {
+    const OUTBOX = "Use an outbox table for retries so a crashed worker never loses a charge.";
+    const SCHEMA = "Keep the outbox in the payments schema, next to the charges table.";
+
+    /**
+     * A session that recalls `echoed` (Memchor output naming those records), with assistant text
+     * `before` and `after` the recall. It runs after the records were written, as it would.
+     */
+    function session(repo: string, sessionId: string, echoed: string[], before: string[], after: string[]): string {
+      let n = 0;
+      const started = Date.now();
+      const base = () => ({ timestamp: new Date(started + ++n * 1_000).toISOString(), uuid: `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`, cwd: repo, sessionId, version: "2.1.281", gitBranch: "main" });
+      const said = (text: string) => JSON.stringify({ ...base(), type: "assistant", message: { content: [{ type: "text", text }] } });
+      return [
+        JSON.stringify({ ...base(), type: "user", origin: { kind: "human" }, message: { content: "Pick up the retry work." } }),
+        ...before.map(said),
+        JSON.stringify({ ...base(), type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_recall", name: "mcp__memchor__memory_recall", input: { query: "retries" } }] } }),
+        JSON.stringify({ ...base(), type: "user", origin: { kind: "human" }, message: { content: [{ type: "tool_result", tool_use_id: "toolu_recall", content: JSON.stringify({ items: echoed.map((recordId) => ({ recordId, excerpt: "(excerpt)" })) }) }] } }),
+        ...after.map(said),
+      ].join("\n") + "\n";
+    }
+
+    test("a verbatim restatement after the recall is a copy of the recalled record, not corroboration", () => {
+      const e = env();
+      const repo = initRepo();
+      const memory = open(repo, e);
+      memory.bootstrap({ importChoice: "none" });
+      const decision = memory.record({ kind: "decision", body: OUTBOX, attribution: "user_direction" });
+      const sessionId = "44444444-4444-4444-8444-444444444444";
+      installTranscript(e.config, "", { cwd: repo, sessionId, content: session(repo, sessionId, [decision.recordId], [], [OUTBOX]) });
+      memory.bootstrap({ importChoice: "current_project" });
+
+      const stated = memory.recall({ query: "outbox table retries", maxTokens: 8_000 }).items.filter((i) => i.excerpt === OUTBOX);
+      expect(stated).toHaveLength(1);
+      expect(stated[0]).toMatchObject({ recordId: decision.recordId, independentRoot: `record:${decision.recordId}`, corroboration: { independentRoots: 1, records: 2 } });
+      expect(stated[0]?.copies).toEqual([expect.objectContaining({ host: "claude-code", source: expect.objectContaining({ transcriptId: sessionId }) as unknown })]);
+    });
+
+    test("a restatement appended after the recall was already imported still derives from it", () => {
+      const e = env();
+      const repo = initRepo();
+      const memory = open(repo, e);
+      memory.bootstrap({ importChoice: "none" });
+      const decision = memory.record({ kind: "decision", body: OUTBOX, attribution: "user_direction" });
+      const sessionId = "66666666-6666-4666-8666-666666666666";
+      const t = installTranscript(e.config, "", { cwd: repo, sessionId, content: session(repo, sessionId, [decision.recordId], [], []) });
+      memory.bootstrap({ importChoice: "current_project" });
+      memory.close();
+
+      appendFileSync(t.path, JSON.stringify({ type: "assistant", uuid: "00000000-0000-4000-8000-000000000099", timestamp: new Date(Date.now() + 60_000).toISOString(), cwd: repo, sessionId, version: "2.1.281", message: { content: [{ type: "text", text: OUTBOX }] } }) + "\n");
+      const again = open(repo, e);
+      again.bootstrap();
+      const stated = again.recall({ query: "outbox table retries", maxTokens: 8_000 }).items.filter((i) => i.excerpt === OUTBOX);
+      expect(stated.map((i) => [i.recordId, i.corroboration])).toEqual([[decision.recordId, { independentRoots: 1, records: 2 }]]);
+    });
+
+    test("a restatement of one long sentence, ignoring case and spacing, derives from the recalled record; a paraphrase, a short body or an earlier statement does not", () => {
+      const e = env();
+      const repo = initRepo();
+      const memory = open(repo, e);
+      memory.bootstrap({ importChoice: "none" });
+      const decision = memory.record({ kind: "decision", body: `${OUTBOX} ${SCHEMA}`, attribution: "user_direction" });
+      const short = memory.record({ kind: "evidence", body: "Retry once.", attribution: "direct_observation" });
+      const sessionId = "55555555-5555-4555-8555-555555555555";
+      const quoted = `As decided earlier:  ${SCHEMA.toUpperCase()}  Starting there.`;
+      const paraphrase = "The outbox should live beside the charges table in the payments schema.";
+      const trivial = "Retry once. Then stop.";
+      const earlier = `Before recalling anything: ${OUTBOX}`;
+      installTranscript(e.config, "", { cwd: repo, sessionId, content: session(repo, sessionId, [decision.recordId, short.recordId], [earlier], [quoted, paraphrase, trivial]) });
+      memory.bootstrap({ importChoice: "current_project" });
+
+      const items = memory.recall({ query: "outbox payments schema charges retry", maxTokens: 8_000 }).items;
+      const byText = (text: string) => items.find((i) => i.excerpt === text);
+      expect(byText(quoted)).toMatchObject({ independentRoot: `record:${decision.recordId}`, citations: [{ recordId: decision.recordId, relation: "derived_from" }] });
+      for (const own of [paraphrase, trivial, earlier]) {
+        expect(byText(own)?.independentRoot).toMatch(/^event:claude-code\//);
+        expect(byText(own)?.citations).toEqual([]);
+      }
+    });
+  });
+
   test("a transcript that moves to another repository is quarantined from that point, with a scope_ambiguous gap", () => {
     const e = env();
     const repo = initRepo();

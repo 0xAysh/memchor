@@ -181,6 +181,17 @@ describe("Claude Code adapter", () => {
     expect(JSON.stringify(chunk.events)).not.toContain(rawTail);
   });
 
+  test("a Bash command that only reads files is artifact access with the files' absolute paths; a heredoc write or a search stays other", () => {
+    const { chunk } = readAll("2.1.281/shell-reads.jsonl");
+    expect(chunk.events.filter((e) => e.type === "tool_call").map((e) => [e.tool, e.toolKind, e.paths])).toEqual([
+      ["Bash", "artifact_access", [`${CWD}/src/gateway.ts`]],
+      ["Bash", "artifact_access", [`${CWD}/src/gateway.ts`, `${CWD}/src/retry.ts`]],
+      ["Bash", "artifact_access", [`${CWD}/src/gateway.ts`]],
+      ["Bash", "other", []],
+      ["Bash", "other", []],
+    ]);
+  });
+
   test("reading in small slices yields exactly the events of one full read", () => {
     const { adapter, file, chunk: whole } = readAll("2.1.281/basic.jsonl");
     const events: NormalizedEvent[] = [];

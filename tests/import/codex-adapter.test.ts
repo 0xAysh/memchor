@@ -44,7 +44,7 @@ describe("Codex adapter", () => {
       ["assistant", "I'll run the gateway tests first, then read the retry logic in the gateway client."],
       ["call", "exec_command", "$ npm test -- gateway", "other", [], []],
       ["result", "call_0001", "FAIL src/gateway.test.ts\n  x retries a 5", true],
-      ["call", "exec_command", "$ sed -n 40,87p src/gateway.ts", "other", [], []],
+      ["call", "exec_command", "$ sed -n 40,87p src/gateway.ts", "artifact_access", [`${CWD}/src/gateway.ts`], []],
       ["result", "call_0002", "export async function charge(order) {\n  ", false],
       ["call", "apply_patch", "apply_patch src/gateway.ts, docs/idempotency.md", "artifact_access", [`${CWD}/src/gateway.ts`, `${CWD}/docs/idempotency.md`], []],
       ["result", "call_0003", "Success. Updated the following files:\nM ", false],
@@ -155,6 +155,37 @@ describe("Codex adapter", () => {
     const summaries = chunk.events.filter((e) => e.type === "tool_call").map((e) => e.summary);
     expect(summaries.join("\n")).not.toContain("SYNTHETIC-SECRET-VALUE-0003");
     expect(summaries).toContain("apply_patch .env");
+  });
+
+  test("a shell command that only reads files is artifact access with the files' absolute paths; anything else stays other", () => {
+    const { chunk } = readAll("0.142.5/shell-reads.jsonl");
+    const calls = chunk.events.filter((e) => e.type === "tool_call").map((e) => [e.tool, e.toolKind, e.paths]);
+    expect(calls).toEqual([
+      ["exec_command", "artifact_access", [`${CWD}/src/gateway.ts`]],
+      ["exec_command", "artifact_access", [`${CWD}/src/retry.ts`]],
+      ["exec_command", "artifact_access", [`${CWD}/README.md`, `${CWD}/docs/idempotency.md`]],
+      ["exec_command", "artifact_access", [`${CWD}/package.json`]],
+      // `cd` moves the directory later reads resolve against; `echo` separators print only their own words.
+      ["exec_command", "artifact_access", [`${CWD}/src/gateway.ts`, `${CWD}/src/retry.ts`]],
+      // Relative to the call's own workdir, not the turn's cwd.
+      ["exec_command", "artifact_access", [`${CWD}/docs/notes.md`]],
+      ["exec_command", "artifact_access", [`${CWD}/logs/app.log`]],
+      // `bash -lc` / `zsh -lc` wrappers are unwrapped, in argv and in string form.
+      ["shell", "artifact_access", [`${CWD}/src/gateway.ts`]],
+      ["shell_command", "artifact_access", [`${CWD}/src/retry.ts`]],
+      ["exec_command", "artifact_access", [`${CWD}/src/missing.ts`]],
+      // A test run, a search, an in-place edit, a sed write command, a redirect, an expansion, a substitution,
+      // an `||` alternative and positional shell arguments are not pure reads.
+      ["exec_command", "other", []],
+      ["exec_command", "other", []],
+      ["exec_command", "other", []],
+      ["exec_command", "other", []],
+      ["exec_command", "other", []],
+      ["exec_command", "other", []],
+      ["exec_command", "other", []],
+      ["exec_command", "other", []],
+      ["shell", "other", []],
+    ]);
   });
 
   test("a 0.148.0-alpha.21 legacy rollout: audio is binary, new metadata types are skipped, and the MCP call triple yields one call and one result", () => {

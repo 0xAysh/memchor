@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { readdirSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { type Line, readLines } from "../jsonl.js";
+import { asObject, type JsonObject, type Line, listDir, parseAny, parseObject, readLines } from "../jsonl.js";
 import type {
   CompatibilityRow,
   EventOrigin,
@@ -14,6 +14,7 @@ import type {
   TranscriptFile,
   TranscriptHead,
 } from "../normalized-event.js";
+import { shellCall } from "../shell-reads.js";
 import { inCompatibility } from "../versions.js";
 
 /**
@@ -34,7 +35,7 @@ import { inCompatibility } from "../versions.js";
  *   session_meta{id, cwd, cli_version, history_mode, forked_from_id, source, thread_source, git.branch}
  *   turn_context{cwd} · event_msg{user_message{message, images, local_images, audio, local_audio},
  *   agent_message{message}} · response_item{message.role/content, function_call{name, namespace,
- *   arguments, call_id}, custom_tool_call{name, input, call_id}, local_shell_call{action.command},
+ *   arguments{cmd, command, workdir, …}, call_id}, custom_tool_call{name, input, call_id}, local_shell_call{action.command},
  *   web_search_call{id, action}, *_output{call_id, output}} · compacted{message}
  *
  * Messages come from one source per role: `event_msg/user_message` (Codex's own record of what the
@@ -107,7 +108,7 @@ const METADATA_EVENTS = new Set([
 const METADATA_ITEMS = new Set(["tool_search_call", "tool_search_output", "compaction", "context_compaction", "other", "agent_message"]);
 const METADATA_TYPES = new Set(["world_state", "security_risk_score", "inter_agent_communication", "inter_agent_communication_metadata"]);
 
-type Entry = Record<string, unknown>;
+type Entry = JsonObject;
 type Excluder = (reason: ExclusionReason, n?: number) => void;
 
 /** What line 1 says about the whole rollout. */
@@ -219,7 +220,7 @@ export function codexAdapter(options: { codexHome?: string } = {}): TranscriptAd
         chunk.end = line.end;
         continue;
       }
-      const entry = parseJson(line.text);
+      const entry = parseObject(line.text);
       if (entry === null) {
         exclude("malformed");
         chunk.end = line.end;
@@ -248,9 +249,9 @@ function readHead(path: string): Head | null | undefined {
   const [line] = readLines(path, 0, 1);
   if (line === undefined) return undefined;
   if (line.text === null || line.end > HEAD_BYTES) return null;
-  const entry = parseJson(line.text);
+  const entry = parseObject(line.text);
   if (entry?.["type"] !== "session_meta") return null;
-  const payload = asEntry(entry["payload"]);
+  const payload = asObject(entry["payload"]);
   const { id, cwd, cli_version: version } = payload;
   if (typeof id !== "string" || typeof cwd !== "string" || typeof version !== "string") return null;
   const source = payload["source"];
@@ -267,7 +268,7 @@ function readHead(path: string): Head | null | undefined {
 }
 
 function branchOf(payload: Entry): string | null {
-  const branch = asEntry(payload["git"])["branch"];
+  const branch = asObject(payload["git"])["branch"];
   return typeof branch === "string" && branch !== "" ? branch : null;
 }
 
@@ -289,10 +290,10 @@ function contextBefore(path: string, from: number, head: Head): { cwd: string; g
       if (text === null || text === undefined) continue;
       const lead = text.slice(0, 160);
       if (lead.includes('"type":"session_meta"') && gitBranch === undefined) {
-        const payload = asEntry(parseJson(text)?.["payload"]);
+        const payload = asObject(parseObject(text)?.["payload"]);
         if (payload["id"] === head.id) gitBranch = branchOf(payload);
       } else if (lead.includes('"type":"turn_context"')) {
-        const cwd = asEntry(parseJson(text)?.["payload"])["cwd"];
+        const cwd = asObject(parseObject(text)?.["payload"])["cwd"];
         if (typeof cwd === "string") return { cwd, gitBranch: gitBranch === undefined ? head.gitBranch : gitBranch };
       }
     }
@@ -323,8 +324,8 @@ function matchPrefix(childPath: string, head: Head, parentPath: string, parentId
     // The fork's own file ended inside the copy: more may still be appended, so not settled.
     if (child === undefined) return { prefix, settled: false };
     if (parent === undefined || child.text === null || parent.text === null) return { prefix, settled: true };
-    const a = parseJson(child.text);
-    const b = parseJson(parent.text);
+    const a = parseObject(child.text);
+    const b = parseObject(parent.text);
     const timestamp = b?.["timestamp"];
     if (a === null || b === null || typeof timestamp !== "string" || withoutTimestamp(a) !== withoutTimestamp(b)) return { prefix, settled: true };
     prefix.lines.set(child.start, { start: parent.start, timestamp });
@@ -458,7 +459,7 @@ function responseItem(p: Entry, ctx: LineContext, line: { start: number; end: nu
       return;
     }
     case "local_shell_call": {
-      const command = asEntry(p["action"])["command"];
+      const command = asObject(p["action"])["command"];
       const callId = typeof p["call_id"] === "string" ? p["call_id"] : `${ctx.head.id}@${line.start}`;
       const cmd = Array.isArray(command) ? command.filter((c): c is string => typeof c === "string").join(" ") : "";
       out.push({ ...at(0), type: "tool_call", callId, tool: "local_shell", summary: `$ ${cmd}`, paths: [], urls: [], toolKind: "other" });
@@ -466,7 +467,7 @@ function responseItem(p: Entry, ctx: LineContext, line: { start: number; end: nu
     }
     case "web_search_call": {
       // No call id and no result line: the search itself is the observation.
-      const action = asEntry(p["action"]);
+      const action = asObject(p["action"]);
       const callId = typeof p["id"] === "string" ? p["id"] : `${ctx.head.id}@${line.start}`;
       const url = typeof action["url"] === "string" ? action["url"] : null;
       let summary = "web_search";
@@ -524,7 +525,7 @@ function isContextual(content: unknown): boolean {
 function describeCall(tool: string, input: unknown, raw: unknown, cwd: string): { summary: string; paths: string[]; urls: string[]; toolKind: ToolKind; inputDigest?: string } {
   const memchor = MEMCHOR_TOOL.exec(tool);
   if (memchor !== null) return { summary: `${memchor[1] ?? tool} ${JSON.stringify(input ?? {})}`, paths: [], urls: [], toolKind: "memchor" };
-  const args = asEntry(input);
+  const args = asObject(input);
   const str = (key: string): string | null => (typeof args[key] === "string" ? args[key] : null);
   const at = (path: string): string => (isAbsolute(path) ? path : resolve(cwd, path));
   const omitted = () => ({
@@ -547,15 +548,17 @@ function describeCall(tool: string, input: unknown, raw: unknown, cwd: string): 
       const path = str("path");
       return { summary: `view_image ${path === null ? "(no path)" : at(path)}`, paths: path === null ? [] : [at(path)], urls: [], toolKind: "artifact_access" };
     }
+    // A command that only prints files is a file read (see shell-reads.ts); its paths resolve
+    // against the call's own workdir, which Codex runs it in, else the turn's cwd.
     case "exec_command":
-      // Shell text is never parsed for paths: telling reads from writes in free-form commands is guesswork.
-      return { summary: `$ ${str("cmd") ?? ""}`, paths: [], urls: [], toolKind: "other" };
+      return { summary: `$ ${str("cmd") ?? ""}`, urls: [], ...shellCall(str("cmd"), at(str("workdir") ?? cwd)) };
     case "shell": {
       const command = args["command"];
-      return { summary: `$ ${Array.isArray(command) ? command.filter((c) => typeof c === "string").join(" ") : ""}`, paths: [], urls: [], toolKind: "other" };
+      const argv = Array.isArray(command) ? (command as unknown[]) : null;
+      return { summary: `$ ${argv === null ? "" : argv.filter((c) => typeof c === "string").join(" ")}`, urls: [], ...shellCall(argv, at(str("workdir") ?? cwd)) };
     }
     case "shell_command":
-      return { summary: `$ ${str("command") ?? ""}`, paths: [], urls: [], toolKind: "other" };
+      return { summary: `$ ${str("command") ?? ""}`, urls: [], ...shellCall(str("command"), at(str("workdir") ?? cwd)) };
     case "write_stdin": {
       // What was typed into a running process can be a password; only the session is described.
       const session = args["session_id"];
@@ -566,29 +569,4 @@ function describeCall(tool: string, input: unknown, raw: unknown, cwd: string): 
     default:
       return omitted();
   }
-}
-
-function listDir(dir: string): import("node:fs").Dirent[] {
-  try {
-    return readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-}
-
-function asEntry(value: unknown): Entry {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Entry) : {};
-}
-
-function parseAny(text: string): unknown {
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    return null;
-  }
-}
-
-function parseJson(text: string): Entry | null {
-  const value = parseAny(text);
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Entry) : null;
 }

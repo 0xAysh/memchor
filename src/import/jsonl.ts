@@ -1,4 +1,4 @@
-import { closeSync, openSync, readSync } from "node:fs";
+import { closeSync, type Dirent, openSync, readdirSync, readSync } from "node:fs";
 
 /**
  * Line-oriented reading of host JSONL transcripts, shared by the adapters. Byte offsets are
@@ -69,5 +69,37 @@ export function readLines(path: string, from: number, maxBytes: number): Line[] 
     return lines;
   } finally {
     closeSync(fd);
+  }
+}
+
+/** A parsed JSONL entry (or nested object); adapters read only the fields they document. */
+export type JsonObject = Record<string, unknown>;
+
+/** The value as an object, or an empty one when it is missing or not an object. */
+export function asObject(value: unknown): JsonObject {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : {};
+}
+
+/** Any JSON value, or null when the text is not JSON. */
+export function parseAny(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+/** A JSON object, or null when the text is not JSON or not an object (a damaged or foreign line). */
+export function parseObject(text: string): JsonObject | null {
+  const value = parseAny(text);
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : null;
+}
+
+/** A directory's entries, or none when it is missing or unreadable (a host that never ran, a retention sweep). */
+export function listDir(dir: string): Dirent[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
   }
 }

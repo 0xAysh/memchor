@@ -25,5 +25,6 @@ Placeholders, substituted by `tests/import/fixtures.ts`:
 | `2.1.281/compaction.jsonl` | 2.1.281 | `compact_boundary` + `isCompactSummary` summary, `away_summary` |
 | `2.1.281/malformed.jsonl` | 2.1.281 | an unparseable line mid-file, an unknown entry type, a partial trailing line |
 | `2.1.281/large-and-sensitive.jsonl` | 2.1.281 | an oversized message and tool output (`{{LARGE_MESSAGE}}`, `{{LARGE_OUTPUT}}`, generated at render time), a `.env` read, credentials in assistant text |
+| `2.1.281/shell-reads.jsonl` | 2.1.281 | `Bash` commands that only print files (`cat`, `sed -n` with `echo` separators, `2>/dev/null \| head`) and ones that do not (a `cat >` heredoc write, a read chained with `grep`) |
 | `2.1.183/basic.jsonl` | 2.1.183 (oldest observed) | the pre-2.1.200 key set (no `origin`, `slug`, `session_id` …) |
 | `unknown-version.jsonl` | 3.0.0 (not in the compatibility table) | a supported prefix followed by an unsupported version |

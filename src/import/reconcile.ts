@@ -4,6 +4,7 @@ import { relative, sep } from "node:path";
 import { ensureWorkspace, resolveWorkstream, type ScopeAmbiguity } from "../bootstrap/workstream-resolution.js";
 import { locateWorkspace, registerWorkspace, type WorkspaceLocation } from "../bootstrap/workspace-resolution.js";
 import { type ErrorCode, MemchorError } from "../errors.js";
+import { VISIBLE_SQL } from "../retrieval/eligibility.js";
 import { type ExternalRef, IMPORT_CHOICES, type ImportChoice } from "../schemas.js";
 import { type Db, openDatabase, prepared, toStorageError, writeTransaction } from "../storage/database.js";
 import { appendRecord } from "../storage/records.js";
@@ -424,6 +425,7 @@ export class TranscriptImporter {
             workspaceId: entry.target.workspaceId,
             counters,
             calls: new Map(),
+            echoed: new Map(),
             locate: (cwd) => this.locations.get(cwd) ?? null,
           };
           const quarantine = applyEvents(batch, chunk.events);
@@ -657,6 +659,8 @@ interface Batch {
   counters: ImportCounters;
   /** Tool calls seen in this batch, by call id (earlier batches are looked up in import_events). */
   calls: Map<string, CallMeta>;
+  /** Per branch: the records Memchor output earlier in this pass showed the agent (see {@link restatedEchoes}). */
+  echoed: Map<string, Map<string, string[]>>;
   locate: (cwd: string) => Target | null;
 }
 
@@ -728,6 +732,7 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
       touch.run(batch.epoch, batch.host, batch.transcriptId, event.branch, event.eventId, hash);
       batch.counters.replayed++;
       if (event.type === "tool_call") batch.calls.set(event.callId, parseCallMeta(same.meta));
+      if (same.disposition === "echo") rememberEcho(batch, event.branch, (JSON.parse(same.meta) as { references?: string[] }).references ?? []);
       continue;
     }
     const previous = versions.find((v) => v.record_id !== null)?.record_id ?? null;
@@ -757,6 +762,7 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
         batch.counters.echoes++;
         batch.counters.echoReferences += existing.length;
         store("echo", null, { callId: event.callId, tool: call.tool, references: existing });
+        rememberEcho(batch, event.branch, existing);
         continue;
       }
       const written = appendImported(batch, event, previous, toolResultRecord(batch, call, event));
@@ -766,7 +772,9 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
       continue;
     }
 
-    const written = appendImported(batch, event, previous, messageRecord(batch, event));
+    // What the agent writes (a message or a host summary it wrote) may repeat memory it was shown.
+    const derivedFrom = event.type === "message" && event.role === "user" ? [] : restatedEchoes(batch, event.branch, event.text);
+    const written = appendImported(batch, event, previous, messageRecord(batch, event), derivedFrom);
     store("record", written, previous === null ? {} : { versionOf: previous });
   }
   return null;
@@ -832,7 +840,7 @@ function passage(batch: Batch, text: string, maxBytes: number, count = true): st
   return bounded.text;
 }
 
-function appendImported(batch: Batch, event: NormalizedEvent, previous: string | null, draft: Draft): string {
+function appendImported(batch: Batch, event: NormalizedEvent, previous: string | null, draft: Draft, derivedFrom: readonly string[] = []): string {
   const written = appendRecord(batch.db, batch.workstreamId, {
     kind: draft.kind,
     title: draft.title,
@@ -844,12 +852,71 @@ function appendImported(batch: Batch, event: NormalizedEvent, previous: string |
     reviewState: "unreviewed",
     applicability: { sourceVersion: `${batch.host} ${event.hostVersion}` },
     externalRefs: draft.externalRefs,
-    links: previous === null ? [] : [{ recordId: previous, relation: "related_to" }],
+    links: [...(previous === null ? [] : [{ recordId: previous, relation: "related_to" as const }]), ...derivedFrom.map((recordId) => ({ recordId, relation: "derived_from" as const }))],
     sourceId: batch.sourceId,
     createdAt: event.observedAt,
   });
   batch.counters.records++;
   return written.recordId;
+}
+
+/**
+ * Shortest normalised text that counts as a restatement of echoed memory. A shorter sentence
+ * ("Tests pass.", "Done.") recurs by itself, so containing it says nothing about copying.
+ */
+const MIN_RESTATED_CHARS = 40;
+
+function normalizeForEcho(text: string): string {
+  return text.toLowerCase().replace(/\s+/gu, " ").trim();
+}
+
+/** The texts whose verbatim appearance marks a copy of a record: its whole body and each long-enough sentence. */
+function restatable(body: string): string[] {
+  const pieces = [body, ...body.split(/\n+|(?<=[.!?])\s+/u)].map(normalizeForEcho).filter((piece) => piece.length >= MIN_RESTATED_CHARS);
+  return [...new Set(pieces)];
+}
+
+/**
+ * The records shown to the agent on `branch` earlier in this reconciliation pass, loaded once
+ * per batch from the echo rows this pass has written or replayed (`seen_epoch` = this epoch,
+ * so in a rewrite pass nothing later in the file is included), and kept current as echoes
+ * go by. Only records the transcript's workstream can see are kept: they are link targets.
+ */
+function echoesOn(batch: Batch, branch: string): Map<string, string[]> {
+  let echoed = batch.echoed.get(branch);
+  if (echoed !== undefined) return echoed;
+  echoed = new Map();
+  batch.echoed.set(branch, echoed);
+  const rows = prepared(batch.db, "SELECT meta FROM import_events WHERE host = ? AND transcript_id = ? AND branch = ? AND disposition = 'echo' AND seen_epoch = ?")
+    .all(batch.host, batch.transcriptId, branch, batch.epoch) as { meta: string }[];
+  rememberEcho(batch, branch, rows.flatMap((row) => (JSON.parse(row.meta) as { references?: string[] }).references ?? []));
+  return echoed;
+}
+
+function rememberEcho(batch: Batch, branch: string, recordIds: readonly string[]): void {
+  const echoed = echoesOn(batch, branch);
+  const fresh = [...new Set(recordIds)].filter((id) => !echoed.has(id));
+  if (fresh.length === 0) return;
+  const rows = prepared(batch.db, `SELECT r.id, r.body FROM records r WHERE r.id IN (SELECT value FROM json_each($ids)) AND ${VISIBLE_SQL}`)
+    .all({ ids: JSON.stringify(fresh), workstreamId: batch.workstreamId }) as { id: string; body: string }[];
+  for (const row of rows) echoed.set(row.id, restatable(row.body));
+}
+
+/**
+ * Records Memchor showed the agent earlier on this branch whose body, or one of whose
+ * sentences of at least {@link MIN_RESTATED_CHARS} characters, `text` contains verbatim
+ * (case and whitespace ignored). Such a text is a copy of that memory, so its record is
+ * stored `derived_from` it and inherits its independent root: echoed memory must never come
+ * back as independent corroboration (PRD §8.3, §17). The window is the rest of the branch,
+ * not the turn: the echo stays in the agent's context (and in compaction summaries) after the
+ * user speaks again. Only verbatim containment counts: a paraphrase cannot be told apart from
+ * a new observation, so it remains its own root.
+ */
+function restatedEchoes(batch: Batch, branch: string, text: string): string[] {
+  const echoed = echoesOn(batch, branch);
+  if (echoed.size === 0) return [];
+  const said = normalizeForEcho(text);
+  return [...echoed].filter(([, pieces]) => pieces.some((piece) => said.includes(piece))).map(([id]) => id);
 }
 
 function lookupCall(batch: Batch, callId: string): CallMeta | null {

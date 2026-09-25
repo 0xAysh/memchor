@@ -447,12 +447,13 @@ export function ensureWorkspace(db: Db, location: WorkspaceLocation, now: string
 
 /** Worktree bindings follow the repository by their position relative to its main worktree. */
 function repointMovedRepository(db: Db, fromKey: string, toKey: string): void {
-  db.prepare("UPDATE workspaces SET repository_key = ? WHERE repository_key = ?").run(toKey, fromKey);
+  requireTransaction(db, "repointMovedRepository");
+  prepared(db, "UPDATE workspaces SET repository_key = ? WHERE repository_key = ?").run(toKey, fromKey);
   const from = mainWorktreeOf(fromKey);
   const to = mainWorktreeOf(toKey);
   if (from === null || to === null) return;
-  const bindings = db.prepare("SELECT worktree_path FROM worktree_bindings").all() as { worktree_path: string }[];
-  const move = db.prepare("UPDATE worktree_bindings SET worktree_path = ? WHERE worktree_path = ?");
+  const bindings = prepared(db, "SELECT worktree_path FROM worktree_bindings").all() as { worktree_path: string }[];
+  const move = prepared(db, "UPDATE worktree_bindings SET worktree_path = ? WHERE worktree_path = ?");
   for (const { worktree_path: path } of bindings) {
     if (path === from || path.startsWith(from + sep)) move.run(to + path.slice(from.length), path);
   }
