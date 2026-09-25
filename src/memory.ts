@@ -197,7 +197,7 @@ export interface PackCheckpoint {
 export interface Omission {
   /**
    * `budget`: more of the sequence follows (use `continuation`).
-   * `exceeds_budget`: records too large for this budget even alone (read them directly).
+   * `exceeds_budget`: records too large for this budget even alone (read them directly); at most 5 per page, later ones on continuation pages.
    * `candidate_limit`: eligible matches the sequence does not carry: beyond the 500-record cap, or more than a continuation can hold within this budget (at most a quarter of it). Refine the query or raise the budget.
    */
   reason: "budget" | "exceeds_budget" | "candidate_limit";

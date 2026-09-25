@@ -49,6 +49,16 @@ function staleMemory(): { repo: string; home: string; evidence: string } {
   return { repo, home, evidence };
 }
 
+/** Records that each cite ten long code references: every one is larger than a small budget's room. */
+function refHeavyMemory(count: number): { repo: string; home: string } {
+  const repo = initRepo();
+  const home = tempDir();
+  const memory = open(repo, home);
+  const refs = Array.from({ length: 10 }, (_, i) => ({ kind: "code" as const, locator: `src/${"deeply/nested/module/".repeat(8)}file-${i}.ts` }));
+  for (let i = 0; i < count; i++) memory.record({ kind: "note", body: `ref-heavy note ${i}`, attribution: "agent_inference", externalRefs: refs });
+  return { repo, home };
+}
+
 describe("context pack budgets", () => {
   test("a truncated pack cuts bodies, never warnings or citations, and stays within its byte budget", () => {
     const { repo, home, evidence } = staleMemory();
@@ -117,6 +127,32 @@ describe("context pack budgets", () => {
     }
   });
 
+  test("with records larger than the budget, every page fits, none is starved, and each record is returned or reported once", () => {
+    const { repo, home } = refHeavyMemory(60);
+    const memory = open(repo, home, "codex");
+    // 1_000 holds the envelope and one oversized id but not the whole continuation: what it cannot carry is reported.
+    for (const maxBytes of [1_000, 1_500, 1_750, 2_000, 2_500, 3_500, 5_000, 9_000]) {
+      let pack = memory.recall({ maxBytes });
+      const seen: string[] = [];
+      let limited = 0;
+      for (let pages = 0; pages < 100; pages++) {
+        expect(packBytes(pack)).toBeLessThanOrEqual(maxBytes);
+        expect(pack.notice ?? "").not.toMatch(/too small for even/);
+        const oversized = pack.omissions.find((o) => o.reason === "exceeds_budget");
+        expect(oversized?.recordIds?.length ?? 0).toBe(oversized?.count ?? 0);
+        seen.push(...pack.items.map((item) => item.recordId), ...(oversized?.recordIds ?? []));
+        if (pack.continuation === null) {
+          limited = pack.omissions.find((o) => o.reason === "candidate_limit")?.count ?? 0;
+          break;
+        }
+        expect(pack.items.length + (oversized?.count ?? 0)).toBeGreaterThan(0);
+        pack = memory.recall({ continuation: pack.continuation, maxBytes });
+      }
+      expect(new Set(seen).size).toBe(seen.length);
+      expect(seen.length + limited).toBe(60);
+    }
+  });
+
   test("a large candidate set keeps its continuation within the budget, and what the token cannot carry is reported", () => {
     const repo = initRepo();
     const memory = open(repo, tempDir());
@@ -174,6 +210,22 @@ describe("context pack budgets", () => {
     expect(packBytes(context)).toBeLessThanOrEqual(2_800);
     expect(catchMemchorError(() => memory.bootstrap({ maxTokens: 1_000_000 })).code).toBe("invalid_input");
     expect(catchMemchorError(() => memory.bootstrap({ maxBytes: 10 })).code).toBe("invalid_input");
+  });
+
+  test("records too large for a small budget are reported by id without starving the pack of what fits", () => {
+    const { repo, home } = refHeavyMemory(60);
+    const memory = open(repo, home);
+    for (const maxBytes of [1_500, 2_500]) {
+      const pack = memory.recall({ maxBytes });
+      expect(packBytes(pack)).toBeLessThanOrEqual(maxBytes);
+      expect(pack.notice).not.toMatch(/too small for even/);
+      // Every record is accounted for: returned, reported as too large, or carried/reported for later.
+      const accounted = (reason: string): number => pack.omissions.find((o) => o.reason === reason)?.count ?? 0;
+      expect(pack.items.length + accounted("exceeds_budget") + accounted("budget") + accounted("candidate_limit")).toBe(60);
+      expect(pack.items.length + accounted("exceeds_budget")).toBeGreaterThan(0);
+      expect(pack.continuation).not.toBeNull();
+      expect(accounted("budget")).toBeGreaterThan(0);
+    }
   });
 
   test("a budget too small for the pack's own scope returns no entries and no continuation, and says why", () => {

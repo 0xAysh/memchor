@@ -10,8 +10,9 @@ import { clipToBytes } from "./search.js";
  * length of its JSON serialisation: scope, checkpoint, items, omissions, notice,
  * continuation and the budget object itself. `usedBytes` is that length. The envelope is
  * measured first (see {@link planPage}); entries fill what it leaves. A budget too small
- * for the envelope alone gets a pack with no entries and says so: the one case a pack
- * exceeds its budget, since scope (and an ambiguity question) is never cut.
+ * for the envelope alone, or for the envelope with its bounded list of records too large to
+ * return ({@link LISTED_OVERSIZED}), gets a pack with no entries that says so: the only pack
+ * that can be larger than its budget, since scope (and an ambiguity question) is never cut.
  */
 
 export const ITEM_EXCERPT_BYTES = 1_000;
@@ -103,6 +104,18 @@ export interface Packable<T> {
 
 export type FitResult<T> = { entry: T; bytes: number; excerptBytes: number } | null;
 
+/**
+ * A page reports at most this many records as too large for its budget (`exceeds_budget`,
+ * listed by id), fewer when a small budget cannot also hold the continuation; the next
+ * oversized record waits for the continuation's page. Bounding the list bounds the envelope,
+ * so {@link planPage} can reserve it up front: an unbounded list grew with every record a
+ * shrinking room pushed out, and starved pages whose bare envelope fitted.
+ */
+export const LISTED_OVERSIZED = 5;
+
+/** Record ids are fixed-length (`rec_` + 32 hex), so this measures a listed id exactly. */
+const ID_SHAPE = `rec_${"0".repeat(32)}`;
+
 /** Below this, a clipped excerpt is noise; the item waits for the next page instead (unless it would lead a page). */
 const MIN_USEFUL_EXCERPT_BYTES = 120;
 
@@ -154,15 +167,20 @@ export interface PackedPage<C, I> {
 export interface Room {
   room: number;
   maxRoom: number;
+  /** Most records this page reports as oversized (1…{@link LISTED_OVERSIZED}). */
+  listed: number;
+  /** Bytes that list adds to the envelope (see {@link packWithinBudget}'s fallback). */
+  listing: number;
 }
 
 /**
  * Greedy packing in rank order. The checkpoint (if any) goes first. Packing stops at the
  * first item that does not fit, so the pack is always a prefix of the ranked sequence
  * and the continuation resumes exactly there. An entry too large for even an empty
- * page's whole room is skipped and reported by id instead of blocking the sequence.
+ * page's whole room is skipped and reported by id instead of blocking the sequence, up to
+ * `listed` per page.
  */
-export function packPage<C, I>({ room, maxRoom }: Room, checkpoint: Packable<C> | null, candidates: readonly Packable<I>[]): PackedPage<C, I> {
+export function packPage<C, I>({ room, maxRoom, listed }: Room, checkpoint: Packable<C> | null, candidates: readonly Packable<I>[]): PackedPage<C, I> {
   let usedBytes = 0;
   const oversized: string[] = [];
   let packedCheckpoint: C | null = null;
@@ -188,6 +206,7 @@ export function packPage<C, I>({ room, maxRoom }: Room, checkpoint: Packable<C> 
       continue;
     }
     if (leadsPage || fit(candidate, maxRoom) === null) {
+      if (oversized.length >= listed) break;
       oversized.push(candidate.recordId);
       consumed++;
       continue;
@@ -218,21 +237,31 @@ export const EMPTY_PAGE: PackedPage<never, never> = { checkpoint: null, items: [
 
 /**
  * Measures the envelope before any entry is packed: the result with no entries and no
- * continuation, and the continuation the whole sequence would need (capped at the budget's
- * {@link CONTINUATION_SHARE}). Null when the budget cannot hold even the bare envelope.
+ * continuation, the continuation the whole sequence would need (capped at the budget's
+ * {@link CONTINUATION_SHARE}), and how many oversized ids fit beside that continuation (at
+ * least one, so a page of oversized records still advances the sequence). Null when the
+ * budget cannot hold even the bare envelope.
  */
 export function planPage<C, I, P extends Envelope>(maxBytes: number, assemble: Assemble<C, I, P>, remainingAfter: (page: PackedPage<C, I>) => number): Room | null {
-  const bare = measured(assemble(EMPTY_PAGE, 0, false)).budget.usedBytes;
-  const carrying = measured(assemble(EMPTY_PAGE, carryWithin(maxBytes, assemble, EMPTY_PAGE, remainingAfter(EMPTY_PAGE)), false)).budget.usedBytes;
+  const bytes = (oversized: number, carry: number): number =>
+    measured(assemble({ ...EMPTY_PAGE, oversized: Array<string>(oversized).fill(ID_SHAPE) }, carry, false)).budget.usedBytes;
+  const bare = bytes(0, 0);
   const maxRoom = maxBytes - bare;
-  return maxRoom <= 0 ? null : { room: Math.max(0, maxRoom - (carrying - bare)), maxRoom };
+  if (maxRoom <= 0) return null;
+  const carry = carryWithin(maxBytes, assemble, EMPTY_PAGE, remainingAfter(EMPTY_PAGE));
+  let listed = LISTED_OVERSIZED;
+  while (listed > 1 && bytes(listed, carry) > maxBytes) listed--;
+  return { room: Math.max(0, maxBytes - bytes(0, carry)), maxRoom, listed, listing: Math.max(0, bytes(listed, 0) - bare) };
 }
 
 /**
  * Packs the page and returns the whole result within `maxBytes`: entries in `room`, then a
  * continuation carrying as much of the rest as its share of the budget allows. What pushes
- * the result over (omission lists, notice) shrinks the room and the page is packed again;
- * if nothing fits, the result is the starved envelope.
+ * the result over (a leading entry's continuation, the notice, count digits, oversized ids)
+ * shrinks the room and the page is packed again. Should that not settle, the page falls back to
+ * what the plan can hold: the checkpoint or leading entry beside its bounded oversized list, and a
+ * continuation cut to the bytes left. The result is starved (no entries, says so) only when the
+ * budget cannot hold the envelope itself, or the envelope with that page's oversized ids.
  */
 export function packWithinBudget<C, I, P extends Envelope>(
   maxBytes: number,
@@ -248,7 +277,25 @@ export function packWithinBudget<C, I, P extends Envelope>(
     const result = measured(assemble(page, carryWithin(maxBytes, assemble, page, remainingAfter(page)), false));
     const over = result.budget.usedBytes - maxBytes;
     if (over <= 0) return result;
-    room = { room: Math.max(0, room.room - over), maxRoom: room.maxRoom - over };
+    room = { ...room, room: Math.max(0, room.room - over), maxRoom: room.maxRoom - over };
+  }
+  if (plan !== null) {
+    const page = packPage({ ...plan, room: 0, maxRoom: plan.maxRoom - plan.listing }, checkpoint, candidates);
+    const fits = (carry: number): P | null => {
+      const result = measured(assemble(page, carry, false));
+      return result.budget.usedBytes <= maxBytes ? result : null;
+    };
+    // Largest carry (within the continuation's share) whose whole result fits. `lo` only ever
+    // holds 0 or a carry that fitted, and fits(0) is checked below.
+    let lo = 0;
+    let hi = carryWithin(maxBytes, assemble, page, remainingAfter(page));
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (fits(mid) !== null) lo = mid;
+      else hi = mid - 1;
+    }
+    const result = fits(lo);
+    if (result !== null) return result;
   }
   return measured(assemble(EMPTY_PAGE, 0, true));
 }
