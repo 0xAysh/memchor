@@ -28,8 +28,9 @@ The adapters contain no memory policy. Host differences outside the transcript f
 | `continueImport({maxMs?})` | One bounded step of the remaining approved import (current project first, then other projects' own workspaces). The MCP server calls it between requests while alive. Not an agent tool |
 | `record({kind, body, attribution, …})` | Appends one record with its links and search chunks; `operationKey` makes it idempotent |
 | `checkpoint({expectedRevision, goal, status, …})` | Appends revision `expectedRevision + 1` only if the head still equals `expectedRevision` |
-| `recall({query?, kinds?, maxTokens?, maxBytes?, continuation?})` | A bounded pack: head checkpoint first, then ranked eligible items, each with live freshness, provenance, independent root and corroboration (see [Recall applicability](#recall-applicability)) |
-| `read({recordId, maxTokens?, maxBytes?, offset?})` | A slice of one visible record's body, with its visible links, live freshness and independent root. Offsets count UTF-16 code units; an offset inside a surrogate pair snaps back to that code point's start |
+| `recall({query?, kinds?, maxTokens?, maxBytes?, continuation?})` | A bounded pack: head checkpoint first, then ranked eligible items, each with live freshness, provenance, independent root and corroboration (see [Recall applicability](#recall-applicability)), plus `corrections` when memory in scope changed since this session's previous pack |
+| `read({recordId, maxTokens?, maxBytes?, offset?})` | A slice of one visible record's body, with its visible links, live freshness and independent root. Offsets count UTF-16 code units; an offset inside a surrogate pair snaps back to that code point's start. A record that is no longer current is `not_found` with its `lifecycle`, `replacementId` or `taint` |
+| `manage({v?, action, recordId, body?, reason?, attribution?, operationKey?})` | `inspect` \| `correct` \| `supersede` \| `retract` \| `restore` one in-scope claim (see [Memory lifecycle](#memory-lifecycle)). Each change is one transaction; the result lists what it took out of (or back into) current guidance |
 | `status()` | Runtime, storage, the scope bootstrap *would* resolve (`workstreamId`, `resolvedBy`, `taskKey`, or the `ambiguity` it would ask), and counts. It runs the same resolution rules as bootstrap without their writes (`previewWorkstream`); after a repository move it reports no resolution until bootstrap re-points the bindings, and none while a schema migration is pending (the next bootstrap migrates). Strictly read-only: no registry entry, rows or migrations. Never throws for scope or storage problems |
 | `rebuildSearchIndex()` | Regenerates the derived index inside one write transaction |
 | `checkIntegrity()` | Read-only `integrity_check`, `foreign_key_check` and FTS index-vs-content check. It reports a damaged, foreign or unmigrated file and never repairs or migrates it |
@@ -79,8 +80,11 @@ The agent shows `question`, then calls `bootstrap({workstream})`. That choice be
 
 | Table | Role | Invariant |
 |---|---|---|
-| `records` | Canonical, append-only knowledge | Body ≤ 16 KiB; `attribution`, `review_state` and `freshness` are CHECKed enums; `workstream_id NULL` means workspace-level |
-| `links` | Provenance (`supported_by`, …) | Both ends visible to the writer's workstream at write time |
+| `records` | Canonical, append-only knowledge | Body ≤ 16 KiB; `attribution`, `review_state`, `lifecycle` (v5) and `freshness` are CHECKed enums; `workstream_id NULL` means workspace-level; `superseded_by` names the replacement of a corrected or superseded claim |
+| `links` | Provenance (`supported_by`, `derived_from`, `supersedes`, …) | Both ends visible to the writer's workstream at write time (the importer's lineage links need only be in scope) |
+| `taints` (v5) | Why an active record is not current: (record, cause, `invalidated` \| `quarantined`) | One row per cause; the record is eligible again only when every cause is gone |
+| `lifecycle_events` (v5) | Append-only audit of every lifecycle change | `seq` is the correction watermark |
+| `suppressions` (v5) | Host events (host + event id) whose claim is no longer active | The importer skips new copies and versions of them |
 | `workstreams` | Label, lifecycle, `head_revision`, `task_key`, `branch` (v4) | The head only moves inside the CAS transaction; `branch` (last seen) is evidence, never identity |
 | `checkpoints` | Revision history | `PRIMARY KEY (workstream_id, revision)` backs the CAS |
 | `operations` | Idempotency keys | The hash covers operation + workstream + normalised input |
@@ -91,7 +95,7 @@ The agent shows `question`, then calls `bootstrap({workstream})`. That choice be
 | `import_events` (v2) | Event identity → record | PK = host + transcript + branch + event id + content hash, so replay is a no-op and an edit is a new version |
 | `consents` | Reserved | The import decision is host-level, so it lives in `$MEMCHOR_HOME/consent.json`, not in a workspace |
 
-**Eligibility** (`src/retrieval/eligibility.ts`) is one SQL predicate used for reads, links, citations and ranking. A record must be in this workstream or workspace-level, and not retracted. Recall additionally excludes checkpoint records: the head is returned separately.
+**Eligibility** (`src/retrieval/eligibility.ts`) is one SQL predicate, `VISIBLE_SQL`, used by recall ranking and loading (and so FTS), direct reads, link and citation expansion, independent roots, echo lineage, the head checkpoint and the ambiguity glimpse; `memchor diag records` pages through recall, so it is covered too. A record must be in this workstream or workspace-level, have `lifecycle = 'active'`, and have no `taints` row. Recall additionally excludes checkpoint records: the head is returned separately. `memory_manage inspect` is the one reader of ineligible records, and it labels them (`eligible: false`).
 
 ## Transaction ordering
 
@@ -99,6 +103,7 @@ Every write is one `BEGIN IMMEDIATE` transaction, so it never upgrades from read
 
 - **`record`**: look up the operation key → insert the record → insert links (each target scope-checked) → insert chunks and FTS rows → insert the operation row.
 - **`checkpoint`**: look up the operation key (a replay wins over a conflict) → compare the head with `expectedRevision` → append the checkpoint record, its links and chunks → insert the `checkpoints` row → conditionally update `head_revision`.
+- **`manage`** (a change): look up the operation key → check the claim is `active` (else `lifecycle_conflict`) → append the replacement with its `supersedes` link → set the lifecycle of the claim and its copies → insert taints → insert suppressions → append the `lifecycle_events` row.
 
 **Reads.** Recall reads in one deferred transaction, so the head, candidates and citations share a snapshot. Scope and eligibility sit in the WHERE clause, ahead of bm25 ranking. Ties are broken by `created_at DESC, seq DESC`. Query words are individually quoted, so FTS syntax cannot be injected.
 
@@ -180,7 +185,7 @@ Known Codex limits:
 
 - Not supported, reported as `unsupported_version` gaps: 0.104.x (it writes `user_message` before its turn's `turn_context`), 0.143.0 – 0.148.0-alpha.20 and anything newer than 0.148.0-alpha.21 (no rollouts or build to verify), and every paginated rollout (the 0.148 TUI and `codex exec` create paginated threads by default; the app-server, which Codex Desktop uses, creates legacy ones unless asked otherwise). Compressed `.jsonl.zst` rollouts (an off-by-default feature) are not listed.
 - A resumer newer than the creator appends lines Memchor cannot version-check; unknown types among them are skipped and counted, never guessed.
-- Rolled-back turns (`thread_rolled_back`) stay imported: they were already emitted when the rollback line arrives, and the adapter seam cannot retract (supersession belongs to corrections, #21).
+- Rolled-back turns (`thread_rolled_back`) stay imported: they were already emitted when the rollback line arrives, and the adapter seam cannot retract. The user can retract them with `memory_manage`.
 - A fork whose parent rollout is not on disk keeps its own ids for the copied prefix, so the copy over-counts as an independent observation until the parent reappears (a changed id then counts as a new event, not a replay).
 - If more than 1 MiB of output separates a turn's `turn_context` from a batch boundary, events after the boundary take the thread's initial cwd and branch label (a batch boundary falls there only in very long turns; no local rollout ever changed cwd mid-thread).
 - A web search has no result line, so it is kept as call bookkeeping only, never as a record. MCP results can be truncated by Codex in `function_call_output`; the id extraction then falls back to scanning the text, as for clipped Claude output. MCP `isError` is not read (it lives only in `mcp_tool_call_end`).
@@ -204,7 +209,7 @@ Shell file reads (`src/import/shell-reads.ts`, shared by both adapters for Claud
 ```text
 re-read cursor (CAS: another process moved it → give up this transcript for now)
   → first batch: ensure workspace row, worktree binding, session, source, cursor
-  → per event: scope check → identity lookup (same hash: replay; other hash: new linked version) → record + links + chunks + import_events row
+  → per event: scope check → identity lookup (same hash: replay) → suppressed host event? skip → (other hash: new linked version) → record + links (+ inherited taints) + chunks + import_events row
   → update cursor: offset, anchor hash, state, gap, counters (file size/mtime only once caught up)
 ```
 
@@ -218,6 +223,37 @@ A kill mid-batch rolls the whole batch back. The cursor never passes evidence th
 Transcripts whose cwd is gone or not in Git are counted as `unassigned`. `all projects` imports each repository into its own workspace database. Retrieval never mixes them.
 
 **Order and budget.** Bootstrap imports only the current repository (newest transcript first) until its budget. The MCP server then calls `continueImport` in 200 ms steps with 25 ms pauses until every approved transcript is reconciled. Expected failures (`storage_busy`, `storage_full`, `storage_unavailable`, an unreadable `consent.json` → state `unavailable`) are reported as `import.problem` and never fail bootstrap. The MCP loop retries a failed step with backoff (2 s … 32 s, five times). Any other error is a bug: the batch rolls back and the error propagates. Gaps met while backfilling other projects are reported in this process's status, labelled with their workspace. No model call and no network access are involved; the e2e test preloads a guard that fails on any socket, DNS lookup or fetch.
+
+## Memory lifecycle
+
+`memory_manage` (`src/integrity/lifecycle.ts`) owns every change to whether a claim is current guidance. Handlers and agents never touch the tables; one call is one `BEGIN IMMEDIATE` transaction with no model or network call inside.
+
+```text
+                 correct ──▶ corrected   wrong; a `correction` record (body + "Reason: …") supersedes it
+  active ──────  supersede ─▶ superseded right then, outdated now; a same-kind record replaces it
+    ▲            retract ──▶ retracted  wrong; withdrawn without a replacement
+    └── restore ◀────────────┘           only a retraction made here; removes exactly its own taints and suppressions
+```
+
+`review_state` stays the review axis (unreviewed / accepted / disputed); `record` no longer accepts `retracted`. Records the v3 migration retracted become `lifecycle = 'retracted'` and can never be restored.
+
+**One claim, one observation.** A change applies to the record and every in-scope copy of the same host event (host + event id: a Claude Code `/branch` copy, an edited version), the same identity independent roots use. The event goes into `suppressions`, so a cursor reset, rewrite pass or new copy skips it (`import.counters.suppressed`). An imported record that restates or rests on an ineligible record (an echoed record corrected since, an earlier version) is linked to it and inherits its state (`lineage: "inherit"` in `appendRecord`), and a host summary imported after a corrected event of its transcript is quarantined.
+
+**Dependents are tainted in the same transaction** (`src/integrity/taints.ts`), transitively, depth ≤ 16:
+
+| Dependency on the changed claim | correct / retract | supersede |
+|---|---|---|
+| `derived_from` (restates it) | invalidated | invalidated |
+| `supported_by` (rests on it) | quarantined | — |
+| No lineage: a checkpoint repeating it verbatim (the ≥ 40-character rule in `src/integrity/restatement.ts`, last 1,000 checkpoints of its scope), a host summary of its transcript written at or after it | quarantined | — |
+
+`related_to` and `references` never taint: they are loose. A superseded claim was true when made, so conclusions that rested on it stay. A quarantined head checkpoint is withheld from packs with a notice asking for a new checkpoint (`expectedRevision` = the head); older revisions are not promoted.
+
+**Correction watermark.** Each change appends a `lifecycle_events` row. A Memory instance (one host session) starts at the current watermark; its next pack carries `corrections: { watermark, changes (≤ 5, oldest first), omitted }` for changes in its scope since, then advances. The notice is part of the budgeted envelope. A session is not told about its own change unless other changes came first.
+
+**Inspect** returns any in-scope record whatever its state: body (≤ 4 KB), lifecycle, `eligible`, taints with causes, live freshness, source, `history` (its lifecycle events), `replacement`, `evidence` (what it rests on or restates), `conflicts` (other versions of the same event, `related_to` records) and `derivations` (incoming `derived_from`/`supported_by`, with the taint it put on each), each list ≤ 20 with totals in `counts`.
+
+Known limits: a claim already in a model's context, in a host transcript, or in an export or backup is not erased; a running session hears of a change only on its next pack. A paraphrase in a checkpoint or summary, or an uncited agent record repeating the claim, is not found (verbatim only). Copies in another workstream are not changed, though their host event is suppressed for the whole workspace.
 
 ## Handoff
 
@@ -255,7 +291,8 @@ At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix f
 | `scope_unresolved` | cwd is not inside a Git worktree |
 | `scope_ambiguous` | No workstream is chosen yet (`scope.ambiguity`): thrown by `record` without `workspaceLevel` and by `checkpoint`; `details.candidates` lists the ids. Also the gap reason for a held or quarantined transcript |
 | `scope_denied` | The target belongs to another workstream |
-| `not_found` | Unknown or ineligible (e.g. retracted) record, or a chosen `workstream` that is not in this workspace |
+| `not_found` | Unknown or ineligible record (its `details` name the `lifecycle`, `replacementId` or `taint`), or a chosen `workstream` that is not in this workspace |
+| `lifecycle_conflict` | `memory_manage` found the claim in the wrong state (already corrected, or restoring what was not retracted here); `details.lifecycle` / `replacementId` |
 | `invalid_input` | Schema violation, unknown key, oversized content, or a bad continuation |
 | `idempotency_conflict` | The operation key was reused with a different request |
 | `checkpoint_conflict` | The head ≠ `expectedRevision`; `details.currentRevision` gives the head |
@@ -269,7 +306,7 @@ At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix f
 `src/storage/migrations/` holds an append-only ordered list, and `PRAGMA user_version` is the applied count:
 
 - Each step runs in its own `BEGIN IMMEDIATE` transaction together with the version bump, so a failed step leaves the previous version intact.
-- Steps run with foreign keys off, as SQLite's documented table-rebuild procedure requires. v4 rebuilds `sessions` to make `workstream_id` nullable. Each step runs `foreign_key_check` before committing, and rolls back on any violation.
+- Steps run with foreign keys off, as SQLite's documented table-rebuild procedure requires. v4 rebuilds `sessions` to make `workstream_id` nullable. v5 adds `records.lifecycle` and the `taints`, `lifecycle_events` and `suppressions` tables. Each step runs `foreign_key_check` before committing, and rolls back on any violation.
 - Concurrent openers serialise, and the second finds nothing to do.
 - A database newer than the build fails closed before any pragma changes it.
 - A shipped migration is never edited.

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { inheritTaints } from "../integrity/taints.js";
 import { type Citation, insertLinks } from "../integrity/provenance.js";
 import { indexRecord } from "../retrieval/search.js";
 import type { RecordRow } from "../retrieval/eligibility.js";
@@ -22,6 +23,13 @@ export interface NewRecord {
   sourceId?: string;
   /** When the content was observed, if earlier than now (imported history); defaults to now. */
   createdAt?: string;
+  /**
+   * `strict` (default, agent writes): every link target must be current guidance.
+   * `inherit` (the importer): a target only needs to be in scope, and the new record takes on
+   * the state of what it restates or rests on (see `inheritTaints`), so a copy of a corrected
+   * claim is stored as ineligible instead of resurrecting it.
+   */
+  lineage?: "strict" | "inherit";
 }
 
 /**
@@ -67,7 +75,9 @@ export function appendRecord(db: Db, scopeWorkstreamId: string, record: NewRecor
     contentHash,
     createdAt,
   );
-  const links = insertLinks(db, scopeWorkstreamId, recordId, record.links, createdAt);
+  const lineage = record.lineage ?? "strict";
+  const links = insertLinks(db, scopeWorkstreamId, recordId, record.links, createdAt, lineage);
+  if (lineage === "inherit") inheritTaints(db, recordId, links, createdAt);
   indexRecord(db, { id: recordId, title: record.title, body: record.body, externalRefs: record.externalRefs });
   return { recordId, createdAt, links };
 }

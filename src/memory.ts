@@ -13,6 +13,18 @@ import {
 import { headCommit, locateWorkspace, registerWorkspace, resolveHome, type WorkspaceLocation } from "./bootstrap/workspace-resolution.js";
 import { type ErrorCode, MemchorError } from "./errors.js";
 import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integrity/checkpoints.js";
+import {
+  type Affected,
+  changeClaim,
+  changesSince,
+  type CorrectionNotice,
+  type HistoryEntry,
+  inspectRecord,
+  lifecycleWatermark,
+  type Related,
+  restoreClaim,
+  type RestoreResult,
+} from "./integrity/lifecycle.js";
 import { hostDescriptor } from "./hosts.js";
 import type { TranscriptAdapter } from "./import/normalized-event.js";
 import { type ImportStatus, TranscriptImporter, unsupportedHostStatus } from "./import/reconcile.js";
@@ -35,7 +47,7 @@ import {
   sealContinuation,
   usage,
 } from "./retrieval/context-pack.js";
-import { requireVisibleRecord, type RecordRow } from "./retrieval/eligibility.js";
+import { isEligible, type Lifecycle, requireVisibleRecord, type RecordRow, type Taint } from "./retrieval/eligibility.js";
 import { captureObservations, type CheckedRef, checkFreshness, freshnessFloor, type RecordFreshness, type StoredRef } from "./retrieval/freshness.js";
 import { type Candidate, clipToBytes, loadCandidates, PAGE_CANDIDATES, rankSequence, rebuildSearchIndex, SEQUENCE_CAP, toFtsQuery } from "./retrieval/search.js";
 import {
@@ -48,6 +60,7 @@ import {
   type Freshness,
   LIMITS,
   type LinkRelation,
+  ManageInput,
   OPERATION_SCHEMAS,
   ReadInput,
   RecallInput,
@@ -76,6 +89,8 @@ export type { ImportCounters, ImportGap, ImportStatus } from "./import/reconcile
 export type { IntegrityReport } from "./storage/database.js";
 export type { CandidateSignal, ResolutionBasis, ScopeAmbiguity, WorkstreamCandidate } from "./bootstrap/workstream-resolution.js";
 export type { CheckpointSummary } from "./integrity/checkpoints.js";
+export type { Affected, CorrectionNotice, HistoryEntry, LifecycleChange, Related } from "./integrity/lifecycle.js";
+export type { Lifecycle, Taint } from "./retrieval/eligibility.js";
 
 // ───────────────────────────── Public interface ─────────────────────────────
 
@@ -224,6 +239,12 @@ export interface ContextPack {
   /** True when nothing eligible was found: an honest miss, not a reason to invent continuity. */
   empty: boolean;
   notice: string | null;
+  /**
+   * Set when memory in this scope was corrected, superseded, retracted, restored or forgotten
+   * since this session's previous pack: do not rely on the listed records any more, even if
+   * you read them earlier. Each change is reported once per session.
+   */
+  corrections: CorrectionNotice | null;
 }
 
 export interface BootstrapResult {
@@ -287,6 +308,55 @@ export interface ReadResult {
   /** The budget applies to `body` only. */
   budget: { maxTokens: number; maxBytes: number; usedTokens: number; usedBytes: number };
 }
+
+/** One record as `memory_manage` inspect shows it, whatever its lifecycle. */
+export interface InspectedRecord {
+  recordId: string;
+  kind: RecordKind;
+  title: string | null;
+  /** Up to 4 KB of the body; `memory_read` pages through an eligible record's whole body. */
+  body: string;
+  truncated: boolean;
+  attribution: Attribution;
+  reviewState: ReviewState;
+  /** The claim's own state (see docs/architecture.md, "Memory lifecycle"). */
+  lifecycle: Lifecycle;
+  /** Whether it is current guidance: active and not tainted by another record. */
+  eligible: boolean;
+  /** Why an active record is still not current: the records it restates (invalidated) or rests on (quarantined). */
+  taints: { causeId: string; taint: Taint }[];
+  workspaceLevel: boolean;
+  host: string;
+  sessionId: string | null;
+  source: ImportedSource | null;
+  createdAt: string;
+  applicability: Applicability;
+  freshness: Freshness;
+  warning: string | null;
+  externalRefs: CheckedRef[];
+}
+
+export type ManageResult =
+  | {
+      v: 1;
+      action: "inspect";
+      record: InspectedRecord;
+      /** Lifecycle changes of this record, oldest first (the last 20). */
+      history: HistoryEntry[];
+      /** The correction or new version that replaced it. */
+      replacement: { recordId: string; kind: RecordKind; excerpt: string; lifecycle: Lifecycle; eligible: boolean } | null;
+      /** What it rests on or restates. */
+      evidence: Related[];
+      /** Other versions of the same transcript event, and loosely related records. */
+      conflicts: Related[];
+      /** Known downstream derivations, with the taint this record put on each (null if none). */
+      derivations: (Related & { taint: Taint | null })[];
+      counts: { evidence: number; conflicts: number; derivations: number; history: number };
+    }
+  | { v: 1; action: "correct"; recordId: string; replacementId: string; affected: Affected; watermark: number; replayed: boolean }
+  | { v: 1; action: "supersede"; recordId: string; replacementId: string; affected: Affected; watermark: number; replayed: boolean }
+  | { v: 1; action: "retract"; recordId: string; affected: Affected; watermark: number; replayed: boolean }
+  | { v: 1; action: "restore"; recordId: string; affected: RestoreResult["affected"]; watermark: number; replayed: boolean };
 
 export interface StatusScope {
   workspaceId: string;
@@ -378,6 +448,12 @@ export interface Memory {
   /** Returns one visible record's body slice within a budget, plus its in-scope links. */
   read(input: ReadInput): ReadResult;
   /**
+   * Inspects, corrects, supersedes, retracts or restores one claim in this scope. Each change
+   * is one transaction that also takes every dependent out of (or back into) current guidance
+   * and records an attributed audit entry; see src/integrity/lifecycle.ts.
+   */
+  manage(input: ManageInput): ManageResult;
+  /**
    * Reports runtime, storage and scope health. Strictly read-only: it never creates the
    * workspace, workstream, session or registry entry, never migrates, and does not
    * throw for unresolved scope or unusable storage (see `problem`).
@@ -408,6 +484,9 @@ export function openMemory(options: OpenMemoryOptions): Memory {
 // ───────────────────────────── Implementation ─────────────────────────────
 
 const OPERATIONS = Object.keys(OPERATION_SCHEMAS);
+/** A result before `idempotent` adds `replayed` (distributes over union members). */
+type Unreplayed<T> = T extends unknown ? Omit<T, "replayed"> : never;
+const INSPECT_BODY_BYTES = 4_096;
 const DEFAULT_IMPORT_BUDGET_MS = 3_000;
 
 interface Bound {
@@ -424,6 +503,8 @@ class LocalMemory implements Memory {
   private hostSessionId: string | undefined;
   private bound: Bound | undefined;
   private closed = false;
+  /** The newest lifecycle change this session has been told about (the correction watermark). */
+  private seenLifecycle = 0;
   /** Null for hosts without a transcript adapter. */
   private readonly importer: TranscriptImporter | null;
 
@@ -577,6 +658,27 @@ class LocalMemory implements Memory {
     });
   }
 
+  manage(input: ManageInput): ManageResult {
+    return this.guard(() => {
+      const parsed = parse(ManageInput, input);
+      const { db, scope } = this.bind();
+      const recordId = parsed.recordId ?? "";
+      const action = parsed.action;
+      if (action === "inspect") return this.inspect(db, scope, recordId);
+      const actor = { sessionId: scope.sessionId, host: scope.host, attribution: parsed.attribution ?? "user_direction", reason: parsed.reason ?? "" };
+      const applicability = withHeadCommit({}, scope.worktree);
+      const result = this.idempotent(db, scope, "manage", parsed, (): Unreplayed<Exclude<ManageResult, { action: "inspect" }>> => {
+        if (action === "restore") return { v: 1, action: "restore", ...restoreClaim(db, scope, { recordId, actor }) };
+        const changed = changeClaim(db, scope, { action, recordId, ...(parsed.body === undefined ? {} : { body: parsed.body }), applicability, actor });
+        const { replacementId, ...rest } = changed;
+        return action === "retract" || replacementId === null ? { v: 1, action: "retract", ...rest } : { v: 1, action, ...rest, replacementId };
+      });
+      // This session made the change itself; it needs no notice of it unless others came first.
+      if (!result.replayed && result.watermark === this.seenLifecycle + 1) this.seenLifecycle = result.watermark;
+      return result;
+    });
+  }
+
   status(input: StatusInput = {}): StatusResult {
     return this.guard(() => {
       parse(StatusInput, input);
@@ -704,6 +806,8 @@ class LocalMemory implements Memory {
     const db = openDatabase(location.dbPath, this.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: this.busyTimeoutMs });
     try {
       const scope = bindScope(db, location, { host: this.host, hostSessionId: this.hostSessionId }, hints);
+      // A new session starts from current memory; only later changes are news to it.
+      this.seenLifecycle = lifecycleWatermark(db);
       this.bound = { db, scope, location };
       return this.bound;
     } catch (error) {
@@ -727,6 +831,49 @@ class LocalMemory implements Memory {
     throw new MemchorError("invalid_input", "This Memchor process is already bound to a different host session.", {
       details: { hostSessionId },
     });
+  }
+
+  private inspect(db: Db, scope: BoundScope, recordId: string): ManageResult {
+    const found = db.transaction(() => {
+      const inspection = inspectRecord(db, scope.workstreamId, recordId);
+      return { inspection, source: importedFrom(db, [recordId]).get(recordId) ?? null };
+    })();
+    const { inspection, source } = found;
+    const row = inspection.row;
+    const fields = recordFields(row);
+    const checked = checkFreshness(scope.worktree, [{ recordId: row.id, refs: fields.externalRefs, imported: source !== null }]).get(row.id);
+    const body = clipToBytes(row.body, INSPECT_BODY_BYTES);
+    return {
+      v: 1,
+      action: "inspect",
+      record: {
+        recordId: row.id,
+        kind: fields.kind,
+        title: row.title,
+        body,
+        truncated: body.length < row.body.length,
+        attribution: fields.attribution,
+        reviewState: fields.reviewState,
+        lifecycle: inspection.lifecycle,
+        eligible: inspection.eligible,
+        taints: inspection.taints,
+        workspaceLevel: fields.workspaceLevel,
+        host: row.host,
+        sessionId: row.session_id,
+        source,
+        createdAt: row.created_at,
+        applicability: fields.applicability,
+        freshness: checked?.freshness ?? "unknown",
+        warning: checked?.warning ?? null,
+        externalRefs: checked?.externalRefs ?? [],
+      },
+      history: inspection.history,
+      replacement: inspection.replacement,
+      evidence: inspection.evidence,
+      conflicts: inspection.conflicts,
+      derivations: inspection.derivations,
+      counts: inspection.counts,
+    };
   }
 
   /**
@@ -805,7 +952,9 @@ class LocalMemory implements Memory {
         beyondCap = continued.beyondCap;
       }
       const view = scopeView(db, scope);
-      const checkpointRow = continued === null ? loadHeadCheckpoint(db, scope.workstreamId) : null;
+      const head = continued === null ? loadHeadCheckpoint(db, scope.workstreamId) : { row: null, withheld: null };
+      const checkpointRow = head.row;
+      const corrections = changesSince(db, scope.workstreamId, this.seenLifecycle);
       const window = sequence.slice(0, PAGE_CANDIDATES);
       const rows = loadCandidates(db, { workstreamId: scope.workstreamId, match, seqs: window });
       const citations = citationsFor(db, scope.workstreamId, [...rows.map((r) => r.id), ...(checkpointRow ? [checkpointRow.id] : [])]);
@@ -862,8 +1011,14 @@ class LocalMemory implements Memory {
         const truncated = omissions.length > 0 || page.checkpoint?.truncated === true;
         const empty = page.checkpoint === null && page.items.length === 0 && omissions.length === 0;
         let notice: string | null = null;
+        const withheld =
+          head.withheld === null
+            ? null
+            : `The head checkpoint r${view.headRevision} is ${head.withheld} (it rests on or repeats memory that is no longer current), so it is not returned. Use what remains, then publish a new checkpoint with expectedRevision ${view.headRevision}.`;
         if (starved) {
           notice = "This budget is too small for even the pack's scope and envelope, so nothing was returned. Recall again with a larger maxBytes/maxTokens.";
+        } else if (empty && withheld !== null) {
+          notice = withheld;
         } else if (empty) {
           notice =
             continued === null && query === null
@@ -894,7 +1049,8 @@ class LocalMemory implements Memory {
               : null,
           budget: { ...budget, usedBytes: 0, usedTokens: 0 },
           empty,
-          notice: withScopeNotice(scope, notice, empty),
+          notice: withScopeNotice(scope, withheld !== null && notice !== withheld && !starved ? (notice === null ? withheld : `${withheld} ${notice}`) : notice, empty),
+          corrections,
         };
       };
       const plan = planPage(budget.maxBytes, assemble, (page) => remainingAfter(page).length);
@@ -922,7 +1078,7 @@ class LocalMemory implements Memory {
         if (result === undefined) throw new Error(`record ${row.id} was packed without a freshness check`);
         return result;
       };
-      return packWithinBudget(
+      const packed = packWithinBudget(
         budget.maxBytes,
         plan,
         checkpointRow === null ? null : checkpointPackable(freshnessOf(checkpointRow)),
@@ -930,6 +1086,8 @@ class LocalMemory implements Memory {
         assemble,
         (page) => remainingAfter(page).length,
       );
+      if (corrections !== null) this.seenLifecycle = Math.max(this.seenLifecycle, corrections.watermark);
+      return packed;
     })();
   }
 
@@ -1008,9 +1166,18 @@ function rootOf(roots: ReadonlyMap<string, string>, recordId: string): string {
 const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
 const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
 
-function loadHeadCheckpoint(db: Db, workstreamId: string): RecordRow | null {
+/**
+ * The head checkpoint, or why it is withheld: a head that was retracted, or that rests on or
+ * repeats memory that is no longer current, is not current guidance either.
+ */
+function loadHeadCheckpoint(db: Db, workstreamId: string): { row: RecordRow | null; withheld: Lifecycle | Taint | null } {
   const recordId = headCheckpointRecordId(db, workstreamId);
-  return recordId === null ? null : requireVisibleRecord(db, workstreamId, recordId);
+  if (recordId === null) return { row: null, withheld: null };
+  const row = db.prepare("SELECT * FROM records WHERE id = ?").get(recordId) as RecordRow;
+  if (isEligible(db, row)) return { row, withheld: null };
+  if (row.lifecycle !== "active") return { row: null, withheld: row.lifecycle };
+  const taint = db.prepare("SELECT taint FROM taints WHERE record_id = ? ORDER BY taint LIMIT 1").get(recordId) as { taint: Taint };
+  return { row: null, withheld: taint.taint };
 }
 
 function scopeView(db: Db, scope: BoundScope): Scope {

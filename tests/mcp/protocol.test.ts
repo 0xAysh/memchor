@@ -5,12 +5,13 @@ import { initRepo, tempDir } from "../helpers.js";
 import { CLI, spawnServer } from "./harness.js";
 
 describe("MCP protocol surface", () => {
-  test("lists the six memory tools with strict JSON Schemas and agent instructions", async () => {
+  test("lists the seven memory tools with strict JSON Schemas and agent instructions", async () => {
     const server = await spawnServer({ cwd: initRepo(), home: tempDir() });
     const { tools } = await server.client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       "memory_bootstrap",
       "memory_checkpoint",
+      "memory_manage",
       "memory_read",
       "memory_recall",
       "memory_record",
@@ -22,6 +23,10 @@ describe("MCP protocol surface", () => {
     }
     const record = tools.find((t) => t.name === "memory_record");
     expect(record?.inputSchema.required).toEqual(["kind", "body", "attribution"]);
+    // One flat object (a top-level union is not a valid tool schema for every host); fields are checked per action.
+    const manage = tools.find((t) => t.name === "memory_manage");
+    expect(manage?.inputSchema.required).toEqual(["action"]);
+    expect(Object.keys(manage?.inputSchema.properties ?? {})).toEqual(["v", "action", "recordId", "body", "reason", "attribution", "operationKey"]);
     expect(server.client.getInstructions()).toMatch(/memory_bootstrap first/);
   });
 
@@ -38,6 +43,7 @@ describe("MCP protocol surface", () => {
       /stale.*unknown.*read the current file/is,
       /independentRoots/,
       /attribution/,
+      /memory_manage/,
       /never re-record/i,
       /memory_checkpoint.*expectedRevision/s,
       /checkpoint_conflict.*never overwrite/is,

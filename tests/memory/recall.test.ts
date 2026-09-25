@@ -73,13 +73,13 @@ describe("recall", () => {
     // More strong-matching retracted records than one page of candidates holds; an explicit
     // commit keeps the loop fast (it skips the per-record HEAD lookup).
     for (let i = 0; i < 210; i++) {
-      memory.record({
+      const { recordId } = memory.record({
         kind: "note",
         body: `redis redis redis cluster required ${i}`,
         attribution: "agent_inference",
-        reviewState: "retracted",
         applicability: { commit: "0000000" },
       });
+      memory.manage({ action: "retract", recordId, reason: "wrong", attribution: "user_direction" });
     }
     const eligible = memory.record({ kind: "decision", body: "redis was only an option", attribution: "user_direction" });
 
@@ -92,7 +92,8 @@ describe("recall", () => {
   test("citations never point at records the workstream cannot see", () => {
     const memory = open(initRepo(), tempDir());
     const evidence = memory.record({ kind: "evidence", body: "p99 latency 900ms", attribution: "direct_observation" });
-    const retracted = memory.record({ kind: "evidence", body: "p99 latency 20ms", attribution: "direct_observation", reviewState: "retracted" });
+    const retracted = memory.record({ kind: "evidence", body: "p99 latency 20ms", attribution: "direct_observation" });
+    memory.manage({ action: "retract", recordId: retracted.recordId, reason: "wrong", attribution: "user_direction" });
     expect(catchMemchorError(() => memory.record({ kind: "decision", body: "x", attribution: "agent_inference", supportedBy: [retracted.recordId] })).code).toBe("not_found");
     const decision = memory.record({ kind: "decision", body: "optimise the latency path", attribution: "agent_inference", supportedBy: [evidence.recordId] });
     expect(memory.recall({ query: "latency" }).items.find((i) => i.recordId === decision.recordId)?.citations).toEqual([

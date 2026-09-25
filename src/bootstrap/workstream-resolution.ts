@@ -276,7 +276,7 @@ function ambiguous(db: Db, evidence: { row: WorkstreamRow; signal: CandidateSign
   const byId = new Map<string, WorkstreamCandidate>();
   const head = prepared(
     db,
-    `SELECT r.body FROM checkpoints c JOIN records r ON r.id = c.record_id WHERE c.workstream_id = ? AND c.revision = ? AND r.review_state <> 'retracted'`,
+    `SELECT r.body FROM checkpoints c JOIN records r ON r.id = c.record_id WHERE c.workstream_id = ? AND c.revision = ? AND r.lifecycle = 'active' AND NOT EXISTS (SELECT 1 FROM taints t WHERE t.record_id = r.id)`,
   );
   const lastActive = prepared(db, "SELECT max(t) AS t FROM (SELECT max(created_at) AS t FROM records WHERE workstream_id = ? UNION ALL SELECT max(started_at) FROM sessions WHERE workstream_id = ?)");
   for (const { row, signal, detail } of evidence) {

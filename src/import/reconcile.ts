@@ -4,7 +4,9 @@ import { relative, sep } from "node:path";
 import { ensureWorkspace, resolveWorkstream, type ScopeAmbiguity } from "../bootstrap/workstream-resolution.js";
 import { locateWorkspace, registerWorkspace, type WorkspaceLocation } from "../bootstrap/workspace-resolution.js";
 import { type ErrorCode, MemchorError } from "../errors.js";
-import { VISIBLE_SQL } from "../retrieval/eligibility.js";
+import { quarantineLateSummary, suppressedEvent } from "../integrity/taints.js";
+import { restatable, restates } from "../integrity/restatement.js";
+import { IN_SCOPE_SQL } from "../retrieval/eligibility.js";
 import { type ExternalRef, IMPORT_CHOICES, type ImportChoice } from "../schemas.js";
 import { type Db, openDatabase, prepared, toStorageError, writeTransaction } from "../storage/database.js";
 import { appendRecord } from "../storage/records.js";
@@ -76,6 +78,8 @@ export interface ImportCounters {
   withheld: number;
   /** File reads/edits stored as references only (the file content was dropped). */
   fileContents: number;
+  /** New copies or versions of events whose claim was corrected, retracted or forgotten; skipped (see `memory_manage`). */
+  suppressed: number;
   rewrites: number;
   excluded: Partial<Record<ExclusionReason, number>>;
 }
@@ -735,6 +739,12 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
       if (same.disposition === "echo") rememberEcho(batch, event.branch, (JSON.parse(same.meta) as { references?: string[] }).references ?? []);
       continue;
     }
+    if (event.type !== "tool_call" && suppressedEvent(db, batch.host, event.eventId)) {
+      // A copy (a /branch transcript) or new version of an event whose claim was corrected,
+      // retracted or forgotten: importing it would resurrect that claim.
+      batch.counters.suppressed++;
+      continue;
+    }
     const previous = versions.find((v) => v.record_id !== null)?.record_id ?? null;
     if (versions.length > 0) batch.counters.conflicts++;
     const store = (disposition: "record" | "tool_call" | "echo", recordId: string | null, meta: object): void => {
@@ -797,6 +807,10 @@ interface Draft {
   externalRefs: ExternalRef[];
 }
 
+/**
+ * Host summaries are the only imported `note`s (messages and tool results are `evidence`);
+ * lifecycle changes rely on that to find summaries without lineage (`HOST_SUMMARY_SQL`).
+ */
 function messageRecord(batch: Batch, event: Extract<NormalizedEvent, { type: "message" | "host_summary" }>): Draft {
   const summary = event.type === "host_summary";
   return {
@@ -855,26 +869,17 @@ function appendImported(batch: Batch, event: NormalizedEvent, previous: string |
     links: [...(previous === null ? [] : [{ recordId: previous, relation: "related_to" as const }]), ...derivedFrom.map((recordId) => ({ recordId, relation: "derived_from" as const }))],
     sourceId: batch.sourceId,
     createdAt: event.observedAt,
+    // Earlier versions and echoed records stay lineage targets after a correction, so the new
+    // record inherits their state instead of coming back as current guidance.
+    lineage: "inherit",
   });
+  // A summary written after a corrected event of this transcript may repeat it; it has no
+  // finer lineage, so it is quarantined rather than partly trusted.
+  if (event.type === "host_summary") quarantineLateSummary(batch.db, written.recordId);
   batch.counters.records++;
   return written.recordId;
 }
 
-/**
- * Shortest normalised text that counts as a restatement of echoed memory. A shorter sentence
- * ("Tests pass.", "Done.") recurs by itself, so containing it says nothing about copying.
- */
-const MIN_RESTATED_CHARS = 40;
-
-function normalizeForEcho(text: string): string {
-  return text.toLowerCase().replace(/\s+/gu, " ").trim();
-}
-
-/** The texts whose verbatim appearance marks a copy of a record: its whole body and each long-enough sentence. */
-function restatable(body: string): string[] {
-  const pieces = [body, ...body.split(/\n+|(?<=[.!?])\s+/u)].map(normalizeForEcho).filter((piece) => piece.length >= MIN_RESTATED_CHARS);
-  return [...new Set(pieces)];
-}
 
 /**
  * The records shown to the agent on `branch` earlier in this reconciliation pass, loaded once
@@ -897,14 +902,16 @@ function rememberEcho(batch: Batch, branch: string, recordIds: readonly string[]
   const echoed = echoesOn(batch, branch);
   const fresh = [...new Set(recordIds)].filter((id) => !echoed.has(id));
   if (fresh.length === 0) return;
-  const rows = prepared(batch.db, `SELECT r.id, r.body FROM records r WHERE r.id IN (SELECT value FROM json_each($ids)) AND ${VISIBLE_SQL}`)
+  // In scope, whatever its lifecycle: a restatement of memory corrected since it was echoed is
+  // still a copy of it, and inherits its state (see appendRecord) instead of coming back as new.
+  const rows = prepared(batch.db, `SELECT r.id, r.body FROM records r WHERE r.id IN (SELECT value FROM json_each($ids)) AND ${IN_SCOPE_SQL}`)
     .all({ ids: JSON.stringify(fresh), workstreamId: batch.workstreamId }) as { id: string; body: string }[];
   for (const row of rows) echoed.set(row.id, restatable(row.body));
 }
 
 /**
  * Records Memchor showed the agent earlier on this branch whose body, or one of whose
- * sentences of at least {@link MIN_RESTATED_CHARS} characters, `text` contains verbatim
+ * sentences of at least 40 characters (`MIN_RESTATED_CHARS`), `text` contains verbatim
  * (case and whitespace ignored). Such a text is a copy of that memory, so its record is
  * stored `derived_from` it and inherits its independent root: echoed memory must never come
  * back as independent corroboration (PRD §8.3, §17). The window is the rest of the branch,
@@ -915,8 +922,7 @@ function rememberEcho(batch: Batch, branch: string, recordIds: readonly string[]
 function restatedEchoes(batch: Batch, branch: string, text: string): string[] {
   const echoed = echoesOn(batch, branch);
   if (echoed.size === 0) return [];
-  const said = normalizeForEcho(text);
-  return [...echoed].filter(([, pieces]) => pieces.some((piece) => said.includes(piece))).map(([id]) => id);
+  return [...echoed].filter(([, pieces]) => restates(text, pieces)).map(([id]) => id);
 }
 
 function lookupCall(batch: Batch, callId: string): CallMeta | null {
@@ -1011,7 +1017,7 @@ function readCursors(db: Db, host: string): Map<string, CursorRow & { transcript
 }
 
 function emptyCounters(): ImportCounters {
-  return { events: 0, records: 0, replayed: 0, conflicts: 0, missing: 0, echoes: 0, echoReferences: 0, redactions: 0, clipped: 0, withheld: 0, fileContents: 0, rewrites: 0, excluded: {} };
+  return { events: 0, records: 0, replayed: 0, conflicts: 0, missing: 0, echoes: 0, echoReferences: 0, redactions: 0, clipped: 0, withheld: 0, fileContents: 0, suppressed: 0, rewrites: 0, excluded: {} };
 }
 
 function parseCounters(json: string): ImportCounters {

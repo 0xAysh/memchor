@@ -19,7 +19,7 @@ import {
 const SKIP = claudeSkipReason();
 if (SKIP !== null) process.stderr.write(`claude code connection tests skipped: ${SKIP}\n`);
 
-const TOOLS = ["memory_bootstrap", "memory_checkpoint", "memory_read", "memory_recall", "memory_record", "memory_status"];
+const TOOLS = ["memory_bootstrap", "memory_checkpoint", "memory_manage", "memory_read", "memory_recall", "memory_record", "memory_status"];
 
 function setup(branch: string) {
   const sandbox = claudeSandbox();
@@ -87,7 +87,7 @@ describe.skipIf(SKIP !== null)(`real Claude Code ${CLAUDE_PINNED_VERSION} connec
     const result = JSON.parse(run.stdout) as { is_error: boolean; result: string; session_id: string };
     expect(result).toMatchObject({ is_error: false, result: "Bootstrapped; nothing to continue yet." });
 
-    // Claude Code offered all six tools, under its mcp__<server>__<tool> names.
+    // Claude Code offered all seven tools, under its mcp__<server>__<tool> names.
     const offered = stub.offeredTools[0] ?? [];
     expect(offered.filter((name) => name.startsWith("mcp__memchor__")).sort()).toEqual(TOOLS.map((tool) => `mcp__memchor__${tool}`));
 

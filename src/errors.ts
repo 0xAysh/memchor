@@ -23,6 +23,12 @@ export const ERROR_CODES = [
   "invalid_input",
   /** An operation key was reused with a different request. */
   "idempotency_conflict",
+  /**
+   * The record is not in the lifecycle state the operation needs (e.g. correcting a record that
+   * was already corrected, or restoring one that was not retracted). `details.lifecycle` names
+   * its state and `details.replacementId` its replacement, if any.
+   */
+  "lifecycle_conflict",
   /** `expectedRevision` does not match the workstream's head; reread and reconcile deliberately. */
   "checkpoint_conflict",
   /** Another writer held the database past the bounded busy timeout. Safe to retry. */

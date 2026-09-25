@@ -4,13 +4,14 @@ import * as initial from "./0001-initial.js";
 import * as transcriptImport from "./0002-transcript-import.js";
 import * as importSourceFingerprint from "./0003-import-source-fingerprint.js";
 import * as scopeResolution from "./0004-scope-resolution.js";
+import * as lifecycle from "./0005-lifecycle.js";
 
 /**
  * Ordered schema migrations. Entry `i` upgrades `PRAGMA user_version` from `i` to `i + 1`.
  * Append only: a shipped migration is never edited, because databases in the field
  * have already applied it.
  */
-const MIGRATIONS: readonly string[] = [initial.sql, transcriptImport.sql, importSourceFingerprint.sql, scopeResolution.sql];
+const MIGRATIONS: readonly string[] = [initial.sql, transcriptImport.sql, importSourceFingerprint.sql, scopeResolution.sql, lifecycle.sql];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
 

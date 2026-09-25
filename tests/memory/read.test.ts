@@ -59,7 +59,8 @@ describe("read", () => {
     git(repo, "worktree", "add", "--quiet", "-b", "other", worktree);
     const mine = open(repo, home);
     const foreign = open(worktree, home).record({ kind: "note", body: "theirs", attribution: "agent_inference" });
-    const retracted = mine.record({ kind: "note", body: "wrong", attribution: "agent_inference", reviewState: "retracted" });
+    const retracted = mine.record({ kind: "note", body: "wrong", attribution: "agent_inference" });
+    mine.manage({ action: "retract", recordId: retracted.recordId, reason: "wrong", attribution: "user_direction" });
 
     expect(catchMemchorError(() => mine.read({ recordId: foreign.recordId })).code).toBe("scope_denied");
     expect(catchMemchorError(() => mine.read({ recordId: retracted.recordId })).code).toBe("not_found");
@@ -71,7 +72,8 @@ describe("read", () => {
     const memory = open(initRepo(), tempDir());
     const evidence = memory.record({ kind: "evidence", body: "e", attribution: "direct_observation" });
     const decision = memory.record({ kind: "decision", body: "d", attribution: "agent_inference", supportedBy: [evidence.recordId] });
-    memory.record({ kind: "note", body: "later retracted note", attribution: "agent_inference", reviewState: "retracted" });
+    const note = memory.record({ kind: "note", body: "later retracted note", attribution: "agent_inference", links: [{ to: evidence.recordId, relation: "related_to" }] });
+    memory.manage({ action: "retract", recordId: note.recordId, reason: "wrong", attribution: "user_direction" });
 
     expect(memory.read({ recordId: evidence.recordId }).links).toEqual([
       { recordId: decision.recordId, relation: "supported_by", direction: "incoming" },
