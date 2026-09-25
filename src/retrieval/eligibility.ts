@@ -23,7 +23,9 @@ import { type Db, prepared } from "../storage/database.js";
  * compete for rank, budget, or continuation positions. Callers bind `$workstreamId`.
  */
 export const IN_SCOPE_SQL = `(r.workstream_id = $workstreamId OR r.workstream_id IS NULL)`;
-export const VISIBLE_SQL = `(r.lifecycle = 'active' AND NOT EXISTS (SELECT 1 FROM taints t WHERE t.record_id = r.id) AND ${IN_SCOPE_SQL})`;
+/** The lifecycle half of visibility, for queries that already fixed scope (a known workstream's checkpoint). */
+export const ELIGIBLE_STATE_SQL = `(r.lifecycle = 'active' AND NOT EXISTS (SELECT 1 FROM taints t WHERE t.record_id = r.id))`;
+export const VISIBLE_SQL = `(${ELIGIBLE_STATE_SQL} AND ${IN_SCOPE_SQL})`;
 export const RECALL_ELIGIBLE_SQL = `(${VISIBLE_SQL} AND r.kind <> 'checkpoint')`;
 
 export type Lifecycle = "active" | "corrected" | "superseded" | "retracted" | "forgotten";
@@ -75,27 +77,34 @@ export function requireInScopeRecord(db: Db, workstreamId: string, recordId: str
  */
 export function requireVisibleRecord(db: Db, workstreamId: string, recordId: string): RecordRow {
   const row = requireInScopeRecord(db, workstreamId, recordId);
-  if (row.lifecycle !== "active") {
+  const state = eligibilityOf(db, row);
+  if (state.eligible) return row;
+  if (state.taint === null) {
     throw new MemchorError(
       "not_found",
       `Record ${recordId} is ${row.lifecycle} and is no longer current guidance${row.superseded_by === null ? "" : `; its replacement is ${row.superseded_by}`}. Use memory_manage inspect for its history.`,
       { details: { recordId, lifecycle: row.lifecycle, ...(row.superseded_by === null ? {} : { replacementId: row.superseded_by }) } },
     );
   }
-  const taint = prepared(db, "SELECT taint, cause_id FROM taints WHERE record_id = ? ORDER BY taint, cause_id LIMIT 1").get(recordId) as
-    | { taint: Taint; cause_id: string }
-    | undefined;
-  if (taint !== undefined) {
-    throw new MemchorError(
-      "not_found",
-      `Record ${recordId} is ${taint.taint} because ${taint.cause_id}, which it ${taint.taint === "invalidated" ? "restates" : "rests on"}, is no longer current. Use memory_manage inspect for details.`,
-      { details: { recordId, lifecycle: row.lifecycle, taint: taint.taint, causeId: taint.cause_id } },
-    );
-  }
-  return row;
+  const { taint } = state;
+  throw new MemchorError(
+    "not_found",
+    `Record ${recordId} is ${taint.taint} because ${taint.causeId}, which it ${taint.taint === "invalidated" ? "restates" : "rests on"}, is no longer current. Use memory_manage inspect for details.`,
+    { details: { recordId, lifecycle: row.lifecycle, taint: taint.taint, causeId: taint.causeId } },
+  );
 }
 
-/** Whether an in-scope row is current guidance (the row form of {@link VISIBLE_SQL}). */
-export function isEligible(db: Db, row: Pick<RecordRow, "id" | "lifecycle">): boolean {
-  return row.lifecycle === "active" && prepared(db, "SELECT 1 FROM taints WHERE record_id = ? LIMIT 1").get(row.id) === undefined;
+/**
+ * The row form of {@link ELIGIBLE_STATE_SQL}: whether a record is current guidance and, if
+ * not, why. A record's own lifecycle is reported before any taint.
+ */
+export function eligibilityOf(
+  db: Db,
+  row: Pick<RecordRow, "id" | "lifecycle">,
+): { eligible: true } | { eligible: false; taint: null } | { eligible: false; taint: { taint: Taint; causeId: string } } {
+  if (row.lifecycle !== "active") return { eligible: false, taint: null };
+  const taint = prepared(db, "SELECT taint, cause_id AS causeId FROM taints WHERE record_id = ? ORDER BY taint, cause_id LIMIT 1").get(row.id) as
+    | { taint: Taint; causeId: string }
+    | undefined;
+  return taint === undefined ? { eligible: true } : { eligible: false, taint };
 }

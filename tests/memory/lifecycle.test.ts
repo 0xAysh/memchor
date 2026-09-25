@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, test } from "vitest";
 import { type ContextPack, openMemory, type Memory } from "../../src/memory.js";
@@ -129,6 +130,17 @@ describe("correction", () => {
     expect(running.recall().corrections).toBeNull();
   });
 
+  test("a direct read tells a running session about changes too, once", () => {
+    const repo = initRepo();
+    const home = tempDir();
+    const running = open(repo, home);
+    const { claim, related } = redisScenario(running);
+    open(repo, home, "codex").manage({ action: "retract", recordId: claim, reason: "Never said.", attribution: "user_direction" });
+    expect(running.read({ recordId: related }).corrections?.changes).toEqual([expect.objectContaining({ recordId: claim, action: "retract" })]);
+    expect(running.read({ recordId: related }).corrections).toBeNull();
+    expect(running.recall().corrections).toBeNull();
+  });
+
   test("correcting twice is a lifecycle_conflict naming the replacement; an operationKey replays", () => {
     const memory = open(initRepo(), tempDir());
     const { claim } = redisScenario(memory);
@@ -204,6 +216,18 @@ describe("retraction, restore and supersession", () => {
     if (corrected.action !== "retract") throw new Error("unreachable");
     expect(corrected.affected.invalidated).toEqual(expect.arrayContaining([ids.restatement, second]));
     expect(recalled(memory)).not.toContain(second);
+  });
+
+  test("a record first reached as resting on the claim, then as restating it, ends invalidated, and so do its restatements", () => {
+    const memory = open(initRepo(), tempDir());
+    const claim = memory.record({ kind: "evidence", body: "Redis is required.", attribution: "user_direction" }).recordId;
+    const copy = memory.record({ kind: "note", body: "copy", attribution: "agent_inference", links: [{ to: claim, relation: "derived_from" }] }).recordId;
+    const both = memory.record({ kind: "note", body: "both", attribution: "agent_inference", supportedBy: [claim], links: [{ to: copy, relation: "derived_from" }] }).recordId;
+    const echo = memory.record({ kind: "note", body: "echo", attribution: "agent_inference", links: [{ to: both, relation: "derived_from" }] }).recordId;
+    const result = memory.manage({ action: "retract", recordId: claim, reason: "r", attribution: "user_direction" });
+    if (result.action !== "retract") throw new Error("unreachable");
+    expect(result.affected.invalidated).toEqual(expect.arrayContaining([copy, both, echo]));
+    expect(result.affected.quarantined).toEqual([]);
   });
 
   test("a checkpoint that restates the claim verbatim without citing it is quarantined (no fine-grained lineage)", () => {
@@ -282,6 +306,26 @@ describe("derived state stays consistent", () => {
     memory.rebuildSearchIndex();
     expect(recalled(memory, "redis")).toEqual(before);
     expect(before).not.toContain(ids.claim);
+  });
+
+  test("a change that fails midway rolls back entirely: nothing corrected, tainted, audited or appended", () => {
+    const memory = open(initRepo(), tempDir());
+    const ids = redisScenario(memory);
+    const dbPath = memory.status().storage.dbPath ?? "";
+    // The ledger append is the last step before COMMIT; a directory in its place makes it fail.
+    mkdirSync(join(dirname(dbPath), "lifecycle.jsonl"));
+    const before = recalled(memory);
+    const error = catchMemchorError(() => memory.manage({ action: "correct", recordId: ids.claim, body: "Redis is optional.", reason: "r", attribution: "user_direction" }));
+    expect(error.code).toBe("storage_unavailable");
+    expect(recalled(memory)).toEqual(before);
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      expect(db.prepare("SELECT lifecycle FROM records WHERE id = ?").get(ids.claim)).toEqual({ lifecycle: "active" });
+      for (const table of ["taints", "lifecycle_events", "suppressions"]) expect(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });
+      expect(db.prepare("SELECT count(*) AS n FROM records WHERE kind = 'correction'").get()).toEqual({ n: 0 });
+    } finally {
+      db.close();
+    }
   });
 
   test("a correction commits the new version, the old claim's state, the taints and the audit row together", () => {

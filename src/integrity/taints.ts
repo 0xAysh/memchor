@@ -1,4 +1,4 @@
-import type { Taint } from "../retrieval/eligibility.js";
+import type { Lifecycle, Taint } from "../retrieval/eligibility.js";
 import { type Db, prepared, requireTransaction } from "../storage/database.js";
 import type { Citation } from "./provenance.js";
 import { restatable, restates } from "./restatement.js";
@@ -23,6 +23,13 @@ import { restatable, restates } from "./restatement.js";
  */
 
 export type Propagation = "wrong" | "outdated" | "removed";
+
+/** Lifecycles whose claim was wrong or removed (as opposed to merely outdated): they taint everything built on them. */
+export const WRONG_OR_REMOVED: readonly Lifecycle[] = ["corrected", "retracted", "forgotten"];
+
+/** Adds a taint; a restatement (invalidated) outranks resting on (quarantined) for the same cause. */
+const UPSERT_TAINT = `INSERT INTO taints (record_id, cause_id, taint, created_at) VALUES (?, ?, ?, ?)
+  ON CONFLICT (record_id, cause_id) DO UPDATE SET taint = 'invalidated' WHERE excluded.taint = 'invalidated'`;
 
 /**
  * Host summaries are the only imported notes (see `messageRecord` in import/reconcile.ts). They
@@ -62,7 +69,9 @@ export function findDependents(db: Db, roots: readonly string[], mode: Propagati
         tainted.set(row.from_id, kind);
         frontier.push(row.from_id);
       } else if (previous === "quarantined" && kind === "invalidated") {
+        // Revisit it: what restates it is now a restatement of an invalidated record.
         tainted.set(row.from_id, kind);
+        frontier.push(row.from_id);
       }
     }
   }
@@ -73,11 +82,7 @@ export function findDependents(db: Db, roots: readonly string[], mode: Propagati
 /** Writes {@link findDependents}' result as taints caused by `causeId`. Call inside the change's transaction. */
 export function insertTaints(db: Db, causeId: string, tainted: ReadonlyMap<string, Taint>, now: string): void {
   requireTransaction(db, "insertTaints");
-  const insert = prepared(
-    db,
-    `INSERT INTO taints (record_id, cause_id, taint, created_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT (record_id, cause_id) DO UPDATE SET taint = 'invalidated' WHERE excluded.taint = 'invalidated'`,
-  );
+  const insert = prepared(db, UPSERT_TAINT);
   for (const [id, kind] of tainted) insert.run(id, causeId, kind, now);
 }
 
@@ -119,16 +124,13 @@ export function inheritTaints(db: Db, recordId: string, links: readonly Citation
   requireTransaction(db, "inheritTaints");
   const target = prepared(db, "SELECT lifecycle FROM records WHERE id = ?");
   const targetTaints = prepared(db, "SELECT cause_id, taint FROM taints WHERE record_id = ?");
-  const insert = prepared(
-    db,
-    `INSERT INTO taints (record_id, cause_id, taint, created_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT (record_id, cause_id) DO UPDATE SET taint = 'invalidated' WHERE excluded.taint = 'invalidated'`,
-  );
+  const insert = prepared(db, UPSERT_TAINT);
   for (const link of links) {
     if (link.relation !== "derived_from" && link.relation !== "supported_by") continue;
     const restates = link.relation === "derived_from";
-    const { lifecycle } = target.get(link.recordId) as { lifecycle: string };
-    if (lifecycle !== "active" && (restates || lifecycle !== "superseded")) insert.run(recordId, link.recordId, restates ? "invalidated" : "quarantined", now);
+    const { lifecycle } = target.get(link.recordId) as { lifecycle: Lifecycle };
+    // A copy of any replaced claim goes; resting on one matters only if it was wrong or removed.
+    if (lifecycle !== "active" && (restates || WRONG_OR_REMOVED.includes(lifecycle))) insert.run(recordId, link.recordId, restates ? "invalidated" : "quarantined", now);
     for (const row of targetTaints.all(link.recordId) as { cause_id: string; taint: Taint }[]) insert.run(recordId, row.cause_id, restates ? row.taint : "quarantined", now);
   }
 }
@@ -143,8 +145,8 @@ export function quarantineLateSummary(db: Db, recordId: string): void {
     db,
     `INSERT OR IGNORE INTO taints (record_id, cause_id, taint, created_at)
      SELECT s.id, r.id, 'quarantined', s.created_at FROM records s JOIN records r ON r.source_id = s.source_id
-     WHERE s.id = ? AND r.id <> s.id AND r.created_at <= s.created_at AND r.lifecycle IN ('corrected', 'retracted', 'forgotten')`,
-  ).run(recordId);
+     WHERE s.id = ? AND r.id <> s.id AND r.created_at <= s.created_at AND r.lifecycle IN (SELECT value FROM json_each(?))`,
+  ).run(recordId, JSON.stringify(WRONG_OR_REMOVED));
 }
 
 /** Whether a new copy or version of this host event must be skipped at import (its claim is no longer active). */

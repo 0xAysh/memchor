@@ -102,6 +102,12 @@ describe("test results", () => {
     });
     expect(item(memory, recordId)).toMatchObject({ freshness: "current", warning: null, testRun: { evidence: "captured", applies: "current", reason: "same_state" } });
 
+    // Captured output of another command, or with the other outcome, is not this run.
+    for (const run of [{ command: "npm run lint", outcome: "failed" }, { command: "npm test -- gateway", outcome: "passed" }] as const) {
+      const other = memory.record({ kind: "evidence", body: `claims ${run.command}`, attribution: "direct_observation", supportedBy: [output.recordId], testRun: run }).recordId;
+      expect(item(memory, other).testRun).toMatchObject({ evidence: "asserted" });
+    }
+
     writeFile(repo, "src/gateway.ts", "export const retries = 1;\n");
     const edited = item(memory, recordId);
     expect(edited).toMatchObject({ freshness: "stale", testRun: { applies: "stale", reason: "other_state" } });

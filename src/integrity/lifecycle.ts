@@ -1,10 +1,11 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { MemchorError } from "../errors.js";
-import { IN_SCOPE_SQL, isEligible, type Lifecycle, type RecordRow, requireInScopeRecord, type Taint } from "../retrieval/eligibility.js";
+import { eligibilityOf, IN_SCOPE_SQL, type Lifecycle, type RecordRow, requireInScopeRecord, type Taint } from "../retrieval/eligibility.js";
 import type { Applicability, Attribution, LinkRelation, RecordKind } from "../schemas.js";
 import { type Db, openDatabase, prepared, requireTransaction, writeTransaction } from "../storage/database.js";
 import { appendRecord } from "../storage/records.js";
 import { appendLedger, type LedgerEntry, readLedger } from "./ledger.js";
+import { excerpt } from "./lifecycle-views.js";
 import { findDependents, insertTaints, type Propagation } from "./taints.js";
 
 /**
@@ -42,11 +43,15 @@ import { findDependents, insertTaints, type Propagation } from "./taints.js";
 export type ChangeAction = "correct" | "supersede" | "retract";
 
 export interface Actor {
-  sessionId: string;
+  /** Null for a change re-applied from the ledger (the session that made it may not exist in this copy). */
+  sessionId: string | null;
   host: string;
   attribution: Attribution;
   reason: string;
 }
+
+/** A change a session makes now (not a ledger replay): it always has a session. */
+export type LiveActor = Actor & { sessionId: string };
 
 export interface ChangeScope {
   workstreamId: string;
@@ -77,8 +82,21 @@ export interface ChangeResult {
   watermark: number;
 }
 
-const NEXT_STATE: Record<ChangeAction | "forget", Lifecycle> = { correct: "corrected", supersede: "superseded", retract: "retracted", forget: "forgotten" };
-const PROPAGATION: Record<ChangeAction | "forget", Propagation> = { correct: "wrong", supersede: "outdated", retract: "wrong", forget: "removed" };
+type Action = LedgerEntry["action"];
+
+/**
+ * The state machine, in one place. `from`: the lifecycles an action applies to (to the target
+ * and to each copy of it); `to`: the lifecycle it leaves them in; `propagation`: how it taints
+ * dependents (none for a restore, which removes the taints its retraction added). A restore
+ * additionally needs the retraction to have been made through memory_manage ({@link restorable}).
+ */
+const TRANSITIONS: Record<Action, { from: (lifecycle: Lifecycle) => boolean; to: Lifecycle; propagation: Propagation | null; past: string }> = {
+  correct: { from: (l) => l === "active", to: "corrected", propagation: "wrong", past: "corrected" },
+  supersede: { from: (l) => l === "active", to: "superseded", propagation: "outdated", past: "superseded" },
+  retract: { from: (l) => l === "active", to: "retracted", propagation: "wrong", past: "retracted" },
+  restore: { from: (l) => l === "retracted", to: "active", propagation: null, past: "restored" },
+  forget: { from: (l) => l !== "forgotten", to: "forgotten", propagation: "removed", past: "forgotten" },
+};
 
 /**
  * Corrects, supersedes or retracts a claim in the caller's write transaction. `body` is the
@@ -88,19 +106,19 @@ const PROPAGATION: Record<ChangeAction | "forget", Propagation> = { correct: "wr
 export function changeClaim(
   db: Db,
   scope: ChangeScope,
-  request: { action: ChangeAction; recordId: string; body?: string; applicability: Applicability; actor: Actor },
+  request: { action: ChangeAction; recordId: string; body?: string; applicability: Applicability; actor: LiveActor },
 ): ChangeResult {
   requireTransaction(db, "changeClaim");
   const { action, actor } = request;
   const target = requireInScopeRecord(db, scope.workstreamId, request.recordId);
-  if (target.lifecycle !== "active") throw lifecycleConflict(target, action);
+  if (!TRANSITIONS[action].from(target.lifecycle)) throw lifecycleConflict(target, action);
   if (action === "supersede" && target.kind === "checkpoint") {
     throw new MemchorError("invalid_input", "A checkpoint is superseded by publishing the next revision with memory_checkpoint, not by memory_manage.", {
       details: { recordId: target.id },
     });
   }
   const now = new Date().toISOString();
-  const observation = sameObservation(db, scope.workstreamId, target, (lifecycle) => lifecycle === "active");
+  const observation = sameObservation(db, scope.workstreamId, target, TRANSITIONS[action].from);
 
   let replacementId: string | null = null;
   if (action !== "retract") {
@@ -134,10 +152,10 @@ export interface RestoreResult {
 }
 
 /** Undoes a retraction made through {@link changeClaim}: the claim, and every dependent it alone tainted, are current again. */
-export function restoreClaim(db: Db, scope: ChangeScope, request: { recordId: string; actor: Actor }): RestoreResult {
+export function restoreClaim(db: Db, scope: ChangeScope, request: { recordId: string; actor: LiveActor }): RestoreResult {
   requireTransaction(db, "restoreClaim");
   const target = requireInScopeRecord(db, scope.workstreamId, request.recordId);
-  const observation = sameObservation(db, scope.workstreamId, target, (lifecycle) => lifecycle === "retracted");
+  const observation = sameObservation(db, scope.workstreamId, target, TRANSITIONS.restore.from);
   if (!restorable(db, target, observation.records)) throw lifecycleConflict(target, "restore");
   const now = new Date().toISOString();
   const dependents = (prepared(db, "SELECT DISTINCT record_id FROM taints WHERE cause_id IN (SELECT value FROM json_each(?))").all(JSON.stringify(observation.records)) as {
@@ -146,8 +164,8 @@ export function restoreClaim(db: Db, scope: ChangeScope, request: { recordId: st
   const entry = ledgerEntry("restore", target.id, null, request.actor, observation.events, now);
   const effects = applyEffects(db, entry, target, observation.records, request.actor, new Set());
   appendLedger(db, entry);
-  const stillTainted = prepared(db, "SELECT 1 FROM taints WHERE record_id = ? LIMIT 1");
-  const released = inScope(db, scope, dependents.filter((id) => stillTainted.get(id) === undefined)).listed;
+  const lifecycleOf = prepared(db, "SELECT id, lifecycle FROM records WHERE id = ?");
+  const released = inScope(db, scope, dependents.filter((id) => eligibilityOf(db, lifecycleOf.get(id) as Pick<RecordRow, "id" | "lifecycle">).eligible)).listed;
   return {
     recordId: target.id,
     affected: { records: observation.records, released: released.slice(0, LISTED), omitted: Math.max(0, released.length - LISTED), suppressedEvents: effects.suppressed },
@@ -159,7 +177,6 @@ export function restoreClaim(db: Db, scope: ChangeScope, request: { recordId: st
 
 /** A confirmation is valid this long after its preview: the user confirms what they were just shown. */
 const CONFIRMATION_TTL_MS = 30 * 60 * 1000;
-export const MAX_FORGET_TARGETS = 50;
 
 export interface ForgetTarget {
   recordId: string;
@@ -243,7 +260,7 @@ export interface ForgetResult {
  * scope's, unexpired, and its impact must still be what the preview showed (`preview_outdated`
  * otherwise: preview again and ask the user again).
  */
-export function confirmForget(db: Db, scope: ChangeScope, key: ConfirmationKey, request: { confirmToken: string; actor: Actor }, now = Date.now()): ForgetResult {
+export function confirmForget(db: Db, scope: ChangeScope, key: ConfirmationKey, request: { confirmToken: string; actor: LiveActor }, now = Date.now()): ForgetResult {
   requireTransaction(db, "confirmForget");
   const token = openConfirmation(key, request.confirmToken, now);
   const plan = planForget(db, scope, token.ids);
@@ -257,14 +274,17 @@ export function confirmForget(db: Db, scope: ChangeScope, key: ConfirmationKey, 
   let watermark = 0;
   let suppressed = 0;
   const tainted = new Map<string, Taint>();
+  const entries: LedgerEntry[] = [];
   for (const group of plan.groups) {
     const entry = ledgerEntry("forget", group.target.id, null, request.actor, group.events, at);
     const effects = applyEffects(db, entry, group.target, group.records, request.actor, forgotten);
-    appendLedger(db, entry);
+    entries.push(entry);
     watermark = effects.watermark;
     suppressed += effects.suppressed;
     for (const [id, kind] of effects.tainted) if (tainted.get(id) !== "invalidated") tainted.set(id, kind);
   }
+  // Only once every group's effects succeeded: an entry must never describe a change that rolled back.
+  for (const entry of entries) appendLedger(db, entry);
   return { forgotten: [...forgotten], affected: describe(db, scope, [...forgotten], tainted, suppressed), watermark };
 }
 
@@ -275,8 +295,8 @@ function planForget(db: Db, scope: ChangeScope, recordIds: readonly string[]): F
   for (const recordId of requested) {
     if (all.has(recordId)) continue; // already a copy of an earlier target
     const target = requireInScopeRecord(db, scope.workstreamId, recordId);
-    if (target.lifecycle === "forgotten") throw lifecycleConflict(target, "forget");
-    const observation = sameObservation(db, scope.workstreamId, target, (lifecycle) => lifecycle !== "forgotten");
+    if (!TRANSITIONS.forget.from(target.lifecycle)) throw lifecycleConflict(target, "forget");
+    const observation = sameObservation(db, scope.workstreamId, target, TRANSITIONS.forget.from);
     for (const id of observation.records) all.add(id);
     groups.push({ target, records: observation.records, events: [...observation.events, ...callEventsOf(db, observation.records)], tainted: new Map() });
   }
@@ -374,14 +394,14 @@ export function replayLedger(db: Db): number {
 
 function replayEntry(db: Db, entry: LedgerEntry): void {
   const target = prepared(db, "SELECT * FROM records WHERE id = ?").get(entry.recordId) as RecordRow | undefined;
-  const actor: Actor = { sessionId: "", host: entry.host, attribution: entry.attribution, reason: REPLAYED };
-  const keep = (lifecycle: Lifecycle): boolean =>
-    entry.action === "restore" ? lifecycle === "retracted" : entry.action === "forget" ? lifecycle !== "forgotten" : lifecycle === "active";
-  const records = target === undefined ? [entry.recordId] : sameObservationIn(db, target.workstream_id, target, keep).records;
-  const applies = target !== undefined && keep(target.lifecycle) && (entry.action !== "restore" || restorable(db, target, records));
+  const actor: Actor = { sessionId: null, host: entry.host, attribution: entry.attribution, reason: REPLAYED };
+  const { from } = TRANSITIONS[entry.action];
+  const records = target === undefined ? [entry.recordId] : sameObservation(db, target.workstream_id, target, from).records;
+  const applies = target !== undefined && from(target.lifecycle) && (entry.action !== "restore" || restorable(db, target, records));
   if (target === undefined || !applies) {
-    // Nothing to change in the rows (the record predates this copy, or is already in that state),
-    // but the events are still blocked (or released), and the entry is marked applied.
+    // Nothing to change in the rows (this copy was taken before the record existed, or the
+    // record is already past this change), but the events are still blocked (or released),
+    // and the entry is marked applied.
     effectsOnEvents(db, entry, records);
     appendEvent(db, entry, target?.workstream_id ?? null, actor);
     return;
@@ -412,7 +432,7 @@ function applyEffects(
     prepared(db, "UPDATE records SET lifecycle = 'active', retracted_at = NULL WHERE id IN (SELECT value FROM json_each(?))").run(ids);
   } else {
     // Found before a forget deletes the links that lead to the dependents.
-    tainted = findDependents(db, records, PROPAGATION[entry.action], exclude);
+    tainted = findDependents(db, records, TRANSITIONS[entry.action].propagation ?? "outdated", exclude);
     insertTaints(db, target.id, tainted, entry.at);
     if (entry.action === "forget") removePayload(db, records, entry.events);
     prepared(
@@ -420,7 +440,7 @@ function applyEffects(
       `UPDATE records SET lifecycle = $lifecycle, superseded_by = coalesce($replacement, superseded_by),
          retracted_at = CASE WHEN $lifecycle IN ('retracted', 'forgotten') THEN $at ELSE retracted_at END
        WHERE id IN (SELECT value FROM json_each($ids))`,
-    ).run({ lifecycle: NEXT_STATE[entry.action], replacement: entry.replacementId, at: entry.at, ids });
+    ).run({ lifecycle: TRANSITIONS[entry.action].to, replacement: entry.replacementId, at: entry.at, ids });
   }
   const suppressed = effectsOnEvents(db, entry, records);
   const watermark = appendEvent(db, entry, target.workstream_id, actor);
@@ -466,157 +486,6 @@ function removePayload(db: Db, records: readonly string[], events: readonly { ho
   for (const event of events) scrubCall.run(event.host, event.eventId);
 }
 
-// ── The correction watermark ──
-
-/** The newest lifecycle change in this workspace (0 before any). */
-export function lifecycleWatermark(db: Db): number {
-  return (prepared(db, "SELECT coalesce(max(seq), 0) AS seq FROM lifecycle_events").get() as { seq: number }).seq;
-}
-
-export interface LifecycleChange {
-  recordId: string;
-  action: ChangeAction | "restore" | "forget";
-  replacementId: string | null;
-  reason: string;
-  host: string;
-  createdAt: string;
-}
-
-/**
- * What changed in this workstream's scope since `since`: at most {@link LISTED_CHANGES} changes,
- * oldest first, the rest counted. Null when nothing in scope changed.
- */
-export interface CorrectionNotice {
-  /** Pass nothing back: Memchor remembers per session what it has told you. */
-  watermark: number;
-  changes: LifecycleChange[];
-  omitted: number;
-}
-
-const LISTED_CHANGES = 5;
-const REASON_CHARS = 200;
-
-export function changesSince(db: Db, workstreamId: string, since: number): CorrectionNotice | null {
-  const watermark = lifecycleWatermark(db);
-  if (watermark <= since) return null;
-  const inScope = `seq > $since AND (workstream_id = $workstreamId OR workstream_id IS NULL)`;
-  const rows = prepared(
-    db,
-    `SELECT record_id, action, replacement_id, reason, host, created_at FROM lifecycle_events WHERE ${inScope} ORDER BY seq LIMIT ${LISTED_CHANGES}`,
-  ).all({ since, workstreamId }) as { record_id: string; action: LifecycleChange["action"]; replacement_id: string | null; reason: string; host: string; created_at: string }[];
-  if (rows.length === 0) return null;
-  const total = (prepared(db, `SELECT count(*) AS n FROM lifecycle_events WHERE ${inScope}`).get({ since, workstreamId }) as { n: number }).n;
-  return {
-    watermark,
-    changes: rows.map((row) => ({
-      recordId: row.record_id,
-      action: row.action,
-      replacementId: row.replacement_id,
-      reason: row.reason.length <= REASON_CHARS ? row.reason : `${row.reason.slice(0, REASON_CHARS - 1)}…`,
-      host: row.host,
-      createdAt: row.created_at,
-    })),
-    omitted: total - rows.length,
-  };
-}
-
-// ── Inspection ──
-
-export interface HistoryEntry {
-  action: LifecycleChange["action"];
-  reason: string;
-  attribution: Attribution;
-  replacementId: string | null;
-  host: string;
-  sessionId: string | null;
-  createdAt: string;
-}
-
-export interface Related {
-  recordId: string;
-  relation: LinkRelation;
-  kind: RecordKind;
-  excerpt: string;
-  lifecycle: Lifecycle;
-  eligible: boolean;
-  createdAt: string;
-}
-
-export interface Inspection {
-  row: RecordRow;
-  lifecycle: Lifecycle;
-  eligible: boolean;
-  taints: { causeId: string; taint: Taint }[];
-  history: HistoryEntry[];
-  replacement: { recordId: string; kind: RecordKind; excerpt: string; lifecycle: Lifecycle; eligible: boolean } | null;
-  /** What the record rests on or restates (outgoing supported_by / derived_from). */
-  evidence: Related[];
-  /** Other versions of the same host event, and records it is loosely related to. */
-  conflicts: Related[];
-  /** Known downstream derivations (incoming derived_from / supported_by). */
-  derivations: (Related & { taint: Taint | null })[];
-  counts: { evidence: number; conflicts: number; derivations: number; history: number };
-}
-
-const INSPECT_LISTED = 20;
-const EXCERPT_CHARS = 300;
-
-/** Everything Memchor knows about one in-scope record, whatever its state. Read-only. */
-export function inspectRecord(db: Db, workstreamId: string, recordId: string): Inspection {
-  const row = requireInScopeRecord(db, workstreamId, recordId);
-  const taints = prepared(db, "SELECT cause_id AS causeId, taint FROM taints WHERE record_id = ? ORDER BY created_at, cause_id").all(row.id) as { causeId: string; taint: Taint }[];
-  const history = prepared(
-    db,
-    `SELECT action, reason, attribution, replacement_id AS replacementId, host, session_id AS sessionId, created_at AS createdAt
-     FROM lifecycle_events WHERE record_id = ? OR replacement_id = ? ORDER BY seq`,
-  ).all(row.id, row.id) as HistoryEntry[];
-
-  const params = { recordId: row.id, workstreamId };
-  const related = (sql: string): Related[] =>
-    (prepared(db, sql).all(params) as (Omit<Related, "eligible" | "excerpt"> & { body: string; tainted: number })[]).map(({ body, tainted, ...rest }) => ({
-      ...rest,
-      excerpt: excerpt(body),
-      eligible: rest.lifecycle === "active" && tainted === 0,
-    }));
-  const columns = `r.id AS recordId, r.kind, r.body, r.lifecycle, r.created_at AS createdAt, EXISTS (SELECT 1 FROM taints t WHERE t.record_id = r.id) AS tainted`;
-  const evidence = related(
-    `SELECT ${columns}, l.relation FROM links l JOIN records r ON r.id = l.to_id
-     WHERE l.from_id = $recordId AND l.relation IN ('supported_by', 'derived_from') AND ${IN_SCOPE_SQL} ORDER BY r.seq`,
-  );
-  const conflicts = related(
-    `SELECT ${columns}, 'related_to' AS relation FROM records r
-     WHERE r.id IN (SELECT o.record_id FROM import_events e JOIN import_events o ON o.host = e.host AND o.event_id = e.event_id
-                    WHERE e.record_id = $recordId AND o.record_id IS NOT NULL AND o.record_id <> $recordId)
-       AND ${IN_SCOPE_SQL}
-     UNION
-     SELECT ${columns}, l.relation FROM links l JOIN records r ON r.id = l.to_id WHERE l.from_id = $recordId AND l.relation = 'related_to' AND ${IN_SCOPE_SQL}
-     ORDER BY createdAt`,
-  );
-  const taintOf = prepared(db, "SELECT taint FROM taints WHERE record_id = ? AND cause_id = ?");
-  const derivations = related(
-    `SELECT ${columns}, l.relation FROM links l JOIN records r ON r.id = l.from_id
-     WHERE l.to_id = $recordId AND l.relation IN ('supported_by', 'derived_from') AND ${IN_SCOPE_SQL} ORDER BY r.seq`,
-  ).map((d) => ({ ...d, taint: ((taintOf.get(d.recordId, row.id) as { taint: Taint } | undefined)?.taint ?? null) }));
-
-  let replacement: Inspection["replacement"] = null;
-  if (row.superseded_by !== null) {
-    const next = prepared(db, "SELECT id, kind, body, lifecycle FROM records WHERE id = ?").get(row.superseded_by) as { id: string; kind: RecordKind; body: string; lifecycle: Lifecycle };
-    replacement = { recordId: next.id, kind: next.kind, excerpt: excerpt(next.body), lifecycle: next.lifecycle, eligible: isEligible(db, next) };
-  }
-  return {
-    row,
-    lifecycle: row.lifecycle,
-    eligible: row.lifecycle === "active" && taints.length === 0,
-    taints,
-    history: history.slice(-INSPECT_LISTED),
-    replacement,
-    evidence: evidence.slice(0, INSPECT_LISTED),
-    conflicts: conflicts.slice(0, INSPECT_LISTED),
-    derivations: derivations.slice(0, INSPECT_LISTED),
-    counts: { evidence: evidence.length, conflicts: conflicts.length, derivations: derivations.length, history: history.length },
-  };
-}
-
 // ── internals ──
 
 function ledgerEntry(action: LedgerEntry["action"], recordId: string, replacementId: string | null, actor: Actor, events: LedgerEntry["events"], at: string): LedgerEntry {
@@ -638,14 +507,10 @@ function restorable(db: Db, target: RecordRow, observation: readonly string[]): 
 /**
  * The target and its in-scope copies whose lifecycle passes `keep`: every record imported from
  * the same host event (host + event id, across transcripts and versions), which is also how
- * independent roots identify one observation. A record agents wrote directly is its own observation.
+ * independent roots identify one observation. A record agents wrote directly is its own
+ * observation. A null scope (ledger replay of a workspace-level record) sees workspace-level copies.
  */
-function sameObservation(db: Db, workstreamId: string, target: RecordRow, keep: (lifecycle: Lifecycle) => boolean): { records: string[]; events: { host: string; eventId: string }[] } {
-  return sameObservationIn(db, workstreamId, target, keep);
-}
-
-/** As {@link sameObservation}; a null scope (ledger replay of a workspace-level record) sees workspace-level copies. */
-function sameObservationIn(db: Db, workstreamId: string | null, target: RecordRow, keep: (lifecycle: Lifecycle) => boolean): { records: string[]; events: { host: string; eventId: string }[] } {
+function sameObservation(db: Db, workstreamId: string | null, target: RecordRow, keep: (lifecycle: Lifecycle) => boolean): { records: string[]; events: { host: string; eventId: string }[] } {
   const event = prepared(db, "SELECT host, event_id FROM import_events WHERE record_id = ? LIMIT 1").get(target.id) as { host: string; event_id: string } | undefined;
   if (event === undefined) return { records: [target.id], events: [] };
   const copies = (
@@ -665,7 +530,7 @@ function appendEvent(db: Db, entry: LedgerEntry, workstreamId: string | null, ac
     db,
     `INSERT INTO lifecycle_events (ledger_id, record_id, workstream_id, action, replacement_id, reason, attribution, session_id, host, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(entry.id, entry.recordId, workstreamId, entry.action, entry.replacementId, actor.reason, entry.attribution, actor.sessionId === "" ? null : actor.sessionId, entry.host, entry.at);
+  ).run(entry.id, entry.recordId, workstreamId, entry.action, entry.replacementId, actor.reason, entry.attribution, actor.sessionId, entry.host, entry.at);
   return Number(lastInsertRowid);
 }
 
@@ -695,18 +560,12 @@ function inScope(db: Db, scope: ChangeScope, ids: readonly string[]): { listed: 
   return { listed, elsewhere: ids.length - listed.length };
 }
 
-const PAST: Record<string, string> = { correct: "corrected", supersede: "superseded", retract: "retracted", restore: "restored", forget: "forgotten" };
-
-function lifecycleConflict(target: RecordRow, action: string): MemchorError {
+function lifecycleConflict(target: RecordRow, action: Action): MemchorError {
   const state =
     target.lifecycle === "active" ? "active" : target.lifecycle === "retracted" && action === "restore" ? "retracted, but not by memory_manage (it cannot be restored)" : target.lifecycle;
   return new MemchorError(
     "lifecycle_conflict",
-    `Record ${target.id} is ${state}, so it cannot be ${PAST[action] ?? action}${target.superseded_by === null ? "" : `; its replacement is ${target.superseded_by}`}. Inspect it with memory_manage.`,
+    `Record ${target.id} is ${state}, so it cannot be ${TRANSITIONS[action].past}${target.superseded_by === null ? "" : `; its replacement is ${target.superseded_by}`}. Inspect it with memory_manage.`,
     { details: { recordId: target.id, lifecycle: target.lifecycle, ...(target.superseded_by === null ? {} : { replacementId: target.superseded_by }) } },
   );
-}
-
-function excerpt(body: string): string {
-  return body.length <= EXCERPT_CHARS ? body : `${body.slice(0, EXCERPT_CHARS - 1)}…`;
 }

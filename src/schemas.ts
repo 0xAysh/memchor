@@ -23,8 +23,10 @@ export const LIMITS = {
   taskChars: 500,
   /** Host names longer than this are cut (they are labels, not identities). */
   hostChars: 100,
-  /** Why a claim was corrected, superseded, retracted or restored. */
+  /** Why a claim was corrected, superseded, retracted, restored or forgotten. */
   reasonChars: 1_000,
+  /** Records one forget preview may name (their copies come along). */
+  forgetTargets: 50,
   linksPerRecord: 20,
   externalRefsPerRecord: 10,
   checkpointListItems: 50,
@@ -79,7 +81,7 @@ export type Attribution = z.infer<typeof Attribution>;
  */
 export const ReviewState = z.enum(["unreviewed", "accepted", "disputed", "retracted"]);
 export type ReviewState = z.infer<typeof ReviewState>;
-export const WritableReviewState = z.enum(["unreviewed", "accepted", "disputed"]);
+export const WritableReviewState = ReviewState.exclude(["retracted"]);
 
 /** `supersedes` is written only by `memory_manage` (a correction or new version supersedes the old claim). */
 export const LinkRelation = z.enum(["supported_by", "derived_from", "references", "related_to"]);
@@ -201,7 +203,7 @@ export const RecordInput = z.strictObject({
     .describe("Pointers to code, documents, issues or URLs; never their content"),
   applicability: Applicability.default({}),
   testRun: TestRunInput.optional().describe(
-    "Only when this record reports a test/lint/build run you just did. Memchor stamps the commit and working-tree state it applies to. Cite the run's captured tool output with supportedBy if memory has it; otherwise the result is stored as your assertion, never as observed",
+    "Only when this record reports a test/lint/build run you just did (record it right after running). Memchor stamps the commit and working-tree state it applies to. Cite the run's captured tool output with supportedBy if memory has it; otherwise the result is stored as your assertion, never as observed",
   ),
   operationKey: OperationKey.optional(),
 });
@@ -277,7 +279,7 @@ export const ManageInput = z
         "inspect = state, history, evidence and derivations of a record (any state). correct = the claim was wrong: body is the corrected claim. supersede = it was right but is outdated: body is the new version. retract = it was wrong, with no replacement. restore = undo a retraction. forget_preview = what forgetting recordIds would remove (changes nothing). forget = remove it, with the preview's confirmToken, only after the user confirmed that preview.",
       ),
     recordId: RecordId.optional(),
-    recordIds: z.array(RecordId).min(1).max(50).optional().describe("forget_preview: the records to forget (find them with recall or inspect)"),
+    recordIds: z.array(RecordId).min(1).max(LIMITS.forgetTargets).optional().describe("forget_preview: the records to forget (find them with recall or inspect)"),
     confirmToken: z.string().min(1).max(4_096).optional().describe("forget: the confirmToken of the forget_preview the user confirmed"),
     body: z
       .string()

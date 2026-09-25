@@ -59,7 +59,9 @@ describe("forget", () => {
   });
 
   test("confirming removes the payload, chunks and links, keeps a tombstone, and takes dependents out of recall", () => {
-    const memory = open(initRepo(), tempDir());
+    const repo = initRepo();
+    const home = tempDir();
+    const memory = open(repo, home);
     const ids = scenario(memory);
     const dbPath = memory.status().storage.dbPath ?? "";
     const { confirmToken } = preview(memory, [ids.investigation]);
@@ -68,9 +70,14 @@ describe("forget", () => {
 
     expect(dump(dbPath)).not.toContain("acct_SECRET42");
     expect(dump(dbPath)).not.toContain("Old payment investigation");
-    const db = new Database(dbPath, { readonly: true });
+    const db = new Database(dbPath);
     try {
       expect(db.prepare(`SELECT count(*) AS n FROM chunks_fts WHERE chunks_fts MATCH '"stripe"'`).get()).toEqual({ n: 0 });
+      // The index itself no longer holds the terms (deleted entries were merged away), not just the matches.
+      db.exec("CREATE VIRTUAL TABLE temp.vocab USING fts5vocab(main, chunks_fts, 'row')");
+      const terms = (db.prepare("SELECT term FROM temp.vocab").all() as { term: string }[]).map((row) => row.term);
+      expect(terms).toContain("budget");
+      for (const term of ["stripe", "secret42", "payout", "acct"]) expect(terms).not.toContain(term);
       expect(db.prepare("SELECT count(*) AS n FROM links WHERE from_id = ? OR to_id = ?").get(ids.investigation, ids.investigation)).toEqual({ n: 0 });
       expect(db.prepare("SELECT lifecycle, body, title FROM records WHERE id = ?").get(ids.investigation)).toEqual({ lifecycle: "forgotten", body: "", title: null });
     } finally {
@@ -87,8 +94,15 @@ describe("forget", () => {
     expect(memory.recall().checkpoint).toBeNull();
     expect(memory.recall({ query: "latency budget" }).items.map((item) => item.recordId)).toEqual([ids.unrelated]);
 
-    memory.rebuildSearchIndex();
-    expect(memory.recall({ query: "stripe payouts investigation" }).items).toEqual([]);
+    // With every connection closed (the WAL folded back), no byte of the file holds the payload
+    // or its index terms: secure_delete zeroed freed pages and the FTS index was rewritten.
+    memory.close();
+    const raw = readFileSync(dbPath).toString("latin1").toLowerCase();
+    for (const term of ["acct_secret42", "secret42", "stripe connect", "stripe"]) expect(raw).not.toContain(term);
+
+    const reopened = open(repo, home);
+    reopened.rebuildSearchIndex();
+    expect(reopened.recall({ query: "stripe payouts investigation" }).items).toEqual([]);
   });
 
   test("forgetting needs the preview's token: none, a tampered one, another workspace's, or one whose impact changed are refused", () => {

@@ -16,20 +16,15 @@ import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integ
 import {
   type Affected,
   changeClaim,
-  changesSince,
   confirmForget,
-  type CorrectionNotice,
   type ForgetImpact,
   type ForgetTarget,
-  type HistoryEntry,
-  inspectRecord,
-  lifecycleWatermark,
   openWorkspaceDatabase,
   previewForget,
-  type Related,
   restoreClaim,
   type RestoreResult,
 } from "./integrity/lifecycle.js";
+import { changesSince, type CorrectionNotice, type HistoryEntry, inspectRecord, lifecycleWatermark, type Related } from "./integrity/lifecycle-views.js";
 import { hostDescriptor } from "./hosts.js";
 import type { TranscriptAdapter } from "./import/normalized-event.js";
 import { type ImportStatus, TranscriptImporter, unsupportedHostStatus } from "./import/reconcile.js";
@@ -52,7 +47,7 @@ import {
   sealContinuation,
   usage,
 } from "./retrieval/context-pack.js";
-import { isEligible, type Lifecycle, requireVisibleRecord, type RecordRow, type Taint } from "./retrieval/eligibility.js";
+import { eligibilityOf, type Lifecycle, requireVisibleRecord, type RecordRow, type Taint } from "./retrieval/eligibility.js";
 import {
   captureObservations,
   type CheckedRef,
@@ -102,7 +97,8 @@ export type { ImportCounters, ImportGap, ImportStatus } from "./import/reconcile
 export type { IntegrityReport } from "./storage/database.js";
 export type { CandidateSignal, ResolutionBasis, ScopeAmbiguity, WorkstreamCandidate } from "./bootstrap/workstream-resolution.js";
 export type { CheckpointSummary } from "./integrity/checkpoints.js";
-export type { Affected, CorrectionNotice, ForgetImpact, ForgetTarget, HistoryEntry, LifecycleChange, Related } from "./integrity/lifecycle.js";
+export type { Affected, ForgetImpact, ForgetTarget } from "./integrity/lifecycle.js";
+export type { CorrectionNotice, HistoryEntry, LifecycleChange, Related } from "./integrity/lifecycle-views.js";
 export type { Lifecycle, Taint } from "./retrieval/eligibility.js";
 
 // ───────────────────────────── Public interface ─────────────────────────────
@@ -326,6 +322,8 @@ export interface ReadResult {
   createdAt: string;
   /** The budget applies to `body` only. */
   budget: { maxTokens: number; maxBytes: number; usedTokens: number; usedBytes: number };
+  /** As in a pack: memory in scope that changed since this session last heard. */
+  corrections: CorrectionNotice | null;
 }
 
 /** One record as `memory_manage` inspect shows it, whatever its lifecycle. */
@@ -604,7 +602,7 @@ class LocalMemory implements Memory {
           applicability:
             parsed.testRun === undefined || ranAgainst === null
               ? applicability
-              : { ...applicability, testRun: { ...parsed.testRun, ...ranAgainst, evidence: capturedOutput(db, parsed.supportedBy) ? "captured" : "asserted" } },
+              : { ...applicability, testRun: { ...parsed.testRun, ...ranAgainst, evidence: capturedOutput(db, parsed.supportedBy, parsed.testRun) ? "captured" : "asserted" } },
           externalRefs,
           links,
         });
@@ -667,6 +665,8 @@ class LocalMemory implements Memory {
         const end = offset + body.length;
         const nextOffset = end < row.body.length ? end : null;
         const revision = db.prepare("SELECT revision FROM checkpoints WHERE record_id = ?").get(row.id) as { revision: number } | undefined;
+        const corrections = changesSince(db, scope.workstreamId, this.seenLifecycle);
+        if (corrections !== null) this.seenLifecycle = Math.max(this.seenLifecycle, corrections.watermark);
         const source = importedFrom(db, [row.id]).get(row.id) ?? null;
         const fields = recordFields(row);
         const checked = checkFreshness(scope.worktree, [freshnessSubject(row, source !== null)]).get(row.id);
@@ -692,6 +692,7 @@ class LocalMemory implements Memory {
           contentHash: row.content_hash,
           createdAt: row.created_at,
           budget: { ...budget, ...usage(Buffer.byteLength(body, "utf8")) },
+          corrections,
         };
       })();
     });
@@ -701,26 +702,37 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(ManageInput, input);
       const { db, scope } = this.bind();
-      const recordId = parsed.recordId ?? "";
+      // ManageInput's refinement guarantees each action's required fields; `given` restates that for the compiler.
       const action = parsed.action;
-      if (action === "inspect") return this.inspect(db, scope, recordId);
+      if (action === "inspect") return this.inspect(db, scope, given(parsed.recordId));
       const key = { secret: scope.continuationSecret, workspaceId: scope.workspaceId, workstreamId: scope.workstreamId };
       if (action === "forget_preview") {
-        const preview = db.transaction(() => previewForget(db, scope, key, parsed.recordIds ?? []))();
+        const recordIds = given(parsed.recordIds);
+        const preview = db.transaction(() => previewForget(db, scope, key, recordIds))();
         return { v: 1, action, ...preview, notice: FORGET_NOTICE };
       }
-      const actor = { sessionId: scope.sessionId, host: scope.host, attribution: parsed.attribution ?? "user_direction", reason: parsed.reason ?? "" };
+      const actor = { sessionId: scope.sessionId, host: scope.host, attribution: given(parsed.attribution), reason: given(parsed.reason) };
       const applicability = withHeadCommit({}, scope.worktree);
       const own = { onlyChange: false };
       const result = this.idempotent(db, scope, "manage", parsed, (): Unreplayed<Exclude<ManageResult, { action: "inspect" | "forget_preview" }>> => {
-        own.onlyChange = lifecycleWatermark(db) === this.seenLifecycle;
-        if (action === "restore") return { v: 1, action: "restore", ...restoreClaim(db, scope, { recordId, actor }) };
-        if (action === "forget") return { v: 1, action: "forget", ...confirmForget(db, scope, key, { confirmToken: parsed.confirmToken ?? "", actor }) };
-        const changed = changeClaim(db, scope, { action, recordId, ...(parsed.body === undefined ? {} : { body: parsed.body }), applicability, actor });
-        const { replacementId, ...rest } = changed;
-        return action === "retract" || replacementId === null ? { v: 1, action: "retract", ...rest } : { v: 1, action, ...rest, replacementId };
+        // Nothing in this scope changed since this session last heard: the change is news only to others.
+        own.onlyChange = changesSince(db, scope.workstreamId, this.seenLifecycle) === null;
+        switch (action) {
+          case "restore":
+            return { v: 1, action, ...restoreClaim(db, scope, { recordId: given(parsed.recordId), actor }) };
+          case "forget":
+            return { v: 1, action, ...confirmForget(db, scope, key, { confirmToken: given(parsed.confirmToken), actor }) };
+          case "retract": {
+            const changed = changeClaim(db, scope, { action, recordId: given(parsed.recordId), applicability, actor });
+            return { v: 1, action, recordId: changed.recordId, affected: changed.affected, watermark: changed.watermark };
+          }
+          case "correct":
+          case "supersede": {
+            const changed = changeClaim(db, scope, { action, recordId: given(parsed.recordId), body: given(parsed.body), applicability, actor });
+            return { v: 1, action, ...changed, replacementId: given(changed.replacementId) };
+          }
+        }
       });
-      // This session made the change itself; it needs no notice of it unless others came first.
       if (!result.replayed && own.onlyChange) this.seenLifecycle = result.watermark;
       return result;
     });
@@ -1211,19 +1223,22 @@ function freshnessSubject(row: RecordRow, imported: boolean): FreshnessSubject {
 }
 
 /**
- * Whether a test run's citations include output Memchor captured itself: a tool result imported
- * from the host's transcript. Anything else (the agent's own records) leaves the run an assertion.
+ * Whether a test run's citations include the run itself as Memchor captured it: a tool result
+ * imported from the host's transcript whose call summary (the first line of its body) contains
+ * the command, and whose error flag (" (error)" in the title the importer writes) agrees with
+ * the outcome. Anything else, including unrelated captured output, leaves the run an assertion.
  */
-function capturedOutput(db: Db, supportedBy: readonly string[]): boolean {
+function capturedOutput(db: Db, supportedBy: readonly string[], run: { command: string; outcome: "passed" | "failed" }): boolean {
   if (supportedBy.length === 0) return false;
-  return (
-    db
-      .prepare(
-        `SELECT 1 FROM records r JOIN import_events e ON e.record_id = r.id
-         WHERE r.id IN (SELECT value FROM json_each(?)) AND r.kind = 'evidence' AND r.attribution = 'direct_observation' LIMIT 1`,
-      )
-      .get(JSON.stringify(supportedBy)) !== undefined
-  );
+  const rows = db
+    .prepare(
+      `SELECT r.title, r.body FROM records r JOIN import_events e ON e.record_id = r.id
+       WHERE r.id IN (SELECT value FROM json_each(?)) AND r.kind = 'evidence' AND r.attribution = 'direct_observation'`,
+    )
+    .all(JSON.stringify(supportedBy)) as { title: string | null; body: string }[];
+  const squash = (text: string): string => text.replace(/\s+/gu, " ").trim();
+  const command = squash(run.command);
+  return rows.some((row) => squash(row.body.split("\n", 1)[0] ?? "").includes(command) && (row.title?.includes(" (error):") ?? false) === (run.outcome === "failed"));
 }
 
 /**
@@ -1248,10 +1263,9 @@ function loadHeadCheckpoint(db: Db, workstreamId: string): { row: RecordRow | nu
   const recordId = headCheckpointRecordId(db, workstreamId);
   if (recordId === null) return { row: null, withheld: null };
   const row = db.prepare("SELECT * FROM records WHERE id = ?").get(recordId) as RecordRow;
-  if (isEligible(db, row)) return { row, withheld: null };
-  if (row.lifecycle !== "active") return { row: null, withheld: row.lifecycle };
-  const taint = db.prepare("SELECT taint FROM taints WHERE record_id = ? ORDER BY taint LIMIT 1").get(recordId) as { taint: Taint };
-  return { row: null, withheld: taint.taint };
+  const state = eligibilityOf(db, row);
+  if (state.eligible) return { row, withheld: null };
+  return { row: null, withheld: state.taint === null ? row.lifecycle : state.taint.taint };
 }
 
 function scopeView(db: Db, scope: BoundScope): Scope {
@@ -1283,6 +1297,12 @@ function withHeadCommit(applicability: Applicability, worktree: string): Applica
   if (applicability.commit !== undefined) return applicability;
   const commit = headCommit(worktree);
   return commit === null ? applicability : { ...applicability, commit };
+}
+
+/** A value a schema refinement already guaranteed; its absence is a bug, never an input error. */
+function given<T>(value: T | null | undefined): T {
+  if (value === undefined || value === null) throw new Error("a field the schema requires is missing after parsing");
+  return value;
 }
 
 function parse<S extends z.ZodType>(schema: S, input: unknown): z.output<S> {

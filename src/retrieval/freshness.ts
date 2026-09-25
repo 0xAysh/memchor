@@ -221,15 +221,15 @@ export function freshnessFloor(refs: readonly StoredRef[], testRun?: StoredTestR
   return {
     freshness: "stale",
     externalRefs,
-    testRun: testRun === undefined ? null : { ...presentTestRun(testRun), applies: "stale", reason: "same_state" },
+    // The shortest real label: "stale"/"other_state" (current and unknown labels are longer).
+    testRun: testRun === undefined ? null : { ...presentTestRun(testRun), applies: "stale", reason: "other_state" },
     warning: externalRefs.some((ref) => !isLocalFile(ref)) ? FRESHNESS_WARNINGS.remote : null,
   };
 }
 
+/** The worktree fingerprint is Memchor's bookkeeping, not something an agent can use. */
 function presentTestRun(run: StoredTestRun): Omit<StoredTestRun, "worktree"> {
-  const view: Partial<StoredTestRun> = { ...run };
-  delete view.worktree;
-  return view as Omit<StoredTestRun, "worktree">;
+  return { command: run.command, outcome: run.outcome, ...(run.exitCode === undefined ? {} : { exitCode: run.exitCode }), commit: run.commit, evidence: run.evidence };
 }
 
 class Checker {

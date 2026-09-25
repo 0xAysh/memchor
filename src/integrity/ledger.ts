@@ -2,7 +2,7 @@ import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } f
 import { dirname, join } from "node:path";
 import { MemchorError } from "../errors.js";
 import type { Attribution } from "../schemas.js";
-import type { Db } from "../storage/database.js";
+import { type Db, requireTransaction } from "../storage/database.js";
 
 /**
  * The lifecycle ledger: `lifecycle.jsonl` next to a workspace's `memory.sqlite`, one line per
@@ -15,7 +15,8 @@ import type { Db } from "../storage/database.js";
  * retracted or forgotten after it was taken. Entries hold ids only, never content: the ledger
  * must not become a second copy of what the user asked Memchor to forget.
  *
- * An entry whose transaction then failed to commit (a crash at COMMIT) is re-applied on the next
+ * Entries are appended only after every effect of the change succeeded, so the only entry that
+ * can describe an uncommitted change is one whose COMMIT itself failed (a crash). It is re-applied on the next
  * open; the user asked for it, so erring towards applying it is the safe side. Replaying an entry
  * whose precondition no longer holds (already corrected) records it as applied and changes nothing.
  */
@@ -39,6 +40,7 @@ export function ledgerPath(db: Db): string {
 
 /** Appends one entry durably. Called inside the change's write transaction, so a failure rolls the change back. */
 export function appendLedger(db: Db, entry: LedgerEntry): void {
+  requireTransaction(db, "appendLedger");
   const path = ledgerPath(db);
   let fd: number | undefined;
   try {
