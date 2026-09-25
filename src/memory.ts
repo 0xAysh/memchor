@@ -13,8 +13,7 @@ import {
 import { headCommit, locateWorkspace, registerWorkspace, resolveHome, type WorkspaceLocation } from "./bootstrap/workspace-resolution.js";
 import { type ErrorCode, MemchorError } from "./errors.js";
 import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integrity/checkpoints.js";
-import { claudeCodeAdapter } from "./import/adapters/claude.js";
-import { codexAdapter } from "./import/adapters/codex.js";
+import { hostDescriptor } from "./hosts.js";
 import type { TranscriptAdapter } from "./import/normalized-event.js";
 import { type ImportStatus, TranscriptImporter, unsupportedHostStatus } from "./import/reconcile.js";
 import { type Citation, citationsFor, importedFrom, type ImportedSource, independentRoots, linksOf } from "./integrity/provenance.js";
@@ -403,18 +402,6 @@ export function openMemory(options: OpenMemoryOptions): Memory {
 
 // ───────────────────────────── Implementation ─────────────────────────────
 
-/** The host's transcript format, or null for a host Memchor cannot import from (e.g. "pi", "unknown"). */
-function transcriptAdapterFor(host: string, options: OpenMemoryOptions): TranscriptAdapter | null {
-  switch (host) {
-    case "claude-code":
-      return claudeCodeAdapter(options.claudeConfigDir === undefined ? {} : { configDir: options.claudeConfigDir });
-    case "codex":
-      return codexAdapter(options.codexHome === undefined ? {} : { codexHome: options.codexHome });
-    default:
-      return null;
-  }
-}
-
 const OPERATIONS = Object.keys(OPERATION_SCHEMAS);
 const DEFAULT_IMPORT_BUDGET_MS = 3_000;
 
@@ -441,7 +428,7 @@ class LocalMemory implements Memory {
     this.home = resolveHome(options.home);
     this.busyTimeoutMs = options.busyTimeoutMs;
     this.hostSessionId = options.hostSessionId;
-    const adapter = options.transcriptAdapter ?? transcriptAdapterFor(this.host, options);
+    const adapter = options.transcriptAdapter ?? hostDescriptor(this.host)?.transcripts?.(options) ?? null;
     this.importer =
       adapter === null
         ? null

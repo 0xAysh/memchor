@@ -16,7 +16,7 @@ memchor mcp (src/transports/mcp.ts)   memchor diag (src/cli.ts)
   one SQLite file per workspace (WAL, FTS5)
 ```
 
-The adapters contain no memory policy. `openMemory` picks the transcript adapter by host (`claude-code` → Claude Code, `codex` → Codex, anything else → none). The MCP server forwards raw tool arguments to the module. The module parses them with the zod schemas in `src/schemas.ts`, which are also the source of the tools' JSON Schemas. Each `MemchorError` becomes `isError: true` with `{ error: { code, message, retryable, details } }`.
+The adapters contain no memory policy. Host differences outside the transcript format live in one descriptor table, `src/hosts.ts`: `openMemory` picks the transcript adapter from it (`claude-code` → Claude Code, `codex` → Codex, anything else → none), the MCP server the `_meta` key that names a live session (Codex: `threadId`; an id longer than 200 characters is ignored, never cut), and the CLI its `--host` choices. The MCP server forwards raw tool arguments to the module. The module parses them with the zod schemas in `src/schemas.ts`, which are also the source of the tools' JSON Schemas. Each `MemchorError` becomes `isError: true` with `{ error: { code, message, retryable, details } }`.
 
 ## Memory module interface
 

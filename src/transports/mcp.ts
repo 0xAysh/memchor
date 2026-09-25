@@ -7,8 +7,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { MemchorError } from "../errors.js";
+import { hostDescriptor } from "../hosts.js";
 import { type Memory, openMemory } from "../memory.js";
-import { OPERATION_SCHEMAS, type OperationName } from "../schemas.js";
+import { LIMITS, OPERATION_SCHEMAS, type OperationName } from "../schemas.js";
 
 /**
  * Thin MCP adapter over the memory module. It holds no memory policy: it forwards raw
@@ -78,18 +79,16 @@ const TOOL_LIST = (Object.keys(OPERATION_SCHEMAS) as OperationName[]).map((name)
 const isOperation = (name: string): name is OperationName => Object.hasOwn(OPERATION_SCHEMAS, name);
 
 /**
- * The `tools/call` `_meta` key through which a host names its own session. Codex sends
- * `threadId` on every call, and it equals the id of the thread's rollout (`session_meta.id`), so
- * it is authoritative: adopting it as the host session id makes the live session and the
- * thread's imported rollout the same session for workstream resolution (step 1). `initialize`
- * carries no such id. Hosts not listed here (Claude Code sends none) are unaffected.
+ * The host's own session id from a `tools/call` `_meta`, under the key its descriptor names
+ * (src/hosts.ts). An id longer than a host session id may be is ignored rather than cut: a
+ * prefix is a different identity, and two threads sharing one would be bound as one session.
  */
-const SESSION_META_KEY: Readonly<Record<string, string>> = { codex: "threadId" };
-
 function hostSessionFromMeta(host: string | undefined, meta: Record<string, unknown> | undefined): string | undefined {
-  const key = host === undefined ? undefined : SESSION_META_KEY[host];
-  const value = key === undefined ? undefined : meta?.[key];
-  return typeof value === "string" && value.trim() !== "" ? value.trim().slice(0, 200) : undefined;
+  const key = hostDescriptor(host)?.sessionMetaKey ?? null;
+  const value = key === null ? undefined : meta?.[key];
+  if (typeof value !== "string") return undefined;
+  const id = value.trim();
+  return id !== "" && id.length <= LIMITS.hostSessionIdChars ? id : undefined;
 }
 
 /** One background import step, and the pause between steps that lets requests through. */
