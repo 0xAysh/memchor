@@ -52,6 +52,10 @@ async function main(argv: string[]): Promise<number> {
     const home = values["temp-home"] === true ? mkdtempSync(join(tmpdir(), "memchor-demo-")) : resolveHome(undefined);
     // Transcript commands act as the host whose history they manage; the rest as a diagnostic tool.
     const transcripts = subcommand === "consent" || subcommand === "import";
+    // A host that cannot import would only report "unsupported" for a mistyped name.
+    if (transcripts && values.host !== undefined && !(TRANSCRIPT_HOSTS as string[]).includes(values.host)) {
+      return usage(`--host must be one of ${TRANSCRIPT_HOSTS.join(", ")} (got ${values.host})`);
+    }
     const host = values.host ?? (transcripts ? "claude-code" : "memchor-diag");
     if (values.set !== undefined && !IMPORT_CHOICES.includes(values.set as ImportChoice)) return usage(`--set must be one of ${IMPORT_CHOICES.join(", ")}`);
     const memory = openMemory({ cwd: process.cwd(), host, home });

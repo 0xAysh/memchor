@@ -99,6 +99,21 @@ describe("memchor CLI", () => {
     expect(memchor(initRepo(), tempDir(), "bogus").code).toBe(64);
   });
 
+  test("transcript commands accept only a host whose transcripts Memchor can import", () => {
+    const repo = initRepo();
+    const home = tempDir();
+    for (const host of ["bogus", "pi", "unknown"]) {
+      for (const subcommand of ["consent", "import"]) {
+        const run = memchor(repo, home, "diag", subcommand, "--host", host);
+        expect(run.code).toBe(64);
+        expect(run.stderr).toContain(`memchor: --host must be one of claude-code, codex (got ${host})`);
+      }
+    }
+    const codex = memchor(repo, home, "diag", "consent", "--host", "codex");
+    expect(codex.code).toBe(0);
+    expect(JSON.parse(codex.stdout)).toMatchObject({ consent: null });
+  });
+
   test("the MCP server closes and exits cleanly on SIGTERM", async () => {
     const child = spawn(process.execPath, [CLI, "mcp"], {
       cwd: initRepo(),
