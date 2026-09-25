@@ -37,25 +37,24 @@ const MAX_TAINTED = 10_000;
 const CHECKPOINT_SCAN = 1_000;
 
 /**
- * Taints everything that depends on `roots` (the cause and its copies) with `causeId`, and
- * returns each tainted record with its kind. Call inside the lifecycle change's transaction.
+ * Everything that depends on `roots` (a claim and its copies) and how, without writing:
+ * `forget_preview` shows this before anything changes. Records in `exclude` (the roots, and
+ * everything else a forget removes) are never listed.
  */
-export function taintDependents(db: Db, causeId: string, roots: readonly string[], mode: Propagation, now: string): Map<string, Taint> {
-  requireTransaction(db, "taintDependents");
+export function findDependents(db: Db, roots: readonly string[], mode: Propagation, exclude: ReadonlySet<string> = new Set(roots)): Map<string, Taint> {
   const relations = mode === "outdated" ? ["derived_from"] : ["derived_from", "supported_by"];
   const incoming = prepared(
     db,
     `SELECT from_id, to_id, relation FROM links WHERE to_id IN (SELECT value FROM json_each($ids)) AND relation IN (SELECT value FROM json_each($relations))
      ORDER BY CASE relation WHEN 'derived_from' THEN 0 ELSE 1 END, from_id`,
   );
-  const rootSet = new Set(roots);
   const tainted = new Map<string, Taint>();
-  let frontier = [...rootSet];
+  let frontier = [...new Set(roots)];
   for (let depth = 0; depth < MAX_DEPTH && frontier.length > 0 && tainted.size < MAX_TAINTED; depth++) {
     const rows = incoming.all({ ids: JSON.stringify(frontier), relations: JSON.stringify(relations) }) as { from_id: string; to_id: string; relation: string }[];
     frontier = [];
     for (const row of rows) {
-      if (rootSet.has(row.from_id)) continue;
+      if (exclude.has(row.from_id)) continue;
       // Restating a quarantined conclusion is quarantined, not invalidated: the conclusion itself was never shown wrong.
       const kind: Taint = row.relation === "derived_from" ? (tainted.get(row.to_id) ?? "invalidated") : "quarantined";
       const previous = tainted.get(row.from_id);
@@ -67,15 +66,19 @@ export function taintDependents(db: Db, causeId: string, roots: readonly string[
       }
     }
   }
-  if (mode !== "outdated") for (const id of withoutLineage(db, roots)) if (!rootSet.has(id) && !tainted.has(id)) tainted.set(id, "quarantined");
+  if (mode !== "outdated") for (const id of withoutLineage(db, roots)) if (!exclude.has(id) && !tainted.has(id)) tainted.set(id, "quarantined");
+  return tainted;
+}
 
+/** Writes {@link findDependents}' result as taints caused by `causeId`. Call inside the change's transaction. */
+export function insertTaints(db: Db, causeId: string, tainted: ReadonlyMap<string, Taint>, now: string): void {
+  requireTransaction(db, "insertTaints");
   const insert = prepared(
     db,
     `INSERT INTO taints (record_id, cause_id, taint, created_at) VALUES (?, ?, ?, ?)
      ON CONFLICT (record_id, cause_id) DO UPDATE SET taint = 'invalidated' WHERE excluded.taint = 'invalidated'`,
   );
   for (const [id, kind] of tainted) insert.run(id, causeId, kind, now);
-  return tainted;
 }
 
 /**
@@ -110,7 +113,7 @@ function withoutLineage(db: Db, roots: readonly string[]): string[] {
 /**
  * Gives a newly imported record the state of what it copies or rests on (the importer's
  * `lineage: "inherit"`): a link to a claim that is no longer active, or to a tainted record,
- * taints the new record by the same rules as {@link taintDependents}.
+ * taints the new record by the same rules as {@link findDependents}.
  */
 export function inheritTaints(db: Db, recordId: string, links: readonly Citation[], now: string): void {
   requireTransaction(db, "inheritTaints");

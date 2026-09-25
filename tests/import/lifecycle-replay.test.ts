@@ -106,3 +106,51 @@ describe("corrections survive transcript reconciliation", () => {
     expect(item?.copies.length).toBe(1);
   });
 });
+
+describe("forgetting imported memory", () => {
+  test("a forgotten tool result loses its output and its call's summary, and no re-import brings either back", () => {
+    const repo = initRepo({ branch: "fix/double-charge" });
+    const home = tempDir();
+    const config = claudeConfigDir();
+    installTranscript(config, "2.1.281/basic.jsonl", { cwd: repo, sessionId: "5e550000-0000-4000-8000-0000000000aa" });
+    const memory = open(repo, home, config);
+    memory.bootstrap({ importChoice: "current_project" });
+    const result = memory.recall({ query: "retries 504 idempotency key charged twice" }).items.find((item) => item.attribution === "direct_observation" && item.excerpt.includes("charged twice"));
+    if (result === undefined) throw new Error("tool result not imported");
+    const dbPath = memory.status().storage.dbPath ?? "";
+    expect(dumpDb(dbPath)).toContain("npm test -- gateway");
+
+    const preview = memory.manage({ action: "forget_preview", recordIds: [result.recordId] });
+    if (preview.action !== "forget_preview") throw new Error("unreachable");
+    expect(preview.impact.suppressedEvents).toBe(2); // the result and its call
+    memory.manage({ action: "forget", confirmToken: preview.confirmToken, reason: "Forget the failing test run.", attribution: "user_direction" });
+    for (const text of ["charged twice", "npm test -- gateway"]) expect(dumpDb(dbPath)).not.toContain(text);
+
+    // A cursor reset and a /branch copy both replay the same events.
+    memory.close();
+    const db = new Database(dbPath);
+    db.exec("DELETE FROM import_cursors");
+    db.close();
+    installTranscript(config, "2.1.281/basic.jsonl", { cwd: repo, sessionId: "5e550000-0000-4000-8000-0000000000bb" });
+    const again = open(repo, home, config);
+    again.bootstrap();
+    for (const text of ["charged twice", "npm test -- gateway"]) expect(dumpDb(dbPath)).not.toContain(text);
+    expect(again.recall({ query: "retries 504 idempotency key charged twice" }).items.filter((item) => item.excerpt.includes("charged twice"))).toEqual([]);
+    again.close();
+    // With every connection closed, the WAL is folded back: the file itself holds no trace of the payload.
+    const raw = readFileSync(dbPath).toString("latin1");
+    expect(raw).not.toContain("charged twice");
+    expect(raw).not.toContain("npm test -- gateway");
+  });
+});
+
+/** Every row of every canonical table (the FTS shadow tables hold only index structures). */
+function dumpDb(dbPath: string): string {
+  const db = new Database(dbPath, { readonly: true });
+  try {
+    const tables = (db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'chunks_fts%'").all() as { name: string }[]).map((t) => t.name);
+    return tables.map((table) => JSON.stringify(db.prepare(`SELECT * FROM "${table}"`).all())).join("\n");
+  } finally {
+    db.close();
+  }
+}

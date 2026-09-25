@@ -8,7 +8,8 @@ import { quarantineLateSummary, suppressedEvent } from "../integrity/taints.js";
 import { restatable, restates } from "../integrity/restatement.js";
 import { IN_SCOPE_SQL } from "../retrieval/eligibility.js";
 import { type ExternalRef, IMPORT_CHOICES, type ImportChoice } from "../schemas.js";
-import { type Db, openDatabase, prepared, toStorageError, writeTransaction } from "../storage/database.js";
+import { openWorkspaceDatabase } from "../integrity/lifecycle.js";
+import { type Db, prepared, toStorageError, writeTransaction } from "../storage/database.js";
 import { appendRecord } from "../storage/records.js";
 import { approves, type Consent, readConsent, writeConsent } from "./consent.js";
 import type { CompatibilityRow, ExclusionReason, NormalizedEvent, ToolKind, TranscriptAdapter, TranscriptFile } from "./normalized-event.js";
@@ -351,7 +352,7 @@ export class TranscriptImporter {
     let db = this.others.get(location.workspaceId);
     if (db === undefined) {
       registerWorkspace(location);
-      db = openDatabase(location.dbPath, this.options.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: this.options.busyTimeoutMs });
+      db = openWorkspaceDatabase(location.dbPath, this.options.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: this.options.busyTimeoutMs });
       this.others.set(location.workspaceId, db);
     }
     return db;
@@ -739,9 +740,10 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
       if (same.disposition === "echo") rememberEcho(batch, event.branch, (JSON.parse(same.meta) as { references?: string[] }).references ?? []);
       continue;
     }
-    if (event.type !== "tool_call" && suppressedEvent(db, batch.host, event.eventId)) {
+    if (suppressedEvent(db, batch.host, event.eventId)) {
       // A copy (a /branch transcript) or new version of an event whose claim was corrected,
-      // retracted or forgotten: importing it would resurrect that claim.
+      // retracted or forgotten (for a forgotten tool result, its call too): importing it would
+      // resurrect that claim.
       batch.counters.suppressed++;
       continue;
     }

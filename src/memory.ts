@@ -17,10 +17,15 @@ import {
   type Affected,
   changeClaim,
   changesSince,
+  confirmForget,
   type CorrectionNotice,
+  type ForgetImpact,
+  type ForgetTarget,
   type HistoryEntry,
   inspectRecord,
   lifecycleWatermark,
+  openWorkspaceDatabase,
+  previewForget,
   type Related,
   restoreClaim,
   type RestoreResult,
@@ -73,7 +78,6 @@ import {
   checkIntegrity,
   type Db,
   type IntegrityReport,
-  openDatabase,
   openReadOnly,
   probeRuntime,
   type RuntimeReport,
@@ -89,7 +93,7 @@ export type { ImportCounters, ImportGap, ImportStatus } from "./import/reconcile
 export type { IntegrityReport } from "./storage/database.js";
 export type { CandidateSignal, ResolutionBasis, ScopeAmbiguity, WorkstreamCandidate } from "./bootstrap/workstream-resolution.js";
 export type { CheckpointSummary } from "./integrity/checkpoints.js";
-export type { Affected, CorrectionNotice, HistoryEntry, LifecycleChange, Related } from "./integrity/lifecycle.js";
+export type { Affected, CorrectionNotice, ForgetImpact, ForgetTarget, HistoryEntry, LifecycleChange, Related } from "./integrity/lifecycle.js";
 export type { Lifecycle, Taint } from "./retrieval/eligibility.js";
 
 // ───────────────────────────── Public interface ─────────────────────────────
@@ -356,7 +360,19 @@ export type ManageResult =
   | { v: 1; action: "correct"; recordId: string; replacementId: string; affected: Affected; watermark: number; replayed: boolean }
   | { v: 1; action: "supersede"; recordId: string; replacementId: string; affected: Affected; watermark: number; replayed: boolean }
   | { v: 1; action: "retract"; recordId: string; affected: Affected; watermark: number; replayed: boolean }
-  | { v: 1; action: "restore"; recordId: string; affected: RestoreResult["affected"]; watermark: number; replayed: boolean };
+  | { v: 1; action: "restore"; recordId: string; affected: RestoreResult["affected"]; watermark: number; replayed: boolean }
+  | {
+      v: 1;
+      action: "forget_preview";
+      /** The records named, as they are now. */
+      targets: ForgetTarget[];
+      impact: ForgetImpact;
+      /** Pass to `forget` only after the user confirmed this impact; it is refused if the impact changes. */
+      confirmToken: string;
+      expiresAt: string;
+      notice: string;
+    }
+  | { v: 1; action: "forget"; forgotten: string[]; affected: Affected; watermark: number; replayed: boolean };
 
 export interface StatusScope {
   workspaceId: string;
@@ -487,6 +503,8 @@ const OPERATIONS = Object.keys(OPERATION_SCHEMAS);
 /** A result before `idempotent` adds `replayed` (distributes over union members). */
 type Unreplayed<T> = T extends unknown ? Omit<T, "replayed"> : never;
 const INSPECT_BODY_BYTES = 4_096;
+const FORGET_NOTICE =
+  "Nothing has been removed yet. Show the user the targets and the impact, and ask them to confirm explicitly; only then call memory_manage with action forget and this confirmToken. Forgetting cannot be undone. Records listed as invalidated or quarantined keep their own content (forget them too if the user wants). Host transcripts, loaded model contexts, exports and backups are not erased.";
 const DEFAULT_IMPORT_BUDGET_MS = 3_000;
 
 interface Bound {
@@ -665,16 +683,24 @@ class LocalMemory implements Memory {
       const recordId = parsed.recordId ?? "";
       const action = parsed.action;
       if (action === "inspect") return this.inspect(db, scope, recordId);
+      const key = { secret: scope.continuationSecret, workspaceId: scope.workspaceId, workstreamId: scope.workstreamId };
+      if (action === "forget_preview") {
+        const preview = db.transaction(() => previewForget(db, scope, key, parsed.recordIds ?? []))();
+        return { v: 1, action, ...preview, notice: FORGET_NOTICE };
+      }
       const actor = { sessionId: scope.sessionId, host: scope.host, attribution: parsed.attribution ?? "user_direction", reason: parsed.reason ?? "" };
       const applicability = withHeadCommit({}, scope.worktree);
-      const result = this.idempotent(db, scope, "manage", parsed, (): Unreplayed<Exclude<ManageResult, { action: "inspect" }>> => {
+      const own = { onlyChange: false };
+      const result = this.idempotent(db, scope, "manage", parsed, (): Unreplayed<Exclude<ManageResult, { action: "inspect" | "forget_preview" }>> => {
+        own.onlyChange = lifecycleWatermark(db) === this.seenLifecycle;
         if (action === "restore") return { v: 1, action: "restore", ...restoreClaim(db, scope, { recordId, actor }) };
+        if (action === "forget") return { v: 1, action: "forget", ...confirmForget(db, scope, key, { confirmToken: parsed.confirmToken ?? "", actor }) };
         const changed = changeClaim(db, scope, { action, recordId, ...(parsed.body === undefined ? {} : { body: parsed.body }), applicability, actor });
         const { replacementId, ...rest } = changed;
         return action === "retract" || replacementId === null ? { v: 1, action: "retract", ...rest } : { v: 1, action, ...rest, replacementId };
       });
       // This session made the change itself; it needs no notice of it unless others came first.
-      if (!result.replayed && result.watermark === this.seenLifecycle + 1) this.seenLifecycle = result.watermark;
+      if (!result.replayed && own.onlyChange) this.seenLifecycle = result.watermark;
       return result;
     });
   }
@@ -803,7 +829,7 @@ class LocalMemory implements Memory {
     }
     const location = locateWorkspace(this.cwd, this.home);
     registerWorkspace(location);
-    const db = openDatabase(location.dbPath, this.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: this.busyTimeoutMs });
+    const db = openWorkspaceDatabase(location.dbPath, this.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: this.busyTimeoutMs });
     try {
       const scope = bindScope(db, location, { host: this.host, hostSessionId: this.hostSessionId }, hints);
       // A new session starts from current memory; only later changes are news to it.
@@ -1014,7 +1040,7 @@ class LocalMemory implements Memory {
         const withheld =
           head.withheld === null
             ? null
-            : `The head checkpoint r${view.headRevision} is ${head.withheld} (it rests on or repeats memory that is no longer current), so it is not returned. Use what remains, then publish a new checkpoint with expectedRevision ${view.headRevision}.`;
+            : `The head checkpoint r${view.headRevision} ${head.withheld === "quarantined" || head.withheld === "invalidated" ? `is ${head.withheld} (it rests on or repeats memory that is no longer current)` : `was ${head.withheld}`}, so it is not returned. Use what remains, then publish a new checkpoint with expectedRevision ${view.headRevision}.`;
         if (starved) {
           notice = "This budget is too small for even the pack's scope and envelope, so nothing was returned. Recall again with a larger maxBytes/maxTokens.";
         } else if (empty && withheld !== null) {

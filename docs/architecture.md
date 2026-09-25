@@ -30,7 +30,7 @@ The adapters contain no memory policy. Host differences outside the transcript f
 | `checkpoint({expectedRevision, goal, status, …})` | Appends revision `expectedRevision + 1` only if the head still equals `expectedRevision` |
 | `recall({query?, kinds?, maxTokens?, maxBytes?, continuation?})` | A bounded pack: head checkpoint first, then ranked eligible items, each with live freshness, provenance, independent root and corroboration (see [Recall applicability](#recall-applicability)), plus `corrections` when memory in scope changed since this session's previous pack |
 | `read({recordId, maxTokens?, maxBytes?, offset?})` | A slice of one visible record's body, with its visible links, live freshness and independent root. Offsets count UTF-16 code units; an offset inside a surrogate pair snaps back to that code point's start. A record that is no longer current is `not_found` with its `lifecycle`, `replacementId` or `taint` |
-| `manage({v?, action, recordId, body?, reason?, attribution?, operationKey?})` | `inspect` \| `correct` \| `supersede` \| `retract` \| `restore` one in-scope claim (see [Memory lifecycle](#memory-lifecycle)). Each change is one transaction; the result lists what it took out of (or back into) current guidance |
+| `manage({v?, action, recordId?, recordIds?, confirmToken?, body?, reason?, attribution?, operationKey?})` | `inspect` \| `correct` \| `supersede` \| `retract` \| `restore` one in-scope claim, or `forget_preview` then `forget` (see [Memory lifecycle](#memory-lifecycle)). Each change is one transaction; the result lists what it took out of (or back into) current guidance |
 | `status()` | Runtime, storage, the scope bootstrap *would* resolve (`workstreamId`, `resolvedBy`, `taskKey`, or the `ambiguity` it would ask), and counts. It runs the same resolution rules as bootstrap without their writes (`previewWorkstream`); after a repository move it reports no resolution until bootstrap re-points the bindings, and none while a schema migration is pending (the next bootstrap migrates). Strictly read-only: no registry entry, rows or migrations. Never throws for scope or storage problems |
 | `rebuildSearchIndex()` | Regenerates the derived index inside one write transaction |
 | `checkIntegrity()` | Read-only `integrity_check`, `foreign_key_check` and FTS index-vs-content check. It reports a damaged, foreign or unmigrated file and never repairs or migrates it |
@@ -84,7 +84,7 @@ The agent shows `question`, then calls `bootstrap({workstream})`. That choice be
 | `links` | Provenance (`supported_by`, `derived_from`, `supersedes`, …) | Both ends visible to the writer's workstream at write time (the importer's lineage links need only be in scope) |
 | `taints` (v5) | Why an active record is not current: (record, cause, `invalidated` \| `quarantined`) | One row per cause; the record is eligible again only when every cause is gone |
 | `lifecycle_events` (v5) | Append-only audit of every lifecycle change | `seq` is the correction watermark |
-| `suppressions` (v5) | Host events (host + event id) whose claim is no longer active | The importer skips new copies and versions of them |
+| `suppressions` (v5) | Host events (host + event id) whose claim is no longer active | The importer skips new copies and versions of them. No foreign keys: markers outlive the rows they name |
 | `workstreams` | Label, lifecycle, `head_revision`, `task_key`, `branch` (v4) | The head only moves inside the CAS transaction; `branch` (last seen) is evidence, never identity |
 | `checkpoints` | Revision history | `PRIMARY KEY (workstream_id, revision)` backs the CAS |
 | `operations` | Idempotency keys | The hash covers operation + workstream + normalised input |
@@ -103,7 +103,7 @@ Every write is one `BEGIN IMMEDIATE` transaction, so it never upgrades from read
 
 - **`record`**: look up the operation key → insert the record → insert links (each target scope-checked) → insert chunks and FTS rows → insert the operation row.
 - **`checkpoint`**: look up the operation key (a replay wins over a conflict) → compare the head with `expectedRevision` → append the checkpoint record, its links and chunks → insert the `checkpoints` row → conditionally update `head_revision`.
-- **`manage`** (a change): look up the operation key → check the claim is `active` (else `lifecycle_conflict`) → append the replacement with its `supersedes` link → set the lifecycle of the claim and its copies → insert taints → insert suppressions → append the `lifecycle_events` row.
+- **`manage`** (a change): look up the operation key → check the claim's state (else `lifecycle_conflict`; for forget, the preview's impact) → append the replacement with its `supersedes` link → find dependents → insert taints → (forget: remove the payload) → set the lifecycle of the claim and its copies → insert or release suppressions → append the `lifecycle_events` row → append the ledger entry.
 
 **Reads.** Recall reads in one deferred transaction, so the head, candidates and citations share a snapshot. Scope and eligibility sit in the WHERE clause, ahead of bm25 ranking. Ties are broken by `created_at DESC, seq DESC`. Query words are individually quoted, so FTS syntax cannot be injected.
 
@@ -233,6 +233,7 @@ Transcripts whose cwd is gone or not in Git are counted as `unassigned`. `all pr
   active ──────  supersede ─▶ superseded right then, outdated now; a same-kind record replaces it
     ▲            retract ──▶ retracted  wrong; withdrawn without a replacement
     └── restore ◀────────────┘           only a retraction made here; removes exactly its own taints and suppressions
+  any state but forgotten ── forget_preview → user confirms → forget ──▶ forgotten   payload removed; final
 ```
 
 `review_state` stays the review axis (unreviewed / accepted / disputed); `record` no longer accepts `retracted`. Records the v3 migration retracted become `lifecycle = 'retracted'` and can never be restored.
@@ -251,9 +252,13 @@ Transcripts whose cwd is gone or not in Git are counted as `unassigned`. `all pr
 
 **Correction watermark.** Each change appends a `lifecycle_events` row. A Memory instance (one host session) starts at the current watermark; its next pack carries `corrections: { watermark, changes (≤ 5, oldest first), omitted }` for changes in its scope since, then advances. The notice is part of the budgeted envelope. A session is not told about its own change unless other changes came first.
 
+**Forget** is the one change that deletes. `forget_preview({recordIds ≤ 50})` is read-only: it lists the targets (with excerpts), every copy of the same host event, the records that will be invalidated or quarantined (their own content is kept, and the preview says so), and how many links, search chunks and host events are affected, plus a `confirmToken`: an HMAC over the ids, a digest of that impact and a 30-minute expiry, bound to the workspace and workstream. `forget({confirmToken, reason, attribution})` recomputes the impact and refuses with `invalid_input` (`preview_outdated`) if it differs, so what the user confirmed is what happens. Then, in one transaction: taints; the FTS entries are deleted and the index is optimized; chunks and links are deleted; title, body, references, applicability and content hash are blanked; the reasons of the record's earlier lifecycle changes (they may quote it) and, for a tool result, its call's summary in `import_events` become `[forgotten]`; the result and call events are suppressed. What stays is a tombstone: id, kind, host, times, provenance ids, lifecycle `forgotten`. Connections run with `secure_delete = ON`, so freed pages are zeroed; `tests/import/lifecycle-replay.test.ts` checks the database file itself.
+
+**Ledger and restore.** Every change is also appended (fsynced, inside its transaction) to `$MEMCHOR_HOME/workspaces/<id>/lifecycle.jsonl`: ids, action, attribution, host, the host events, time. Never content. The one supported restore procedure is putting an older copy of `memory.sqlite` back (removing its `-wal`/`-shm`). Every workspace open (`openWorkspaceDatabase`, used by sessions and the importer) re-applies the ledger entries the database lacks, in order, with the same effects code live changes use, and an audit reason saying so. A record the copy never had still gets its host events suppressed, so a later import cannot bring it back. The check is lock-free when nothing is missing; a gap takes the write lock and re-reads, so a change still committing in another process is never applied twice.
+
 **Inspect** returns any in-scope record whatever its state: body (≤ 4 KB), lifecycle, `eligible`, taints with causes, live freshness, source, `history` (its lifecycle events), `replacement`, `evidence` (what it rests on or restates), `conflicts` (other versions of the same event, `related_to` records) and `derivations` (incoming `derived_from`/`supported_by`, with the taint it put on each), each list ≤ 20 with totals in `counts`.
 
-Known limits: a claim already in a model's context, in a host transcript, or in an export or backup is not erased; a running session hears of a change only on its next pack. A paraphrase in a checkpoint or summary, or an uncited agent record repeating the claim, is not found (verbatim only). Copies in another workstream are not changed, though their host event is suppressed for the whole workspace.
+Known limits: forgetting is not forensic erasure. A claim already in a model's context, in a host transcript, in WAL frames not yet checkpointed, or in an export or backup is not erased. Deleting `lifecycle.jsonl` removes the restore protection; a running session hears of a change only on its next pack. A paraphrase in a checkpoint or summary, or an uncited agent record repeating the claim, is not found (verbatim only). Copies in another workstream are not changed, though their host event is suppressed for the whole workspace.
 
 ## Handoff
 

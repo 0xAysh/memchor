@@ -239,7 +239,7 @@ export type ReadInput = z.input<typeof ReadInput>;
 export const StatusInput = z.strictObject({});
 export type StatusInput = z.input<typeof StatusInput>;
 
-export const MANAGE_ACTIONS = ["inspect", "correct", "supersede", "retract", "restore"] as const;
+export const MANAGE_ACTIONS = ["inspect", "correct", "supersede", "retract", "restore", "forget_preview", "forget"] as const;
 export type ManageAction = (typeof MANAGE_ACTIONS)[number];
 
 /** Which fields each action takes: required ones, and optional ones beyond `v`/`action`. Anything else is rejected. */
@@ -249,6 +249,8 @@ const MANAGE_FIELDS: Record<ManageAction, { required: readonly string[]; optiona
   supersede: { required: ["recordId", "body", "reason", "attribution"], optional: ["operationKey"] },
   retract: { required: ["recordId", "reason", "attribution"], optional: ["operationKey"] },
   restore: { required: ["recordId", "reason", "attribution"], optional: ["operationKey"] },
+  forget_preview: { required: ["recordIds"], optional: [] },
+  forget: { required: ["confirmToken", "reason", "attribution"], optional: ["operationKey"] },
 };
 
 /**
@@ -261,9 +263,11 @@ export const ManageInput = z
     action: z
       .enum(MANAGE_ACTIONS)
       .describe(
-        "inspect = state, history, evidence and derivations of a record (any state). correct = the claim was wrong: body is the corrected claim. supersede = it was right but is outdated: body is the new version. retract = it was wrong, with no replacement. restore = undo a retraction.",
+        "inspect = state, history, evidence and derivations of a record (any state). correct = the claim was wrong: body is the corrected claim. supersede = it was right but is outdated: body is the new version. retract = it was wrong, with no replacement. restore = undo a retraction. forget_preview = what forgetting recordIds would remove (changes nothing). forget = remove it, with the preview's confirmToken, only after the user confirmed that preview.",
       ),
     recordId: RecordId.optional(),
+    recordIds: z.array(RecordId).min(1).max(50).optional().describe("forget_preview: the records to forget (find them with recall or inspect)"),
+    confirmToken: z.string().min(1).max(4_096).optional().describe("forget: the confirmToken of the forget_preview the user confirmed"),
     body: z
       .string()
       .min(1)
