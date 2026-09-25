@@ -19,25 +19,121 @@ import type { ToolKind } from "./normalized-event.js";
  */
 
 /**
- * Commands that print files and nothing else, with the options that take a separate argument
- * (so that argument is not mistaken for a file). Any other option is a flag. `sed` has its own
- * rules ({@link sedOperands}); `grep`/`rg` are searches, not reads, and are not here.
+ * What a value-taking option accepts: `count` is a number (optionally signed, fractional or with
+ * a unit suffix: `-n +20`, `-c 1K`, `-s 0.5`), `text` any literal word, a list exactly those words.
  */
-const BAT_ARGUMENTS = ["-l", "--language", "-r", "--line-range", "-H", "--highlight-line", "--style", "--paging", "--theme", "--tabs", "--wrap", "--color", "--decorations", "-m", "--map-syntax", "--file-name", "--terminal-width", "--italic-text", "--pager"];
-const READERS: Record<string, ReadonlySet<string>> = {
-  cat: new Set(),
-  head: new Set(["-n", "-c", "--lines", "--bytes"]),
-  tail: new Set(["-n", "-c", "-s", "-b", "--lines", "--bytes", "--sleep-interval", "--pid", "--max-unchanged-stats"]),
-  nl: new Set(["-b", "-d", "-f", "-h", "-i", "-l", "-n", "-s", "-v", "-w"]),
-  less: new Set(["-b", "-h", "-j", "-p", "-t", "-T", "-x", "-y", "-z", "-P", "-#"]),
-  more: new Set(["-n", "-p"]),
-  bat: new Set(BAT_ARGUMENTS),
-  batcat: new Set(BAT_ARGUMENTS),
+type Value = "count" | "text" | readonly string[];
+
+/**
+ * A command that prints files and nothing else, as an allow-list of its options: anything not
+ * listed (an unknown letter anywhere in a cluster such as `-So`, an unknown long option, a
+ * value of the wrong kind) makes the command not a pure read. Listing only what is known to be
+ * harmless fails closed: `less -o/-O file` writes a log, `less -k file` loads key bindings,
+ * `bat --pager …` runs a command line, and each could hide in a cluster or behind a new flag.
+ */
+interface Reader {
+  /** Short options that take no value. */
+  flags: string;
+  /** Short options that take a value: the rest of the cluster (`-n40`) or the next word. */
+  values: Readonly<Record<string, Value>>;
+  /** Long options: null takes no value; otherwise the value, as `--name=v` or `--name v`. */
+  long: Readonly<Record<string, Value | null>>;
+  /** `-20` is a line count (head, tail, more). */
+  numeric?: true;
+  /** A `+…` word is a command the pager runs at start (`+G`, `+/re`, `+!cmd`), not a file. */
+  pager?: true;
+}
+
+const TEXT = "text" as const;
+const COUNT = "count" as const;
+const BAT: Reader = {
+  flags: "pnAPuf",
+  values: { l: TEXT, r: TEXT, H: TEXT, m: TEXT },
+  long: {
+    plain: null,
+    number: null,
+    "show-all": null,
+    unbuffered: null,
+    "force-colorization": null,
+    style: TEXT,
+    language: TEXT,
+    "line-range": TEXT,
+    "highlight-line": TEXT,
+    "map-syntax": TEXT,
+    theme: TEXT,
+    tabs: COUNT,
+    wrap: ["auto", "never", "character"],
+    color: ["auto", "never", "always"],
+    decorations: ["auto", "never", "always"],
+    "italic-text": ["always", "never"],
+    "terminal-width": TEXT,
+    "file-name": TEXT,
+    // Any other paging mode starts the pager; `--pager` names a command line to run.
+    paging: ["never"],
+  },
 };
-/** `less -o/-O file` copies its input to a log file: a write. */
-const WRITING_OPTIONS = new Set(["-o", "-O", "--log-file", "--LOG-FILE"]);
+const READERS: Readonly<Record<string, Reader>> = {
+  cat: {
+    flags: "AbeEnstTuv",
+    values: {},
+    long: { number: null, "number-nonblank": null, "show-all": null, "show-ends": null, "show-tabs": null, "show-nonprinting": null, "squeeze-blank": null },
+  },
+  head: { flags: "qv", values: { n: COUNT, c: COUNT }, long: { lines: COUNT, bytes: COUNT, quiet: null, silent: null, verbose: null }, numeric: true },
+  tail: {
+    flags: "fFqvr",
+    values: { n: COUNT, c: COUNT, b: COUNT, s: COUNT },
+    long: { lines: COUNT, bytes: COUNT, follow: null, retry: null, quiet: null, silent: null, verbose: null, pid: COUNT, "sleep-interval": COUNT, "max-unchanged-stats": COUNT },
+    numeric: true,
+  },
+  nl: {
+    flags: "p",
+    values: { b: TEXT, d: TEXT, f: TEXT, h: TEXT, i: COUNT, l: COUNT, n: TEXT, s: TEXT, v: COUNT, w: COUNT },
+    long: {
+      "body-numbering": TEXT,
+      "section-delimiter": TEXT,
+      "footer-numbering": TEXT,
+      "header-numbering": TEXT,
+      "line-increment": COUNT,
+      "join-blank-lines": COUNT,
+      "number-format": TEXT,
+      "number-separator": TEXT,
+      "starting-line-number": COUNT,
+      "number-width": COUNT,
+      "no-renumber": null,
+    },
+  },
+  // Not -o/-O (write a log file), -k (load key bindings), -t/-T (follow a tags file), -f (open special files).
+  less: {
+    flags: "aBcCdeEFgGiIJKLmMnNqQrRsSuUwWX~",
+    values: { b: COUNT, h: COUNT, j: TEXT, p: TEXT, P: TEXT, x: TEXT, y: COUNT, z: COUNT, "#": COUNT },
+    long: {
+      "chop-long-lines": null,
+      "LINE-NUMBERS": null,
+      "line-numbers": null,
+      "RAW-CONTROL-CHARS": null,
+      "raw-control-chars": null,
+      "quit-if-one-screen": null,
+      "quit-at-eof": null,
+      "QUIT-AT-EOF": null,
+      "no-init": null,
+      "ignore-case": null,
+      "IGNORE-CASE": null,
+      "squeeze-blank-lines": null,
+      "no-lessopen": null,
+      tabs: TEXT,
+      pattern: TEXT,
+    },
+    pager: true,
+  },
+  more: { flags: "dlfpcsu", values: { n: COUNT }, long: {}, numeric: true, pager: true },
+  bat: BAT,
+  batcat: BAT,
+};
+const COUNT_VALUE = /^[+-]?\d+(?:\.\d+)?[A-Za-z]{0,3}$/;
 
 const SHELLS = new Set(["bash", "sh", "zsh", "dash"]);
+/** sed's short options that neither write nor load a script, and `-e <script>`. */
+const SED_SHORT = { flags: "nErsuz", values: { e: "text" } } as const;
 /** One sed address: a line number, `$`, or a /regex/ (no flags). */
 const SED_ADDRESS = String.raw`(?:\d+|\$|/(?:[^/\\]|\\.)*/)`;
 /** A sed command that only prints a range: `12p`, `1,200p`, `/start/,/end/p`, `10,+5p`, `0~4p`. */
@@ -158,33 +254,71 @@ function readerPaths(name: string, args: Word[]): { literal: string[]; glob: boo
   let operands: Word[] | null;
   if (name === "sed") operands = sedOperands(args);
   else {
-    const withArgument = READERS[name];
-    operands = withArgument === undefined ? null : readerOperands(args, withArgument);
+    const reader = READERS[name];
+    operands = reader === undefined ? null : readerOperands(args, reader);
   }
   if (operands === null) return null;
   // `-` is stdin: in a pipeline it filters what came before, like no operand at all.
   return { literal: operands.filter((o) => !o.glob && o.word !== "-").map((o) => o.word), glob: operands.some((o) => o.glob) };
 }
 
-function readerOperands(args: Word[], withArgument: ReadonlySet<string>): Word[] | null {
+function readerOperands(args: Word[], reader: Reader): Word[] | null {
   const operands: Word[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i] as Word;
-    if (arg.word === "--") return [...operands, ...args.slice(i + 1)];
-    // `-20` (head/tail line count) and `+20` (less/more start line) are counts, not files.
-    if (/^[-+]\d+$/.test(arg.word)) continue;
+    if (arg.word === "--") {
+      operands.push(...args.slice(i + 1));
+      break;
+    }
+    if (reader.pager === true && arg.word.startsWith("+")) return null;
     if (!arg.word.startsWith("-") || arg.word === "-") {
       operands.push(arg);
       continue;
     }
     if (arg.glob) return null;
-    const long = arg.word.startsWith("--");
-    const flag = long ? (arg.word.split("=", 1)[0] ?? "") : arg.word.slice(0, 2);
-    const inline = long ? arg.word.includes("=") : arg.word.length > 2;
-    if (WRITING_OPTIONS.has(flag)) return null;
-    if (withArgument.has(flag) && !inline) i++;
+    if (reader.numeric === true && /^-\d+$/.test(arg.word)) continue;
+    // The value an option takes: inline, else the next word (which is then consumed).
+    const valueOf = (inline: string | null): string | null => {
+      if (inline !== null) return inline;
+      const next = args[++i];
+      return next === undefined || next.glob ? null : next.word;
+    };
+    if (arg.word.startsWith("--")) {
+      const eq = arg.word.indexOf("=");
+      const name = arg.word.slice(2, eq === -1 ? undefined : eq);
+      if (!Object.hasOwn(reader.long, name)) return null;
+      const kind = reader.long[name] ?? null;
+      if (kind === null) {
+        if (eq !== -1) return null;
+        continue;
+      }
+      if (!accepts(kind, valueOf(eq === -1 ? null : arg.word.slice(eq + 1)))) return null;
+      continue;
+    }
+    if (!shortCluster(arg.word.slice(1), reader, valueOf)) return null;
   }
   return operands;
+}
+
+/**
+ * Checks every letter of a short-option cluster (`-So`, `-n40`, `-ba`): each must be a known
+ * flag, until one that takes a value, which takes the rest of the cluster or the next word.
+ */
+function shortCluster(cluster: string, reader: Pick<Reader, "flags" | "values">, valueOf: (inline: string | null) => string | null): boolean {
+  for (let j = 0; j < cluster.length; j++) {
+    const letter = cluster.charAt(j);
+    const kind = Object.hasOwn(reader.values, letter) ? reader.values[letter] : undefined;
+    if (kind !== undefined) return accepts(kind, valueOf(j + 1 < cluster.length ? cluster.slice(j + 1) : null));
+    if (!reader.flags.includes(letter)) return false;
+  }
+  return true;
+}
+
+function accepts(kind: Value, value: string | null): boolean {
+  if (value === null) return false;
+  if (kind === "text") return true;
+  if (kind === "count") return COUNT_VALUE.test(value);
+  return kind.includes(value);
 }
 
 /**
@@ -207,7 +341,7 @@ function sedOperands(args: Word[]): Word[] | null {
       continue;
     }
     if (arg.glob) return null;
-    if (word === "-e" || word === "--expression") {
+    if (word === "--expression") {
       const script = args[++i];
       if (script === undefined || script.glob) return null;
       scripts.push(script.word);
@@ -215,8 +349,16 @@ function sedOperands(args: Word[]): Word[] | null {
       scripts.push(word.slice("--expression=".length));
     } else if (word === "--quiet" || word === "--silent") {
       quiet = true;
-    } else if (/^-[nErsuz]+$/.test(word)) {
-      if (word.includes("n")) quiet = true;
+    } else if (/^-[^-]/.test(word)) {
+      // A cluster such as `-ne '1,5p'`: flags up to an `e`, whose script is the rest or the next word.
+      const valueOf = (inline: string | null): string | null => {
+        const next = inline === null ? args[++i] : undefined;
+        const script = inline ?? (next === undefined || next.glob ? null : next.word);
+        if (script !== null) scripts.push(script);
+        return script;
+      };
+      if (!shortCluster(word.slice(1), SED_SHORT, valueOf)) return null;
+      if ((word.split("e", 1)[0] ?? "").includes("n")) quiet = true;
     } else if (!["--posix", "--debug", "--regexp-extended", "--null-data", "--unbuffered", "--separate"].includes(word)) {
       return null;
     }

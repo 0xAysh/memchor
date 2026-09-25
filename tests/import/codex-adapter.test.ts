@@ -188,6 +188,39 @@ describe("Codex adapter", () => {
     ]);
   });
 
+  test("every letter of a reader's flags is checked: a flag that writes, runs a command or is unknown makes the command not a pure read", () => {
+    const { chunk } = readAll("0.142.5/shell-flags.jsonl");
+    const calls = chunk.events.filter((e) => e.type === "tool_call").map((e) => [e.summary, e.toolKind, e.paths]);
+    const gateway = [`${CWD}/src/gateway.ts`];
+    const retry = [`${CWD}/src/retry.ts`];
+    expect(calls).toEqual([
+      ["$ cat -ns src/gateway.ts", "artifact_access", gateway],
+      ["$ head -c 200 src/gateway.ts", "artifact_access", gateway],
+      ["$ head -n40 src/gateway.ts", "artifact_access", gateway],
+      ["$ tail -n +20 src/retry.ts", "artifact_access", retry],
+      ["$ nl -ba -w4 src/retry.ts", "artifact_access", retry],
+      ["$ less -SN src/gateway.ts", "artifact_access", gateway],
+      ["$ bat --paging=never -n src/retry.ts", "artifact_access", retry],
+      ["$ sed -ne '1,5p' src/gateway.ts", "artifact_access", gateway],
+      // `-o`/`-O` inside a cluster still write a log file; `-k` loads key bindings from a file.
+      ["$ cat src/gateway.ts | less -So log.txt", "other", []],
+      ["$ less -O log.txt src/gateway.ts", "other", []],
+      ["$ less -k keys.bin src/gateway.ts", "other", []],
+      // A `+` operand is a pager command, and bat's pager is a command line.
+      ["$ less '+!echo hi' src/gateway.ts", "other", []],
+      ["$ more +/charge src/gateway.ts", "other", []],
+      ["$ bat --pager 'sh -c true' src/retry.ts", "other", []],
+      ["$ bat --paging=always src/retry.ts", "other", []],
+      // A count that is not a number, and letters the reader does not know, fail closed.
+      ["$ head -n x src/gateway.ts", "other", []],
+      ["$ cat -z src/gateway.ts", "other", []],
+      ["$ nl -ba -Q src/retry.ts", "other", []],
+      // `-f` loads a script from a file; in `-en` the `n` is the script (not -n), so every line prints.
+      ["$ sed -nf print.sed src/gateway.ts", "other", []],
+      ["$ sed -en '1p' src/gateway.ts", "other", []],
+    ]);
+  });
+
   test("a 0.148.0-alpha.21 legacy rollout: audio is binary, new metadata types are skipped, and the MCP call triple yields one call and one result", () => {
     const { chunk } = readAll("0.148.0-alpha.21/basic.jsonl");
     expect(chunk.stop).toBeNull();
