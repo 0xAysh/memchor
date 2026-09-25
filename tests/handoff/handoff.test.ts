@@ -172,17 +172,22 @@ describe("Claude → fresh Codex → fresh Claude handoff across processes", () 
     expect(codexSide).toMatchObject({ attribution: "agent_inference", source: { host: "codex", transcriptId: threadId }, corroboration: { independentRoots: 1, records: 1 } });
     expect(codexSide.independentRoot).toMatch(new RegExp(`^event:codex/${threadId}@\\d+$`));
 
-    // Root rule: the /branch copy is the same Claude observation (one item listing the copy); Codex
-    // stating the claim after its own test run is a second observation; the Memchor recall echoed in
-    // the rollout is never a record, so it corroborates nothing.
+    // Root rule: the /branch copy is the same Claude observation (one item listing the copy). Codex
+    // stating the claim after its own failing test run, before recalling anything, is a second
+    // observation. Its verbatim repeat after the Memchor recall echoed Claude's record is a copy of
+    // that record (derived_from), and the echo itself is never a record, so neither corroborates.
     const roots = await codex.ok<ContextPack>("memory_recall", { query: "root cause retries idempotency key", maxTokens: 8_000 });
     mainPacks.push(roots);
     const stated = roots.items.filter((i) => i.excerpt === ROOT_CAUSE);
     expect(stated.map((i) => i.host).sort()).toEqual(["claude-code", "codex"]);
-    for (const i of stated) expect(i.corroboration).toEqual({ independentRoots: 2, records: 3 });
+    for (const i of stated) expect(i.corroboration).toEqual({ independentRoots: 2, records: 4 });
     const claudeRoot = stated.find((i) => i.host === "claude-code");
-    expect(claudeRoot?.copies.map((c) => c.source?.transcriptId)).toEqual([expect.stringMatching(new RegExp(`^(${claudeParent.sessionId}|${claudeBranch.sessionId})$`))]);
-    expect(stated.find((i) => i.host === "codex")?.copies).toEqual([]);
+    const copies = claudeRoot?.copies.map((c) => c.source?.transcriptId) ?? [];
+    expect(copies).toHaveLength(2);
+    expect(copies).toEqual(expect.arrayContaining([threadId, expect.stringMatching(new RegExp(`^(${claudeParent.sessionId}|${claudeBranch.sessionId})$`))]));
+    const codexOwn = stated.find((i) => i.host === "codex");
+    expect(codexOwn?.copies).toEqual([]);
+    expect(codexOwn?.independentRoot).toMatch(new RegExp(`^event:codex/${threadId}@\\d+$`));
 
     // Codex continues: restating Claude's decision with a citation is a copy of it, not corroboration.
     const restated = await codex.ok<RecordResult>("memory_record", { kind: "note", body: DECISION, attribution: "agent_inference", links: [{ to: decision.recordId, relation: "derived_from" }] });

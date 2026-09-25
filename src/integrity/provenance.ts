@@ -105,7 +105,9 @@ const MAX_DERIVATION_DEPTH = 16;
  * - Anything else is its own root. Memchor does not infer derivation from similar text;
  *   an uncited restatement cannot be told apart from an independent observation, so
  *   agents are told to cite instead of re-recording (and Memchor's own output in a
- *   transcript is never imported as a record at all).
+ *   transcript is never imported as a record at all). The one exception is verbatim: the
+ *   importer links an agent's message that repeats memory Memchor echoed earlier in the
+ *   same transcript `derived_from` that record (`restatedEchoes` in import/reconcile.ts).
  *
  * Only visible targets are followed, so a root never discloses an out-of-scope record.
  */
