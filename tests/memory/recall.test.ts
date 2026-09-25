@@ -11,15 +11,14 @@ function open(cwd: string, home: string): Memory {
   return memory;
 }
 
-const bytesOf = (pack: ContextPack): number =>
-  (pack.checkpoint ? Buffer.byteLength(JSON.stringify(pack.checkpoint)) : 0) +
-  pack.items.reduce((sum, item) => sum + Buffer.byteLength(JSON.stringify(item)), 0);
+/** The whole pack as a client receives it: the budget covers all of it. */
+const bytesOf = (pack: ContextPack): number => Buffer.byteLength(JSON.stringify(pack), "utf8");
 
 describe("recall", () => {
   test("an empty store is an honest miss", () => {
     const pack = open(initRepo(), tempDir()).recall();
     expect(pack).toMatchObject({ empty: true, checkpoint: null, items: [], omissions: [], truncated: false, continuation: null });
-    expect(pack.budget).toMatchObject({ usedBytes: 0, usedTokens: 0 });
+    expect(pack.budget.usedBytes).toBe(bytesOf(pack));
     expect(pack.notice).toMatch(/no prior context/i);
   });
 
@@ -119,7 +118,7 @@ describe("recall", () => {
     }
 
     const seen: string[] = [];
-    let pack = memory.recall({ query: "deploy", maxTokens: 300 });
+    let pack = memory.recall({ query: "deploy", maxTokens: 600 });
     expect(pack.truncated).toBe(true);
     expect(pack.omissions).toEqual([{ reason: "budget", count: 12 - pack.items.length }]);
     for (let pages = 0; ; pages++) {
@@ -130,7 +129,7 @@ describe("recall", () => {
       expect(pack.budget.usedTokens).toBe(Math.ceil(pack.budget.usedBytes / 4));
       seen.push(...pack.items.map((i) => i.recordId));
       if (pack.continuation === null) break;
-      pack = memory.recall({ continuation: pack.continuation, maxTokens: 300 });
+      pack = memory.recall({ continuation: pack.continuation, maxTokens: 600 });
     }
     expect(seen).toHaveLength(12);
     expect(new Set(seen)).toEqual(recorded);
@@ -140,13 +139,13 @@ describe("recall", () => {
   test("records written after the first page never enter an in-flight continuation", () => {
     const memory = open(initRepo(), tempDir());
     for (let i = 0; i < 6; i++) memory.record({ kind: "note", body: `lint rule ${i} ${"x ".repeat(150)}`, attribution: "agent_inference" });
-    const first = memory.recall({ maxTokens: 200 });
+    const first = memory.recall({ maxTokens: 500 });
     const late = memory.record({ kind: "note", body: "lint rule late", attribution: "agent_inference" });
 
     const ids = [...first.items.map((i) => i.recordId)];
     let continuation = first.continuation;
     while (continuation !== null) {
-      const page = memory.recall({ continuation, maxTokens: 200 });
+      const page = memory.recall({ continuation, maxTokens: 500 });
       ids.push(...page.items.map((i) => i.recordId));
       continuation = page.continuation;
     }
@@ -161,7 +160,7 @@ describe("recall", () => {
     for (let i = 0; i < 6; i++) existing.add(memory.record({ kind: "note", body: `alpha ${i} ${pad}`, attribution: "agent_inference" }).recordId);
     for (let i = 0; i < 6; i++) existing.add(memory.record({ kind: "note", body: `beta beta ${i} ${pad}`, attribution: "agent_inference" }).recordId);
 
-    const first = memory.recall({ query: "alpha beta", maxTokens: 300 });
+    const first = memory.recall({ query: "alpha beta", maxTokens: 600 });
     expect(first.continuation).not.toBeNull();
     const seen = first.items.map((i) => i.recordId);
     // Make "beta" common so its IDF collapses and the live ranking reorders.
@@ -169,7 +168,7 @@ describe("recall", () => {
 
     let continuation = first.continuation;
     while (continuation !== null) {
-      const page = memory.recall({ continuation, maxTokens: 300 });
+      const page = memory.recall({ continuation, maxTokens: 600 });
       seen.push(...page.items.map((i) => i.recordId));
       continuation = page.continuation;
     }
@@ -182,7 +181,7 @@ describe("recall", () => {
     const home = tempDir();
     const memory = open(repo, home);
     for (let i = 0; i < 5; i++) memory.record({ kind: "note", body: `item ${i} ${"y ".repeat(200)}`, attribution: "agent_inference" });
-    const { continuation } = memory.recall({ maxTokens: 250 });
+    const { continuation } = memory.recall({ maxTokens: 500 });
     expect(continuation).not.toBeNull();
     const token = continuation ?? "";
 
@@ -203,12 +202,12 @@ describe("recall", () => {
     memory.record({ kind: "note", body: "some later item", attribution: "agent_inference" });
     memory.checkpoint({ expectedRevision: 0, goal: "big", status: "s ".repeat(1500) });
 
-    const pack = memory.recall({ maxTokens: 250 });
+    const pack = memory.recall({ maxTokens: 500 });
     expect(pack.checkpoint?.truncated).toBe(true);
     expect(pack.items).toEqual([]);
     expect(pack.truncated).toBe(true);
-    expect(pack.budget.usedBytes).toBeLessThanOrEqual(1_000);
-    const next = memory.recall({ continuation: pack.continuation ?? "", maxTokens: 250 });
+    expect(pack.budget.usedBytes).toBeLessThanOrEqual(2_000);
+    const next = memory.recall({ continuation: pack.continuation ?? "", maxTokens: 500 });
     expect(next.checkpoint).toBeNull();
     expect(next.items).toHaveLength(1);
   });

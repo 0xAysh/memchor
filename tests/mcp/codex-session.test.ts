@@ -43,4 +43,25 @@ describe("Codex live session binding", () => {
     const { pack } = await run(false);
     expect(pack.items.map((item) => item.excerpt)).not.toContain(USER_ASK);
   });
+
+  test("an over-long thread id is ignored, never cut into a different identity", async () => {
+    // Two live sessions in two worktrees naming the same thread: an adopted id binds the
+    // second to the first's workstream (session binding); an ignored one leaves it its own.
+    async function secondResolution(threadId: string): Promise<BootstrapResult["scope"]> {
+      const repo = initRepo();
+      const home = tempDir();
+      const other = join(tempDir("memchor-wt-"), "wt");
+      git(repo, "worktree", "add", "--quiet", "-b", "side", other);
+      const scopes: BootstrapResult["scope"][] = [];
+      for (const cwd of [repo, other]) {
+        const server = await spawnServer({ cwd, home, host: "codex", codexHome: codexHome() });
+        const result = await server.client.callTool({ name: "memory_bootstrap", arguments: { importChoice: "none" }, _meta: { threadId } });
+        scopes.push((result.structuredContent as BootstrapResult).scope);
+        await server.close();
+      }
+      return scopes[1] as BootstrapResult["scope"];
+    }
+    expect(await secondResolution("t".repeat(200))).toMatchObject({ resolvedBy: "session_binding" });
+    expect(await secondResolution("t".repeat(201))).toMatchObject({ resolvedBy: "new_workstream" });
+  });
 });

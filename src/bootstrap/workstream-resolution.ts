@@ -94,6 +94,16 @@ interface WorkstreamRow {
 }
 
 /**
+ * What {@link decide} concluded, before anything is written: bind an existing workstream,
+ * create one, or ask. Keeping the decision separate from {@link settle} is what lets status
+ * preview a bootstrap on a read-only connection by the very same rules.
+ */
+type Decision =
+  | { status: "bind"; row: WorkstreamRow; basis: ResolutionBasis }
+  | { status: "create"; basis: "choice" | "new_workstream" }
+  | { status: "ambiguous"; ambiguity: ScopeAmbiguity };
+
+/**
  * Decides and applies the workstream for one session, inside the caller's write transaction.
  * A bound result has already created the workstream and worktree binding it needs (or rebound
  * the worktree, for an explicit choice); an ambiguous result wrote nothing. An explicit
@@ -103,16 +113,52 @@ interface WorkstreamRow {
 export function resolveWorkstream(db: Db, signals: ScopeSignals, now: string): Resolution {
   requireTransaction(db, "resolveWorkstream");
   const taskKey = signals.task === undefined ? null : normalizeTaskKey(signals.task);
+  const decision = decide(db, signals, taskKey);
+  switch (decision.status) {
+    case "ambiguous":
+      return decision;
+    case "create":
+      return settle(db, signals, createWorkstream(db, signals.branch, taskKey, now), taskKey, decision.basis, true, now);
+    case "bind":
+      return settle(db, signals, decision.row, taskKey, decision.basis, false, now);
+  }
+}
 
+/** A bootstrap's resolution as it would be, computed without writing; `workstream` is null when one would be created. */
+export type ResolutionPreview =
+  | { status: "bound"; workstream: ResolvedWorkstream | null; basis: ResolutionBasis }
+  | { status: "ambiguous"; ambiguity: ScopeAmbiguity };
+
+/**
+ * {@link resolveWorkstream}'s decision without its writes, for status: the same rules on the
+ * same rows, so what status reports is what bootstrap would do. Safe on a read-only
+ * connection; run it inside one read transaction for a consistent snapshot.
+ */
+export function previewWorkstream(db: Db, signals: ScopeSignals): ResolutionPreview {
+  const taskKey = signals.task === undefined ? null : normalizeTaskKey(signals.task);
+  const decision = decide(db, signals, taskKey);
+  switch (decision.status) {
+    case "ambiguous":
+      return decision;
+    case "create":
+      return { status: "bound", workstream: null, basis: decision.basis };
+    case "bind":
+      // settle() adopts the task key when the workstream has none; the preview says so too.
+      return { status: "bound", workstream: { id: decision.row.id, label: decision.row.label, taskKey: decision.row.task_key ?? taskKey }, basis: decision.basis };
+  }
+}
+
+/** The resolution rules (see the table above). Reads only. */
+function decide(db: Db, signals: ScopeSignals, taskKey: string | null): Decision {
   if (signals.choice !== undefined) {
-    if (signals.choice === "new") return settle(db, signals, createWorkstream(db, signals.branch, taskKey, now), taskKey, "choice", true, now);
+    if (signals.choice === "new") return { status: "create", basis: "choice" };
     const chosen = workstreamRow(db, signals.choice);
     if (chosen === null) {
       throw new MemchorError("not_found", `No workstream ${signals.choice} exists in this workspace. Choose one of scope.ambiguity.candidates, or "new".`, {
         details: { workstreamId: signals.choice },
       });
     }
-    return settle(db, signals, chosen, taskKey, "choice", false, now);
+    return { status: "bind", row: chosen, basis: "choice" };
   }
 
   const sessionBound = sessionBindings(db, signals);
@@ -131,14 +177,14 @@ export function resolveWorkstream(db: Db, signals: ScopeSignals, now: string): R
     // A binding outranks everything below it, unless the user named a *different* task than
     // the bound workstream's own: that is a conflict to ask about, not something to override.
     const agrees = taskKey === null || (anchor.task_key === null ? tasked.every((row) => row.id === anchor.id) : anchor.task_key === taskKey);
-    if (agrees) return settle(db, signals, anchor, taskKey, basis, false, now);
+    if (agrees) return { status: "bind", row: anchor, basis };
     return ambiguous(db, [
       { row: anchor, signal: basis, detail: `${basis === "session_binding" ? "Memchor bound this session" : "this worktree is bound"} to it (task ${anchor.task_key ?? "not set"}, not ${taskKey})` },
       ...tasked.map((row) => ({ row, signal: "task" as const, detail: `its task is ${taskKey}` })),
     ]);
   }
 
-  if (tasked.length === 1 && tasked[0] !== undefined) return settle(db, signals, tasked[0], taskKey, "task", false, now);
+  if (tasked.length === 1 && tasked[0] !== undefined) return { status: "bind", row: tasked[0], basis: "task" };
   if (tasked.length > 1) return ambiguous(db, tasked.map((row) => ({ row, signal: "task" as const, detail: `its task is ${taskKey ?? ""}` })));
 
   const suggested = orphansOnBranch(db, signals.branch, taskKey);
@@ -148,7 +194,7 @@ export function resolveWorkstream(db: Db, signals: ScopeSignals, now: string): R
       suggested.map((row) => ({ row, signal: "branch" as const, detail: `it was last on branch ${signals.branch} and its worktree no longer exists` })),
     );
   }
-  return settle(db, signals, createWorkstream(db, signals.branch, taskKey, now), taskKey, "new_workstream", true, now);
+  return { status: "create", basis: "new_workstream" };
 }
 
 /**
@@ -226,7 +272,7 @@ function isBranch(branch: string): boolean {
   return branch !== "detached" && !branch.startsWith("detached@");
 }
 
-function ambiguous(db: Db, evidence: { row: WorkstreamRow; signal: CandidateSignal; detail: string }[]): Resolution {
+function ambiguous(db: Db, evidence: { row: WorkstreamRow; signal: CandidateSignal; detail: string }[]): { status: "ambiguous"; ambiguity: ScopeAmbiguity } {
   const byId = new Map<string, WorkstreamCandidate>();
   const head = prepared(
     db,
@@ -259,7 +305,13 @@ function ambiguous(db: Db, evidence: { row: WorkstreamRow; signal: CandidateSign
 function question(candidates: readonly WorkstreamCandidate[], omitted: number): string {
   const lines = candidates.map((c, i) => {
     const task = c.taskKey === null ? "" : ` [task ${c.taskKey}]`;
-    const state = c.lastCheckpoint === null ? "no checkpoint yet" : `r${c.headRevision}: ${c.lastCheckpoint.goal} (${c.lastCheckpoint.status})`;
+    const summary = c.lastCheckpoint;
+    const state =
+      summary === null
+        ? "no checkpoint yet"
+        : summary.goal === null
+          ? `r${c.headRevision}: (checkpoint summary unavailable)`
+          : `r${c.headRevision}: ${summary.goal}${summary.status === null ? "" : ` (${summary.status})`}`;
     return `${i + 1}. ${c.label}${task} (${c.workstreamId}): ${state}; last active ${c.lastActiveAt}. Why: ${c.reasons.map((r) => r.detail).join("; ")}.`;
   });
   return [
@@ -277,7 +329,8 @@ function question(candidates: readonly WorkstreamCandidate[], omitted: number): 
  * "#20", "20", "issue 20", "PR #20" → "#20"; a GitHub/GitLab issue or PR URL →
  * "host/owner/repo#20" (it names its repository, so it never collides with another
  * repository's #20); a tracker key "proj-7" → "PROJ-7"; any other URL → host + path; anything
- * else → lowercased, whitespace collapsed.
+ * else → lowercased, whitespace collapsed. Never cut: the input is already bounded
+ * (`LIMITS.taskChars`), and a cut key would make two tasks sharing a prefix the same task.
  */
 export function normalizeTaskKey(raw: string): string {
   const text = raw.trim();
@@ -286,13 +339,13 @@ export function normalizeTaskKey(raw: string): string {
     const host = url.host.toLowerCase();
     const numbered = /^\/(.+?)\/(?:-\/)?(?:issues|pull|pulls|merge_requests)\/(\d+)(?:\/|$)/.exec(url.pathname);
     if (numbered !== null) return `${host}/${(numbered[1] ?? "").toLowerCase()}#${Number(numbered[2])}`;
-    return `${host}${url.pathname.replace(/\/+$/, "")}`.slice(0, 200);
+    return `${host}${url.pathname.replace(/\/+$/, "")}`;
   }
   const numbered = /^(?:(?:issue|pull request|pull|pr)\s*)?#?\s*(\d+)$/i.exec(text);
   if (numbered !== null) return `#${Number(numbered[1])}`;
   const tracker = /^([A-Za-z][A-Za-z0-9_]*)-(\d+)$/.exec(text);
   if (tracker !== null) return `${(tracker[1] ?? "").toUpperCase()}-${Number(tracker[2])}`;
-  return text.toLowerCase().replace(/\s+/g, " ").slice(0, 200);
+  return text.toLowerCase().replace(/\s+/g, " ");
 }
 
 // ───────────────────────────── Live sessions ─────────────────────────────
@@ -341,17 +394,7 @@ export function bindScope(db: Db, location: WorkspaceLocation, session: SessionI
   return writeTransaction(db, () => {
     const now = new Date().toISOString();
     const workspace = ensureWorkspace(db, location, now);
-    const resolution = resolveWorkstream(
-      db,
-      {
-        worktree: location.worktree,
-        branch: location.branch,
-        session: { host: session.host, hostSessionId: session.hostSessionId ?? null, ...(session.sessionId === undefined ? {} : { sessionId: session.sessionId }) },
-        ...(hints.task === undefined ? {} : { task: hints.task }),
-        ...(hints.workstream === undefined ? {} : { choice: hints.workstream }),
-      },
-      now,
-    );
+    const resolution = resolveWorkstream(db, liveSignals(location, session, hints), now);
     const workstream = resolution.status === "bound" ? resolution.workstream : null;
     const sessionId = session.sessionId ?? `ses_${randomUUID().replaceAll("-", "")}`;
     if (session.sessionId === undefined) {
@@ -380,6 +423,33 @@ export function bindScope(db: Db, location: WorkspaceLocation, session: SessionI
       createdWorkstream: resolution.status === "bound" && resolution.created,
     };
   });
+}
+
+/**
+ * What {@link bindScope} would resolve for this live session, read-only (for status): the
+ * same workspace check and signals through {@link previewWorkstream}, in one read
+ * transaction. Writes nothing, so it works on a read-only connection. Null after a
+ * repository move: bootstrap re-points the moved worktree bindings first, and resolving
+ * against the not-yet-re-pointed paths would report a different answer than bootstrap's.
+ * Throws `storage_unavailable` where bootstrap would.
+ */
+export function previewScope(db: Db, location: WorkspaceLocation, session: SessionIdentity): ResolutionPreview | null {
+  return db.transaction(() => {
+    const workspaces = prepared(db, "SELECT id, repository_key FROM workspaces").all() as { id: string; repository_key: string }[];
+    const fit = workspaceFit(workspaces, location);
+    if (fit === "foreign") throw foreignDatabase(location, workspaces);
+    return fit === "moved" ? null : previewWorkstream(db, liveSignals(location, session, {}));
+  })();
+}
+
+function liveSignals(location: WorkspaceLocation, session: SessionIdentity, hints: ScopeHints): ScopeSignals {
+  return {
+    worktree: location.worktree,
+    branch: location.branch,
+    session: { host: session.host, hostSessionId: session.hostSessionId ?? null, ...(session.sessionId === undefined ? {} : { sessionId: session.sessionId }) },
+    ...(hints.task === undefined ? {} : { task: hints.task }),
+    ...(hints.workstream === undefined ? {} : { choice: hints.workstream }),
+  };
 }
 
 /** The bound workstream id for a workstream-scoped write; `scope_ambiguous` while the session has none. */
@@ -419,30 +489,39 @@ export function ensureWorkspace(db: Db, location: WorkspaceLocation, now: string
     workspaces.push({ id: location.workspaceId, label: location.label, repository_key: location.repositoryKey, continuation_secret: secret });
   }
   const workspace = workspaces[0];
-  if (
-    workspaces.length === 1 &&
-    workspace !== undefined &&
-    workspace.id === location.workspaceId &&
-    workspace.repository_key !== location.repositoryKey &&
-    location.formerRepositoryKeys.includes(workspace.repository_key)
-  ) {
+  const fit = workspaceFit(workspaces, location);
+  if (fit === "moved" && workspace !== undefined) {
     repointMovedRepository(db, workspace.repository_key, location.repositoryKey);
     workspace.repository_key = location.repositoryKey;
   }
-  if (workspaces.length !== 1 || workspace === undefined || workspace.id !== location.workspaceId || workspace.repository_key !== location.repositoryKey) {
-    throw new MemchorError(
-      "storage_unavailable",
-      `The database at ${location.dbPath} belongs to a different repository or workspace; refusing to use it for ${location.worktree}.`,
-      {
-        details: {
-          dbPath: location.dbPath,
-          expected: { workspaceId: location.workspaceId, repositoryKey: location.repositoryKey },
-          found: workspaces.map((w) => ({ workspaceId: w.id, repositoryKey: w.repository_key })),
-        },
-      },
-    );
-  }
+  if (fit === "foreign" || workspace === undefined) throw foreignDatabase(location, workspaces);
   return { label: workspace.label, continuationSecret: workspace.continuation_secret };
+}
+
+/**
+ * How the database's `workspaces` rows relate to the resolved location: none yet, this very
+ * workspace, this workspace at a recorded former repository key (a move), or anything else.
+ */
+function workspaceFit(rows: readonly { id: string; repository_key: string }[], location: WorkspaceLocation): "new" | "same" | "moved" | "foreign" {
+  if (rows.length === 0) return "new";
+  const [row] = rows;
+  if (rows.length !== 1 || row === undefined || row.id !== location.workspaceId) return "foreign";
+  if (row.repository_key === location.repositoryKey) return "same";
+  return location.formerRepositoryKeys.includes(row.repository_key) ? "moved" : "foreign";
+}
+
+function foreignDatabase(location: WorkspaceLocation, rows: readonly { id: string; repository_key: string }[]): MemchorError {
+  return new MemchorError(
+    "storage_unavailable",
+    `The database at ${location.dbPath} belongs to a different repository or workspace; refusing to use it for ${location.worktree}.`,
+    {
+      details: {
+        dbPath: location.dbPath,
+        expected: { workspaceId: location.workspaceId, repositoryKey: location.repositoryKey },
+        found: rows.map((w) => ({ workspaceId: w.id, repositoryKey: w.repository_key })),
+      },
+    },
+  );
 }
 
 /** Worktree bindings follow the repository by their position relative to its main worktree. */
@@ -457,10 +536,4 @@ function repointMovedRepository(db: Db, fromKey: string, toKey: string): void {
   for (const { worktree_path: path } of bindings) {
     if (path === from || path.startsWith(from + sep)) move.run(to + path.slice(from.length), path);
   }
-}
-
-/** The workstream bound to a worktree, or null. Read-only. */
-export function findBinding(db: Db, worktree: string): { id: string; label: string } | null {
-  const row = boundTo(db, worktree);
-  return row === null ? null : { id: row.id, label: row.label };
 }

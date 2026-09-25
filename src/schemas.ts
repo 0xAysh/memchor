@@ -151,6 +151,9 @@ export const BootstrapInput = z.strictObject({
     .describe(
       'Only after asking the user to choose from scope.ambiguity.candidates: the chosen workstreamId, or "new" for a fresh workstream. The choice becomes this worktree\'s workstream.',
     ),
+  /** Budget for the returned `context` pack, exactly as for recall. */
+  maxTokens: MaxTokens.optional().describe("Budget for the returned context pack (default 2000 tokens), as for memory_recall"),
+  maxBytes: MaxBytes.optional(),
 });
 export type BootstrapInput = z.input<typeof BootstrapInput>;
 
