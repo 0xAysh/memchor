@@ -154,6 +154,16 @@ describe("workstream resolution", () => {
     expect(byUrl.workstreamId).not.toBe(tasked.workstreamId);
   });
 
+  test("long task identities are compared whole: two tasks sharing a long prefix are different tasks", () => {
+    const home = tempDir();
+    const repo = initRepo();
+    const prefix = "migrate the billing ledger ".repeat(10);
+    const first = open(addWorktree(repo, "task-a", true), home).bootstrap({ task: `${prefix}to postgres` }).scope;
+    const second = open(addWorktree(repo, "task-b", true), home).bootstrap({ task: `${prefix}to sqlite` }).scope;
+    expect(second).toMatchObject({ resolvedBy: "new_workstream" });
+    expect(second.workstreamId).not.toBe(first.workstreamId);
+  });
+
   test("a task that contradicts the bound workstream's task is asked about, never overridden", () => {
     const home = tempDir();
     const repo = initRepo();

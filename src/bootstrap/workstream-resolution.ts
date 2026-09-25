@@ -323,7 +323,8 @@ function question(candidates: readonly WorkstreamCandidate[], omitted: number): 
  * "#20", "20", "issue 20", "PR #20" → "#20"; a GitHub/GitLab issue or PR URL →
  * "host/owner/repo#20" (it names its repository, so it never collides with another
  * repository's #20); a tracker key "proj-7" → "PROJ-7"; any other URL → host + path; anything
- * else → lowercased, whitespace collapsed.
+ * else → lowercased, whitespace collapsed. Never cut: the input is already bounded
+ * (`LIMITS.taskChars`), and a cut key would make two tasks sharing a prefix the same task.
  */
 export function normalizeTaskKey(raw: string): string {
   const text = raw.trim();
@@ -332,13 +333,13 @@ export function normalizeTaskKey(raw: string): string {
     const host = url.host.toLowerCase();
     const numbered = /^\/(.+?)\/(?:-\/)?(?:issues|pull|pulls|merge_requests)\/(\d+)(?:\/|$)/.exec(url.pathname);
     if (numbered !== null) return `${host}/${(numbered[1] ?? "").toLowerCase()}#${Number(numbered[2])}`;
-    return `${host}${url.pathname.replace(/\/+$/, "")}`.slice(0, 200);
+    return `${host}${url.pathname.replace(/\/+$/, "")}`;
   }
   const numbered = /^(?:(?:issue|pull request|pull|pr)\s*)?#?\s*(\d+)$/i.exec(text);
   if (numbered !== null) return `#${Number(numbered[1])}`;
   const tracker = /^([A-Za-z][A-Za-z0-9_]*)-(\d+)$/.exec(text);
   if (tracker !== null) return `${(tracker[1] ?? "").toUpperCase()}-${Number(tracker[2])}`;
-  return text.toLowerCase().replace(/\s+/g, " ").slice(0, 200);
+  return text.toLowerCase().replace(/\s+/g, " ");
 }
 
 // ───────────────────────────── Live sessions ─────────────────────────────
