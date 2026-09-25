@@ -17,10 +17,10 @@ function mkdirp(file: string): void {
   mkdirSync(dirname(file), { recursive: true });
 }
 
-/** A pack with the per-session scope fields removed, for comparing across instances. */
+/** A pack with the per-session scope fields (and the byte usage they change) removed, for comparing across instances. */
 function stable(memory: Memory, query?: string) {
-  const { scope, ...pack } = memory.recall(query === undefined ? {} : { query });
-  return { workspaceId: scope.workspaceId, workstreamId: scope.workstreamId, headRevision: scope.headRevision, ...pack };
+  const { scope, budget, ...pack } = memory.recall(query === undefined ? {} : { query });
+  return { workspaceId: scope.workspaceId, workstreamId: scope.workstreamId, headRevision: scope.headRevision, maxBytes: budget.maxBytes, ...pack };
 }
 
 describe("durability", () => {

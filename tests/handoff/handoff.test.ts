@@ -247,8 +247,8 @@ describe("Claude → fresh Codex → fresh Claude handoff across processes", () 
     // ── (g) Truncation: bodies are cut, never warnings, citations or reference freshness ──
     const query = "backoff retries 504 src/retry.ts";
     const full = await resumed.ok<ContextPack>("memory_recall", { query, maxTokens: 8_000 });
-    const firstPage = await resumed.ok<ContextPack>("memory_recall", { query, maxBytes: 1_000 });
-    const nextPage = await resumed.ok<ContextPack>("memory_recall", { continuation: firstPage.continuation, maxBytes: 1_100 });
+    const firstPage = await resumed.ok<ContextPack>("memory_recall", { query, maxBytes: 2_000 });
+    const nextPage = await resumed.ok<ContextPack>("memory_recall", { continuation: firstPage.continuation, maxBytes: 2_100 });
     mainPacks.push(full, firstPage, nextPage);
     expect(firstPage).toMatchObject({ truncated: true, items: [], checkpoint: { recordId: codexCheckpoint.recordId, truncated: true } });
     expect(firstPage.checkpoint?.excerpt).toMatch(/cut by Memchor.*memory_read/);

@@ -132,13 +132,13 @@ describe("provenance and independent roots", () => {
       memory.record({ kind: "note", body: `rollout step ${i}: ${"detail ".repeat(30)}`, attribution: "agent_inference", links: [{ to: original.recordId, relation: "derived_from" }] });
     }
     const seen: string[] = [];
-    let pack = memory.recall({ query: "rollout", maxTokens: 300 });
+    let pack = memory.recall({ query: "rollout", maxTokens: 600 });
     for (let pages = 0; ; pages++) {
       expect(pages).toBeLessThan(20);
       expect(pack.budget.usedBytes).toBeLessThanOrEqual(pack.budget.maxBytes);
       for (const item of pack.items) seen.push(item.recordId, ...item.copies.map((copy) => copy.recordId));
       if (pack.continuation === null) break;
-      pack = memory.recall({ continuation: pack.continuation, maxTokens: 300 });
+      pack = memory.recall({ continuation: pack.continuation, maxTokens: 600 });
     }
     expect(seen).toHaveLength(12);
     expect(new Set(seen).size).toBe(12);

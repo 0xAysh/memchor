@@ -22,12 +22,16 @@ import {
   type ClaimGroup,
   type ContinuationState,
   CUT_MARKER,
+  EMPTY_PAGE,
   groupClaims,
   ITEM_EXCERPT_BYTES,
   LISTED_COPIES,
   normalizeClaim,
   openContinuation,
   packPage,
+  type PackedPage,
+  packWithinBudget,
+  planPage,
   type Packable,
   sealContinuation,
   usage,
@@ -42,7 +46,6 @@ import {
   CheckpointInput,
   ContinueImportInput,
   effectiveBudget,
-  estimateTokens,
   type Freshness,
   LIMITS,
   type LinkRelation,
@@ -196,7 +199,7 @@ export interface Omission {
   /**
    * `budget`: more of the sequence follows (use `continuation`).
    * `exceeds_budget`: records too large for this budget even alone (read them directly).
-   * `candidate_limit`: eligible matches beyond the 500-record sequence cap; refine the query.
+   * `candidate_limit`: eligible matches the sequence does not carry: beyond the 500-record cap, or more than a continuation can hold within this budget (at most a quarter of it). Refine the query or raise the budget.
    */
   reason: "budget" | "exceeds_budget" | "candidate_limit";
   count: number;
@@ -217,6 +220,7 @@ export interface ContextPack {
    * after page 1 are not part of the sequence.
    */
   continuation: string | null;
+  /** `usedBytes` is the UTF-8 length of this whole pack as JSON, scope and continuation included; it exceeds `maxBytes` only when the budget cannot hold the scope itself (then the pack has no entries and says so). */
   budget: { maxTokens: number; maxBytes: number; usedTokens: number; usedBytes: number };
   /** True when nothing eligible was found: an honest miss, not a reason to invent continuity. */
   empty: boolean;
@@ -230,7 +234,7 @@ export interface BootstrapResult {
   runtime: { sqliteVersion: string; fts5: boolean; schemaVersion: number };
   /** Transcript import: the consent question on first use, else progress and capture gaps. */
   import: ImportStatus;
-  /** Same as `recall({})` after this bootstrap's import: head checkpoint plus the most recent eligible records. */
+  /** Same as `recall({ maxTokens, maxBytes })` after this bootstrap's import: head checkpoint plus the most recent eligible records. */
   context: ContextPack;
 }
 
@@ -339,7 +343,7 @@ export interface StatusResult {
  * - **Idempotency**: an `operationKey` replays its stored result for the same request and
  *   is `idempotency_conflict` for a different one.
  * - **Checkpoints are compare-and-swap** on `expectedRevision`; never merged.
- * - **Recall filters before ranking** and never exceeds its budget.
+ * - **Recall filters before ranking** and the whole pack stays within its budget (unless the budget cannot hold even its scope).
  * - Methods are synchronous and throw only `MemchorError` for expected failures.
  */
 export interface Memory {
@@ -461,7 +465,7 @@ class LocalMemory implements Memory {
         created: { workspace: location.isNew, workstream: scope.createdWorkstream },
         runtime: { sqliteVersion: runtime.sqliteVersion, fts5: runtime.fts5, schemaVersion: SCHEMA_VERSION },
         import: imported,
-        context: withScopeNotice(scope, this.pack(db, scope, parse(RecallInput, {}))),
+        context: this.pack(db, scope, parse(RecallInput, { ...(parsed.maxTokens === undefined ? {} : { maxTokens: parsed.maxTokens }), ...(parsed.maxBytes === undefined ? {} : { maxBytes: parsed.maxBytes }) })),
       };
     });
   }
@@ -531,7 +535,7 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(RecallInput, input);
       const { db, scope } = this.bind();
-      return withScopeNotice(scope, this.pack(db, scope, parsed));
+      return this.pack(db, scope, parsed);
     });
   }
 
@@ -775,10 +779,6 @@ class LocalMemory implements Memory {
   /**
    * Builds one page of a context pack inside a single read transaction, so the head
    * checkpoint, the candidates, and their citations come from one consistent snapshot.
-   */
-  /**
-   * Builds one page of a context pack inside a single read transaction, so the head
-   * checkpoint, the candidates, and their citations come from one consistent snapshot.
    *
    * Page 1 ranks and freezes the whole sequence (≤ SEQUENCE_CAP seqs); the continuation
    * carries the unreturned remainder. Later pages only load records by seq, re-checking
@@ -850,16 +850,76 @@ class LocalMemory implements Memory {
       const itemPackables = (count: number, freshnessOf: (row: Candidate) => RecordFreshness): Packable<PackItem>[] =>
         groups.slice(0, count).map((group) => itemPackable(group, freshnessOf(group.representative), citations, sources, roots));
 
+      // Resume at the first unconsumed group. Copies folded into a returned item leave the
+      // sequence with it; records dropped as ineligible leave it too.
+      const loaded = new Set(rows.map((row) => row.seq));
+      const windowed = new Set(window);
+      const remainingAfter = (page: PackedPage<PackCheckpoint, PackItem>): number[] => {
+        const consumed = new Set(groups.slice(0, page.consumed).flatMap((group) => [group.representative, ...group.copies].map((row) => row.seq)));
+        return sequence.filter((seq) => (windowed.has(seq) ? loaded.has(seq) && !consumed.has(seq) : true));
+      };
+      // The whole pack for a page: the budget covers all of it (see context-pack.ts).
+      const assemble = (page: PackedPage<PackCheckpoint, PackItem>, carry: number, starved: boolean): ContextPack => {
+        const remaining = remainingAfter(page);
+        const carried = remaining.slice(0, carry);
+        const uncarried = beyondCap + remaining.length - carried.length;
+        const omissions: Omission[] = [];
+        if (page.oversized.length > 0) omissions.push({ reason: "exceeds_budget", count: page.oversized.length, recordIds: page.oversized });
+        if (carried.length > 0) omissions.push({ reason: "budget", count: carried.length });
+        if (uncarried > 0) omissions.push({ reason: "candidate_limit", count: uncarried });
+        const truncated = omissions.length > 0 || page.checkpoint?.truncated === true;
+        const empty = page.checkpoint === null && page.items.length === 0 && omissions.length === 0;
+        let notice: string | null = null;
+        if (starved) {
+          notice = "This budget is too small for even the pack's scope and envelope, so nothing was returned. Recall again with a larger maxBytes/maxTokens.";
+        } else if (empty) {
+          notice =
+            continued === null && query === null
+              ? "No memory has been recorded for this workstream yet. There is no prior context; do not assume any."
+              : "No eligible memory matches this request. Nothing is known about it; do not assume prior context.";
+        } else if (truncated) {
+          notice =
+            uncarried > 0 && carried.length === 0
+              ? `${uncarried} more eligible record${uncarried === 1 ? "" : "s"} match than this sequence carries (at most ${SEQUENCE_CAP} are sequenced, fewer when a small budget limits the continuation). Refine the query, or recall with a larger budget.`
+              : "Budget reached before all eligible memory was returned. Pass `continuation` for more, or read a recordId to expand it.";
+        }
+        return {
+          scope: view,
+          checkpoint: page.checkpoint,
+          items: page.items,
+          omissions,
+          truncated,
+          continuation:
+            carried.length > 0
+              ? sealContinuation(scope.continuationSecret, {
+                  workspaceId: scope.workspaceId,
+                  workstreamId: scope.workstreamId,
+                  query,
+                  kinds: sequenceKinds,
+                  remaining: carried,
+                  beyondCap: uncarried,
+                })
+              : null,
+          budget: { ...budget, usedBytes: 0, usedTokens: 0 },
+          empty,
+          notice: withScopeNotice(scope, notice, empty),
+        };
+      };
+      const plan = planPage(budget.maxBytes, assemble, (page) => remainingAfter(page).length);
+
       // Two passes keep validation to what the budget can return. The first selects with
       // the smallest annotation freshness could produce; only that prefix is checked
       // against the live worktree; the second packs the prefix with the real annotations,
       // which can only shrink it, so no unchecked record is ever returned.
       const refsOf = (row: RecordRow): StoredRef[] => recordFields(row).externalRefs;
-      const selection = packPage(
-        budget,
-        checkpointPackable(freshnessFloor(checkpointRow === null ? [] : refsOf(checkpointRow))),
-        itemPackables(groups.length, (row) => freshnessFloor(refsOf(row))),
-      );
+      const selection =
+        plan === null
+          ? EMPTY_PAGE
+          : packPage(
+              plan,
+              checkpointPackable(freshnessFloor(checkpointRow === null ? [] : refsOf(checkpointRow))),
+              itemPackables(groups.length, (row) => freshnessFloor(refsOf(row))),
+            );
       const selected = groups.slice(0, selection.consumed).map((group) => group.representative);
       const checked = checkFreshness(scope.worktree, [
         ...(checkpointRow === null ? [] : [{ recordId: checkpointRow.id, refs: refsOf(checkpointRow), imported: false }]),
@@ -870,55 +930,14 @@ class LocalMemory implements Memory {
         if (result === undefined) throw new Error(`record ${row.id} was packed without a freshness check`);
         return result;
       };
-      const page = packPage(budget, checkpointRow === null ? null : checkpointPackable(freshnessOf(checkpointRow)), itemPackables(selection.consumed, freshnessOf));
-
-      // Resume at the first unconsumed group. Copies folded into a returned item leave the
-      // sequence with it; records dropped as ineligible leave it too.
-      const loaded = new Set(rows.map((row) => row.seq));
-      const windowed = new Set(window);
-      const consumed = new Set(groups.slice(0, page.consumed).flatMap((group) => [group.representative, ...group.copies].map((row) => row.seq)));
-      const remaining = sequence.filter((seq) => (windowed.has(seq) ? loaded.has(seq) && !consumed.has(seq) : true));
-      const omissions: Omission[] = [];
-      if (page.oversized.length > 0) omissions.push({ reason: "exceeds_budget", count: page.oversized.length, recordIds: page.oversized });
-      if (remaining.length > 0) omissions.push({ reason: "budget", count: remaining.length });
-      if (beyondCap > 0) omissions.push({ reason: "candidate_limit", count: beyondCap });
-      const truncated = omissions.length > 0 || page.checkpoint?.truncated === true;
-      const empty = page.checkpoint === null && page.items.length === 0 && omissions.length === 0;
-
-      let notice: string | null = null;
-      if (empty) {
-        notice =
-          continued === null && query === null
-            ? "No memory has been recorded for this workstream yet. There is no prior context; do not assume any."
-            : "No eligible memory matches this request. Nothing is known about it; do not assume prior context.";
-      } else if (truncated) {
-        notice =
-          beyondCap > 0 && remaining.length === 0
-            ? `More than ${SEQUENCE_CAP} records match; only the top ${SEQUENCE_CAP} are sequenced. Refine the query to see the rest.`
-            : "Budget reached before all eligible memory was returned. Pass `continuation` for more, or read a recordId to expand it.";
-      }
-
-      return {
-        scope: view,
-        checkpoint: page.checkpoint,
-        items: page.items,
-        omissions,
-        truncated,
-        continuation:
-          remaining.length > 0
-            ? sealContinuation(scope.continuationSecret, {
-                workspaceId: scope.workspaceId,
-                workstreamId: scope.workstreamId,
-                query,
-                kinds: sequenceKinds,
-                remaining,
-                beyondCap,
-              })
-            : null,
-        budget: { ...budget, usedBytes: page.usedBytes, usedTokens: estimateTokens(page.usedBytes) },
-        empty,
-        notice,
-      };
+      return packWithinBudget(
+        budget.maxBytes,
+        plan,
+        checkpointRow === null ? null : checkpointPackable(freshnessOf(checkpointRow)),
+        itemPackables(selection.consumed, freshnessOf),
+        assemble,
+        (page) => remainingAfter(page).length,
+      );
     })();
   }
 
@@ -1009,11 +1028,11 @@ function scopeView(db: Db, scope: BoundScope): Scope {
 }
 
 /** While no workstream is bound, a pack says why it holds only workspace-level memory. */
-function withScopeNotice(scope: BoundScope, pack: ContextPack): ContextPack {
-  if (scope.ambiguity === null) return pack;
+function withScopeNotice(scope: BoundScope, notice: string | null, empty: boolean): string | null {
+  if (scope.ambiguity === null) return notice;
   const why =
     "No workstream is bound yet (scope.ambiguity lists the candidates), so this holds only workspace-level memory. Ask the user which workstream to continue, then call memory_bootstrap with workstream set to its id or \"new\".";
-  return { ...pack, notice: pack.empty || pack.notice === null ? why : `${why} ${pack.notice}` };
+  return empty || notice === null ? why : `${why} ${notice}`;
 }
 
 function withHeadCommit(applicability: Applicability, worktree: string): Applicability {

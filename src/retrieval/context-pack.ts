@@ -6,12 +6,22 @@ import { clipToBytes } from "./search.js";
 /**
  * Budgeted packing and continuation tokens for recall.
  *
- * Budget accounting: every packed entry (the checkpoint and each item) is measured as
- * the UTF-8 length of its JSON serialisation; `usedBytes` is their sum and never exceeds
- * `maxBytes`. The fixed envelope (scope, notice, budget, continuation) is not counted.
+ * Budget accounting: the budget covers the whole pack as the client receives it, the UTF-8
+ * length of its JSON serialisation: scope, checkpoint, items, omissions, notice,
+ * continuation and the budget object itself. `usedBytes` is that length. The envelope is
+ * measured first (see {@link planPage}); entries fill what it leaves. A budget too small
+ * for the envelope alone gets a pack with no entries and says so: the one case a pack
+ * exceeds its budget, since scope (and an ambiguity question) is never cut.
  */
 
 export const ITEM_EXCERPT_BYTES = 1_000;
+
+/**
+ * A continuation may take at most this fraction (1/n) of the budget. Tokens carry their
+ * sequence (≤ 500 seqs, ~2.5 KB) and are paid for in the agent's context like any other
+ * bytes, so a small budget carries a shorter sequence rather than a token bigger than its entries.
+ */
+const CONTINUATION_SHARE = 4;
 
 export interface ContinuationState {
   workspaceId: string;
@@ -20,7 +30,7 @@ export interface ContinuationState {
   kinds: string[] | null;
   /** The not-yet-returned part of the sequence frozen at page 1, as record seqs in rank order. */
   remaining: number[];
-  /** Eligible matches beyond the sequence cap at page 1 (reported, never returned). */
+  /** Eligible matches the sequence does not carry (beyond the cap, or dropped to fit a budget); reported, never returned. */
   beyondCap: number;
 }
 
@@ -28,24 +38,24 @@ export interface ContinuationState {
  * Seals continuation state with an HMAC keyed by a per-workspace secret, so a token
  * cannot be forged, edited, or replayed in another workspace/workstream. The token
  * carries the frozen remainder of the ranked sequence itself, so later pages neither
- * re-rank (bm25 statistics drift as others write) nor need server-side state.
+ * re-rank (bm25 statistics drift as others write) nor need server-side state. The
+ * workspace and workstream are bound by the signature instead of being carried, which
+ * keeps the token (part of every budget) short.
  */
 export function sealContinuation(secret: Buffer, state: ContinuationState): string {
   const payload = Buffer.from(
     JSON.stringify({
-      v: 2,
-      ws: state.workspaceId,
-      wst: state.workstreamId,
+      v: 3,
       q: state.query,
       k: state.kinds,
       r: state.remaining.map((seq) => seq.toString(36)).join(","),
       x: state.beyondCap,
     }),
   ).toString("base64url");
-  return `${payload}.${sign(secret, payload)}`;
+  return `${payload}.${sign(secret, state, payload)}`;
 }
 
-/** Verifies and decodes a token for this scope; anything else is `invalid_input`. */
+/** Verifies and decodes a token for this scope; anything else (including another scope's token) is `invalid_input`. */
 export function openContinuation(secret: Buffer, token: string, scope: { workspaceId: string; workstreamId: string }): ContinuationState {
   const invalid = (why: string): MemchorError =>
     new MemchorError("invalid_input", `The continuation is not valid here (${why}). Start a new recall without it.`, {
@@ -53,23 +63,20 @@ export function openContinuation(secret: Buffer, token: string, scope: { workspa
     });
   const [payload, signature, extra] = token.split(".");
   if (payload === undefined || signature === undefined || extra !== undefined) throw invalid("malformed");
-  const expected = Buffer.from(sign(secret, payload));
+  const expected = Buffer.from(sign(secret, scope, payload));
   const given = Buffer.from(signature);
-  if (expected.length !== given.length || !timingSafeEqual(expected, given)) throw invalid("signature mismatch");
+  if (expected.length !== given.length || !timingSafeEqual(expected, given)) throw invalid("signature mismatch, or issued for another scope");
   const state = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
     v: number;
-    ws: string;
-    wst: string;
     q: string | null;
     k: string[] | null;
     r: string;
     x: number;
   };
-  if (state.v !== 2) throw invalid("unsupported version");
-  if (state.ws !== scope.workspaceId || state.wst !== scope.workstreamId) throw invalid("issued for another scope");
+  if (state.v !== 3) throw invalid("unsupported version");
   return {
-    workspaceId: state.ws,
-    workstreamId: state.wst,
+    workspaceId: scope.workspaceId,
+    workstreamId: scope.workstreamId,
     query: state.q,
     kinds: state.k,
     remaining: state.r === "" ? [] : state.r.split(",").map((seq) => parseInt(seq, 36)),
@@ -77,8 +84,8 @@ export function openContinuation(secret: Buffer, token: string, scope: { workspa
   };
 }
 
-function sign(secret: Buffer, payload: string): string {
-  return createHmac("sha256", secret).update(payload).digest("base64url");
+function sign(secret: Buffer, scope: { workspaceId: string; workstreamId: string }, payload: string): string {
+  return createHmac("sha256", secret).update(`${scope.workspaceId}\u0000${scope.workstreamId}\u0000${payload}`).digest("base64url");
 }
 
 export interface Budget {
@@ -139,17 +146,28 @@ export interface PackedPage<C, I> {
 }
 
 /**
+ * Entry bytes for one page. `room` leaves space for the page's continuation; `maxRoom` is
+ * everything the envelope leaves. The entry that leads a page may use `maxRoom` (its
+ * continuation then carries less), so no entry that fits beside the envelope is ever
+ * reported as too large merely because a continuation was reserved.
+ */
+export interface Room {
+  room: number;
+  maxRoom: number;
+}
+
+/**
  * Greedy packing in rank order. The checkpoint (if any) goes first. Packing stops at the
  * first item that does not fit, so the pack is always a prefix of the ranked sequence
  * and the continuation resumes exactly there. An entry too large for even an empty
- * page's whole budget is skipped and reported by id instead of blocking the sequence.
+ * page's whole room is skipped and reported by id instead of blocking the sequence.
  */
-export function packPage<C, I>(budget: Budget, checkpoint: Packable<C> | null, candidates: readonly Packable<I>[]): PackedPage<C, I> {
+export function packPage<C, I>({ room, maxRoom }: Room, checkpoint: Packable<C> | null, candidates: readonly Packable<I>[]): PackedPage<C, I> {
   let usedBytes = 0;
   const oversized: string[] = [];
   let packedCheckpoint: C | null = null;
   if (checkpoint !== null) {
-    const fitted = fit(checkpoint, budget.maxBytes);
+    const fitted = fit(checkpoint, maxRoom);
     if (fitted === null) oversized.push(checkpoint.recordId);
     else {
       packedCheckpoint = fitted.entry;
@@ -159,8 +177,8 @@ export function packPage<C, I>(budget: Budget, checkpoint: Packable<C> | null, c
   const items: I[] = [];
   let consumed = 0;
   for (const candidate of candidates) {
-    let fitted = fit(candidate, budget.maxBytes - usedBytes);
     const leadsPage = packedCheckpoint === null && items.length === 0;
+    let fitted = fit(candidate, (leadsPage ? maxRoom : room) - usedBytes);
     const sourceBytes = Math.min(candidate.maxExcerptBytes, Buffer.byteLength(candidate.source, "utf8"));
     if (fitted !== null && !leadsPage && fitted.excerptBytes < Math.min(MIN_USEFUL_EXCERPT_BYTES, sourceBytes)) fitted = null;
     if (fitted !== null) {
@@ -169,7 +187,7 @@ export function packPage<C, I>(budget: Budget, checkpoint: Packable<C> | null, c
       consumed++;
       continue;
     }
-    if (leadsPage || fit(candidate, budget.maxBytes) === null) {
+    if (leadsPage || fit(candidate, maxRoom) === null) {
       oversized.push(candidate.recordId);
       consumed++;
       continue;
@@ -181,6 +199,88 @@ export function packPage<C, I>(budget: Budget, checkpoint: Packable<C> | null, c
 
 export function usage(usedBytes: number): { usedBytes: number; usedTokens: number } {
   return { usedBytes, usedTokens: estimateTokens(usedBytes) };
+}
+
+/** What {@link planPage} and {@link packWithinBudget} need from a whole result. */
+export interface Envelope {
+  continuation: string | null;
+  budget: { usedBytes: number; usedTokens: number };
+}
+
+/**
+ * Builds the whole result for a page: its continuation carries at most `carry` of the
+ * sequence the page leaves (the rest is reported as not carried); `starved` marks a budget
+ * too small for any entry. Must be pure: it is called repeatedly while measuring.
+ */
+export type Assemble<C, I, P extends Envelope> = (page: PackedPage<C, I>, carry: number, starved: boolean) => P;
+
+export const EMPTY_PAGE: PackedPage<never, never> = { checkpoint: null, items: [], consumed: 0, usedBytes: 0, oversized: [] };
+
+/**
+ * Measures the envelope before any entry is packed: the result with no entries and no
+ * continuation, and the continuation the whole sequence would need (capped at the budget's
+ * {@link CONTINUATION_SHARE}). Null when the budget cannot hold even the bare envelope.
+ */
+export function planPage<C, I, P extends Envelope>(maxBytes: number, assemble: Assemble<C, I, P>, remainingAfter: (page: PackedPage<C, I>) => number): Room | null {
+  const bare = measured(assemble(EMPTY_PAGE, 0, false)).budget.usedBytes;
+  const carrying = measured(assemble(EMPTY_PAGE, carryWithin(maxBytes, assemble, EMPTY_PAGE, remainingAfter(EMPTY_PAGE)), false)).budget.usedBytes;
+  const maxRoom = maxBytes - bare;
+  return maxRoom <= 0 ? null : { room: Math.max(0, maxRoom - (carrying - bare)), maxRoom };
+}
+
+/**
+ * Packs the page and returns the whole result within `maxBytes`: entries in `room`, then a
+ * continuation carrying as much of the rest as its share of the budget allows. What pushes
+ * the result over (omission lists, notice) shrinks the room and the page is packed again;
+ * if nothing fits, the result is the starved envelope.
+ */
+export function packWithinBudget<C, I, P extends Envelope>(
+  maxBytes: number,
+  plan: Room | null,
+  checkpoint: Packable<C> | null,
+  candidates: readonly Packable<I>[],
+  assemble: Assemble<C, I, P>,
+  remainingAfter: (page: PackedPage<C, I>) => number,
+): P {
+  let room = plan;
+  for (let attempt = 0; room !== null && room.maxRoom > 0 && attempt < 8; attempt++) {
+    const page = packPage(room, checkpoint, candidates);
+    const result = measured(assemble(page, carryWithin(maxBytes, assemble, page, remainingAfter(page)), false));
+    const over = result.budget.usedBytes - maxBytes;
+    if (over <= 0) return result;
+    room = { room: Math.max(0, room.room - over), maxRoom: room.maxRoom - over };
+  }
+  return measured(assemble(EMPTY_PAGE, 0, true));
+}
+
+/** The most of `remaining` a continuation can carry within the budget's share (0 = no continuation). */
+function carryWithin<C, I, P extends Envelope>(maxBytes: number, assemble: Assemble<C, I, P>, page: PackedPage<C, I>, remaining: number): number {
+  const share = Math.floor(maxBytes / CONTINUATION_SHARE);
+  const fits = (carry: number): boolean => Buffer.byteLength(JSON.stringify(assemble(page, carry, false).continuation), "utf8") <= share;
+  if (fits(remaining)) return remaining;
+  let lo = 0;
+  let hi = remaining - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(mid)) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
+/**
+ * Sets `usedBytes` to the length of the result's own serialisation, `budget` included.
+ * The length depends on its own digits, so it is iterated to the fixed point (it grows
+ * monotonically and settles within a step or two).
+ */
+function measured<P extends Envelope>(result: P): P {
+  let current = result;
+  for (let i = 0; i < 8; i++) {
+    const bytes = Buffer.byteLength(JSON.stringify(current), "utf8");
+    if (bytes === current.budget.usedBytes) return current;
+    current = { ...current, budget: { ...current.budget, ...usage(bytes) } };
+  }
+  return current;
 }
 
 /** Appended to an excerpt that was cut to fit, so a clipped body never reads as the whole record. */
