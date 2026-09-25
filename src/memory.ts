@@ -53,7 +53,16 @@ import {
   usage,
 } from "./retrieval/context-pack.js";
 import { isEligible, type Lifecycle, requireVisibleRecord, type RecordRow, type Taint } from "./retrieval/eligibility.js";
-import { captureObservations, type CheckedRef, checkFreshness, freshnessFloor, type RecordFreshness, type StoredRef } from "./retrieval/freshness.js";
+import {
+  captureObservations,
+  type CheckedRef,
+  checkFreshness,
+  type FreshnessSubject,
+  freshnessFloor,
+  type RecordFreshness,
+  type TestRunView,
+  worktreeFingerprint,
+} from "./retrieval/freshness.js";
 import { type Candidate, clipToBytes, loadCandidates, PAGE_CANDIDATES, rankSequence, rebuildSearchIndex, SEQUENCE_CAP, toFtsQuery } from "./retrieval/search.js";
 import {
   type Applicability,
@@ -88,7 +97,7 @@ import {
 import { appendRecord, recordFields } from "./storage/records.js";
 
 export type { ImportedSource, Citation } from "./integrity/provenance.js";
-export type { CheckedRef, FreshnessReason } from "./retrieval/freshness.js";
+export type { CheckedRef, FreshnessReason, TestRunReason, TestRunView } from "./retrieval/freshness.js";
 export type { ImportCounters, ImportGap, ImportStatus } from "./import/reconcile.js";
 export type { IntegrityReport } from "./storage/database.js";
 export type { CandidateSignal, ResolutionBasis, ScopeAmbiguity, WorkstreamCandidate } from "./bootstrap/workstream-resolution.js";
@@ -167,6 +176,11 @@ export interface PackItem {
   citations: Citation[];
   /** Each reference with its own freshness and reason (see `FreshnessReason`). */
   externalRefs: CheckedRef[];
+  /**
+   * The test/lint/build run this record reports, if any: `evidence` (captured tool output, or
+   * the agent's assertion) and whether it `applies` to the commit and working tree as they are now.
+   */
+  testRun: TestRunView | null;
   workspaceLevel: boolean;
   host: string;
   /** Memchor session that wrote (or imported) the record. */
@@ -299,6 +313,7 @@ export interface ReadResult {
   warning: string | null;
   applicability: Applicability;
   externalRefs: CheckedRef[];
+  testRun: TestRunView | null;
   independentRoot: string;
   /** Links in both directions whose other end is visible in this scope. */
   links: { recordId: string; relation: LinkRelation; direction: "outgoing" | "incoming" }[];
@@ -338,6 +353,7 @@ export interface InspectedRecord {
   freshness: Freshness;
   warning: string | null;
   externalRefs: CheckedRef[];
+  testRun: TestRunView | null;
 }
 
 export type ManageResult =
@@ -570,6 +586,7 @@ class LocalMemory implements Memory {
       // Observed outside the write transaction (Git and file reads must not hold the lock),
       // and not part of the idempotency hash, which covers only what the caller sent.
       const externalRefs = captureObservations(scope.worktree, parsed.externalRefs);
+      const ranAgainst = parsed.testRun === undefined ? null : worktreeFingerprint(scope.worktree);
       const links: Citation[] = [
         ...parsed.supportedBy.map((recordId) => ({ recordId, relation: "supported_by" as const })),
         ...parsed.links.map((link) => ({ recordId: link.to, relation: link.relation })),
@@ -584,7 +601,10 @@ class LocalMemory implements Memory {
           host: scope.host,
           attribution: parsed.attribution,
           reviewState: parsed.reviewState,
-          applicability,
+          applicability:
+            parsed.testRun === undefined || ranAgainst === null
+              ? applicability
+              : { ...applicability, testRun: { ...parsed.testRun, ...ranAgainst, evidence: capturedOutput(db, parsed.supportedBy) ? "captured" : "asserted" } },
           externalRefs,
           links,
         });
@@ -649,7 +669,7 @@ class LocalMemory implements Memory {
         const revision = db.prepare("SELECT revision FROM checkpoints WHERE record_id = ?").get(row.id) as { revision: number } | undefined;
         const source = importedFrom(db, [row.id]).get(row.id) ?? null;
         const fields = recordFields(row);
-        const checked = checkFreshness(scope.worktree, [{ recordId: row.id, refs: fields.externalRefs, imported: source !== null }]).get(row.id);
+        const checked = checkFreshness(scope.worktree, [freshnessSubject(row, source !== null)]).get(row.id);
         return {
           recordId: row.id,
           title: row.title,
@@ -662,6 +682,7 @@ class LocalMemory implements Memory {
           freshness: checked?.freshness ?? "unknown",
           warning: checked?.warning ?? null,
           externalRefs: checked?.externalRefs ?? [],
+          testRun: checked?.testRun ?? null,
           independentRoot: rootOf(independentRoots(db, scope.workstreamId, [row.id]), row.id),
           links: linksOf(db, scope.workstreamId, row.id),
           checkpointRevision: revision?.revision ?? null,
@@ -867,7 +888,7 @@ class LocalMemory implements Memory {
     const { inspection, source } = found;
     const row = inspection.row;
     const fields = recordFields(row);
-    const checked = checkFreshness(scope.worktree, [{ recordId: row.id, refs: fields.externalRefs, imported: source !== null }]).get(row.id);
+    const checked = checkFreshness(scope.worktree, [freshnessSubject(row, source !== null)]).get(row.id);
     const body = clipToBytes(row.body, INSPECT_BODY_BYTES);
     return {
       v: 1,
@@ -892,6 +913,7 @@ class LocalMemory implements Memory {
         freshness: checked?.freshness ?? "unknown",
         warning: checked?.warning ?? null,
         externalRefs: checked?.externalRefs ?? [],
+        testRun: checked?.testRun ?? null,
       },
       history: inspection.history,
       replacement: inspection.replacement,
@@ -1085,19 +1107,22 @@ class LocalMemory implements Memory {
       // the smallest annotation freshness could produce; only that prefix is checked
       // against the live worktree; the second packs the prefix with the real annotations,
       // which can only shrink it, so no unchecked record is ever returned.
-      const refsOf = (row: RecordRow): StoredRef[] => recordFields(row).externalRefs;
+      const floorOf = (row: RecordRow): RecordFreshness => {
+        const fields = recordFields(row);
+        return freshnessFloor(fields.externalRefs, fields.testRun ?? undefined);
+      };
       const selection =
         plan === null
           ? EMPTY_PAGE
           : packPage(
               plan,
-              checkpointPackable(freshnessFloor(checkpointRow === null ? [] : refsOf(checkpointRow))),
-              itemPackables(groups.length, (row) => freshnessFloor(refsOf(row))),
+              checkpointPackable(checkpointRow === null ? freshnessFloor([]) : floorOf(checkpointRow)),
+              itemPackables(groups.length, floorOf),
             );
       const selected = groups.slice(0, selection.consumed).map((group) => group.representative);
       const checked = checkFreshness(scope.worktree, [
-        ...(checkpointRow === null ? [] : [{ recordId: checkpointRow.id, refs: refsOf(checkpointRow), imported: false }]),
-        ...selected.map((row) => ({ recordId: row.id, refs: refsOf(row), imported: sources.has(row.id) })),
+        ...(checkpointRow === null ? [] : [freshnessSubject(checkpointRow, false)]),
+        ...selected.map((row) => freshnessSubject(row, sources.has(row.id))),
       ]);
       const freshnessOf = (row: RecordRow): RecordFreshness => {
         const result = checked.get(row.id);
@@ -1166,6 +1191,7 @@ function itemPackable(
       applicability: fields.applicability,
       citations: citations.get(row.id) ?? [],
       externalRefs: freshness.externalRefs,
+      testRun: freshness.testRun,
       workspaceLevel: fields.workspaceLevel,
       host: row.host,
       sessionId: row.session_id,
@@ -1176,6 +1202,28 @@ function itemPackable(
       copies,
     }),
   };
+}
+
+/** What freshness checks need of a stored record: its references and any test run it reports. */
+function freshnessSubject(row: RecordRow, imported: boolean): FreshnessSubject {
+  const fields = recordFields(row);
+  return { recordId: row.id, refs: fields.externalRefs, imported, testRun: fields.testRun ?? undefined };
+}
+
+/**
+ * Whether a test run's citations include output Memchor captured itself: a tool result imported
+ * from the host's transcript. Anything else (the agent's own records) leaves the run an assertion.
+ */
+function capturedOutput(db: Db, supportedBy: readonly string[]): boolean {
+  if (supportedBy.length === 0) return false;
+  return (
+    db
+      .prepare(
+        `SELECT 1 FROM records r JOIN import_events e ON e.record_id = r.id
+         WHERE r.id IN (SELECT value FROM json_each(?)) AND r.kind = 'evidence' AND r.attribution = 'direct_observation' LIMIT 1`,
+      )
+      .get(JSON.stringify(supportedBy)) !== undefined
+  );
 }
 
 /**

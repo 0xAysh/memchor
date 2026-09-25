@@ -3,6 +3,7 @@ import { inheritTaints } from "../integrity/taints.js";
 import { type Citation, insertLinks } from "../integrity/provenance.js";
 import { indexRecord } from "../retrieval/search.js";
 import type { RecordRow } from "../retrieval/eligibility.js";
+import type { StoredTestRun } from "../retrieval/freshness.js";
 import type { Applicability, Attribution, ExternalRef, Freshness, RecordKind, ReviewState } from "../schemas.js";
 import { type Db, prepared, requireTransaction } from "./database.js";
 
@@ -16,7 +17,8 @@ export interface NewRecord {
   host: string;
   attribution: Attribution;
   reviewState: ReviewState;
-  applicability: Applicability;
+  /** A reported test run is stored with the applicability it has: the state it ran against. */
+  applicability: Applicability & { testRun?: StoredTestRun };
   externalRefs: readonly ExternalRef[];
   links: readonly Citation[];
   /** The transcript or external source the record was imported from. */
@@ -90,17 +92,20 @@ export interface RecordFields {
   freshness: Freshness;
   applicability: Applicability;
   externalRefs: ExternalRef[];
+  testRun: StoredTestRun | null;
   workspaceLevel: boolean;
 }
 
 export function recordFields(row: RecordRow): RecordFields {
+  const { testRun, ...applicability } = JSON.parse(row.applicability) as Applicability & { testRun?: StoredTestRun };
   return {
     kind: row.kind as RecordKind,
     attribution: row.attribution as Attribution,
     reviewState: row.review_state as ReviewState,
     freshness: row.freshness as Freshness,
-    applicability: JSON.parse(row.applicability) as Applicability,
+    applicability,
     externalRefs: JSON.parse(row.external_refs) as ExternalRef[],
+    testRun: testRun ?? null,
     workspaceLevel: row.workstream_id === null,
   };
 }

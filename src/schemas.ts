@@ -123,6 +123,14 @@ export const Applicability = z.strictObject({
 });
 export type Applicability = z.infer<typeof Applicability>;
 
+/** A test, lint or build run a record reports. Memchor adds the repository state it ran against. */
+export const TestRunInput = z.strictObject({
+  command: z.string().trim().min(1).max(500).describe("The exact command that ran, e.g. npm test -- gateway"),
+  outcome: z.enum(["passed", "failed"]),
+  exitCode: z.int().min(0).max(255).optional(),
+});
+export type TestRunInput = z.infer<typeof TestRunInput>;
+
 const OperationKey = z
   .string()
   .min(1)
@@ -192,6 +200,9 @@ export const RecordInput = z.strictObject({
     .default([])
     .describe("Pointers to code, documents, issues or URLs; never their content"),
   applicability: Applicability.default({}),
+  testRun: TestRunInput.optional().describe(
+    "Only when this record reports a test/lint/build run you just did. Memchor stamps the commit and working-tree state it applies to. Cite the run's captured tool output with supportedBy if memory has it; otherwise the result is stored as your assertion, never as observed",
+  ),
   operationKey: OperationKey.optional(),
 });
 export type RecordInput = z.input<typeof RecordInput>;

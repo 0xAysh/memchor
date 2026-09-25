@@ -181,7 +181,7 @@ describe("local code freshness", () => {
     expect(recallItem(memory, recordId).externalRefs[0]).toMatchObject({ freshness: "unknown", reason: "too_large" });
   });
 
-  test("issue, PR, URL and document references are historical until the agent verifies them", () => {
+  test("issue, PR, URL and remote document references are historical until the agent verifies them", () => {
     const memory = open(repoWithGateway(), tempDir());
     const { recordId } = memory.record({
       kind: "reference",
@@ -191,7 +191,7 @@ describe("local code freshness", () => {
         { kind: "issue", locator: "#412" },
         { kind: "pr", locator: "#415" },
         { kind: "url", locator: "https://status.example.invalid" },
-        { kind: "document", locator: "docs/runbook.md" },
+        { kind: "document", locator: "https://wiki.example.invalid/runbook" },
       ],
     });
     const item = recallItem(memory, recordId);

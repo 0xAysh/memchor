@@ -34,15 +34,22 @@ import type { ExternalRef, Freshness } from "../schemas.js";
  * - **Imported transcript references were never fingerprinted.** Hashing the file at
  *   import time would certify whatever version exists *then*, not the one the transcript
  *   saw, so they stay `unknown` / `transcript_reference` and the agent reads live code.
- * - **Remote references are historical.** Issues, PRs, URLs and documents can change
- *   without any local trace, and Memchor makes no network call, so they are `unknown` /
+ * - **Documents in the worktree are files.** A `document` reference whose path resolves inside
+ *   the worktree (`docs/design.md`) is fingerprinted and checked exactly like code.
+ * - **Remote references are historical.** Issues, PRs, URLs and documents behind a URL can
+ *   change without any local trace, and Memchor makes no network call, so they are `unknown` /
  *   `remote_unverified` until the agent checks them with its own tools.
+ * - **A test result applies to the state it ran against.** A record's `testRun` is stamped with
+ *   HEAD and a fingerprint of the working tree (see {@link worktreeFingerprint}); it is current
+ *   only while both are unchanged. A run the agent merely reported (no cited tool output that
+ *   Memchor captured from the transcript) is an assertion and is never current.
  *
  * Work is bounded: at most {@link FRESHNESS_LIMITS.refsPerCheck} references and
  * {@link FRESHNESS_LIMITS.totalBytes} hashed bytes per call, files over
  * {@link FRESHNESS_LIMITS.fileBytes} are never read, results are cached per call, and Git
  * runs at most twice per call (one path-limited `git status`, one `cat-file` only when a
- * caller-supplied commit must be checked). There is no repository-wide scan.
+ * caller-supplied commit must be checked), plus one working-tree `git status` only when a
+ * selected record carries a test run. There is no repository-wide scan otherwise.
  */
 
 export const FRESHNESS_LIMITS = {
@@ -79,6 +86,32 @@ export const FRESHNESS_REASONS = [
 ] as const;
 export type FreshnessReason = (typeof FRESHNESS_REASONS)[number];
 
+export const TEST_RUN_REASONS = [
+  /** current: HEAD and the working tree are what the run saw. */
+  "same_state",
+  /** stale: HEAD moved or the working tree changed since the run. */
+  "other_state",
+  /** unknown: the working tree could not be fingerprinted then or now (too large, not Git). */
+  "not_fingerprinted",
+] as const;
+export type TestRunReason = (typeof TEST_RUN_REASONS)[number];
+
+/** A test run as stored in a record's applicability: what ran, and the state it ran against. */
+export interface StoredTestRun {
+  command: string;
+  outcome: "passed" | "failed";
+  exitCode?: number | undefined;
+  /** HEAD when the run was recorded. */
+  commit: string | null;
+  /** {@link worktreeFingerprint} when the run was recorded. */
+  worktree: string | null;
+  /** `captured`: the record cites tool output Memchor imported from the host's transcript; `asserted`: the agent's word only. */
+  evidence: "captured" | "asserted";
+}
+
+/** A test run as presented: whether it still applies to the repository as it is now. */
+export type TestRunView = Omit<StoredTestRun, "worktree"> & { applies: Freshness; reason: TestRunReason };
+
 /** A reference as stored: the caller's pointer plus what Memchor observed at write time. */
 export interface StoredRef extends ExternalRef {
   /** Memchor-captured: the file had uncommitted or untracked changes when observed. */
@@ -92,9 +125,10 @@ export type CheckedRef = Omit<ExternalRef, "observedHash"> & {
 };
 
 export interface RecordFreshness {
-  /** Worst of the references (stale > unknown > current); `unknown` when there are none. */
+  /** Worst of the references and the test run (stale > unknown > current); `unknown` when there are none. */
   freshness: Freshness;
   externalRefs: CheckedRef[];
+  testRun: TestRunView | null;
   /** What the agent must do before relying on the record; null when every reference is current or there are none. */
   warning: string | null;
 }
@@ -104,17 +138,28 @@ export interface FreshnessSubject {
   refs: readonly StoredRef[];
   /** Imported from a transcript: its code references were never fingerprinted. */
   imported: boolean;
+  testRun?: StoredTestRun | undefined;
 }
 
 /** Kept short: every stale or unknown item in a pack carries one, and they share the budget with bodies. */
 const FRESHNESS_WARNINGS = {
-  stale: "Stale: referenced code changed or is gone. Read the current file before relying on this.",
-  unverified: "Unverified: referenced code may have changed. Read the current file before relying on this.",
+  stale: "Stale: a referenced file changed or is gone. Read the current file before relying on this.",
+  unverified: "Unverified: a referenced file may have changed. Read the current file before relying on this.",
   remote: "Historical: issue/PR/URL/document state is as observed then; verify it with your own tools.",
+  asserted: "Asserted: the agent reported this test run; Memchor did not capture its output. Rerun the tests before relying on it.",
+  testStale: "The tests ran against another commit or working tree; rerun them before relying on this.",
+  testUnknown: "The working tree could not be fingerprinted, so this test run may not apply; rerun the tests before relying on it.",
 } as const;
 
 const HASH = /^sha256:[0-9a-f]{64}$/;
 const REMOTE_KINDS: ReadonlySet<string> = new Set(["issue", "pr", "url", "document"]);
+/** A locator with a scheme (`https:`, `file:`) is not a worktree path. */
+const URL_LIKE = /^[a-z][a-z0-9+.-]*:/i;
+
+/** Code, and documents that name a path rather than a URL: files Memchor can fingerprint in the worktree. */
+function isLocalFile(ref: ExternalRef): boolean {
+  return ref.kind === "code" || (ref.kind === "document" && !URL_LIKE.test(ref.path ?? ref.locator));
+}
 const GIT_ENV = { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" };
 
 /**
@@ -126,7 +171,7 @@ const GIT_ENV = { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: 
  */
 export function captureObservations(worktree: string, refs: readonly ExternalRef[]): StoredRef[] {
   const targets = refs.map((ref) =>
-    ref.kind === "code" && ref.commit === undefined && ref.observedHash === undefined ? worktreePath(worktree, ref.path ?? ref.locator) : null,
+    isLocalFile(ref) && ref.commit === undefined && ref.observedHash === undefined ? worktreePath(worktree, ref.path ?? ref.locator) : null,
   );
   const paths = targets.filter((path): path is string => path !== null && !touchesSensitivePath([path]));
   if (paths.length === 0) return [...refs];
@@ -168,12 +213,23 @@ export function checkFreshness(worktree: string, subjects: readonly FreshnessSub
  * it before validating, so only records a budget can hold are ever checked, and the
  * real annotations can only shrink the selection, never add an unchecked record.
  */
-export function freshnessFloor(refs: readonly StoredRef[]): RecordFreshness {
+export function freshnessFloor(refs: readonly StoredRef[], testRun?: StoredTestRun): RecordFreshness {
   const externalRefs = refs.map((ref): CheckedRef => {
-    if (ref.kind === "code") return { ...present(ref), freshness: "stale", reason: "changed" };
+    if (isLocalFile(ref)) return { ...present(ref), freshness: "stale", reason: "changed" };
     return { ...present(ref), freshness: "unknown", reason: REMOTE_KINDS.has(ref.kind) ? "remote_unverified" : "not_checkable" };
   });
-  return { freshness: "stale", externalRefs, warning: externalRefs.some((ref) => ref.kind !== "code") ? FRESHNESS_WARNINGS.remote : null };
+  return {
+    freshness: "stale",
+    externalRefs,
+    testRun: testRun === undefined ? null : { ...presentTestRun(testRun), applies: "stale", reason: "same_state" },
+    warning: externalRefs.some((ref) => !isLocalFile(ref)) ? FRESHNESS_WARNINGS.remote : null,
+  };
+}
+
+function presentTestRun(run: StoredTestRun): Omit<StoredTestRun, "worktree"> {
+  const view: Partial<StoredTestRun> = { ...run };
+  delete view.worktree;
+  return view as Omit<StoredTestRun, "worktree">;
 }
 
 class Checker {
@@ -192,7 +248,7 @@ class Checker {
     let budget: number = FRESHNESS_LIMITS.refsPerCheck;
     for (const subject of subjects) {
       for (const ref of subject.refs) {
-        if (ref.kind !== "code" || budget-- <= 0) continue;
+        if (!isLocalFile(ref) || budget-- <= 0) continue;
         const path = worktreePath(worktree, ref.path ?? ref.locator);
         if (path !== null) paths.add(path);
         if (ref.commit !== undefined && ref.observedHash === undefined && ref.dirty === undefined) pinned.add(ref.commit);
@@ -207,21 +263,34 @@ class Checker {
       const [freshness, reason] = this.ref(ref, subject.imported);
       return { ...present(ref), freshness, reason };
     });
-    const worst: Freshness = externalRefs.some((r) => r.freshness === "stale")
-      ? "stale"
-      : externalRefs.length === 0 || externalRefs.some((r) => r.freshness === "unknown")
-        ? "unknown"
-        : "current";
+    const testRun = subject.testRun === undefined ? null : this.testRun(subject.testRun);
+    // An asserted run counts as unknown whatever the state: the agent's word is not an observation.
+    const testFreshness: Freshness | null = testRun === null ? null : testRun.evidence === "asserted" && testRun.applies !== "stale" ? "unknown" : testRun.applies;
+    const all = [...externalRefs.map((r) => r.freshness), ...(testFreshness === null ? [] : [testFreshness])];
+    const worst: Freshness = all.includes("stale") ? "stale" : all.length === 0 || all.includes("unknown") ? "unknown" : "current";
     const warnings: string[] = [];
     if (externalRefs.some((r) => r.freshness === "stale")) warnings.push(FRESHNESS_WARNINGS.stale);
-    if (externalRefs.some((r) => r.kind === "code" && r.freshness === "unknown")) warnings.push(FRESHNESS_WARNINGS.unverified);
-    if (externalRefs.some((r) => r.kind !== "code")) warnings.push(FRESHNESS_WARNINGS.remote);
-    return { freshness: worst, externalRefs, warning: warnings.length === 0 ? null : warnings.join(" ") };
+    if (externalRefs.some((r) => isLocalFile(r) && r.freshness === "unknown")) warnings.push(FRESHNESS_WARNINGS.unverified);
+    if (externalRefs.some((r) => !isLocalFile(r))) warnings.push(FRESHNESS_WARNINGS.remote);
+    if (testRun?.evidence === "asserted") warnings.push(FRESHNESS_WARNINGS.asserted);
+    else if (testRun?.applies === "stale") warnings.push(FRESHNESS_WARNINGS.testStale);
+    else if (testRun?.applies === "unknown") warnings.push(FRESHNESS_WARNINGS.testUnknown);
+    return { freshness: worst, externalRefs, testRun, warning: warnings.length === 0 ? null : warnings.join(" ") };
+  }
+
+  private current: { commit: string | null; worktree: string | null } | undefined;
+
+  private testRun(run: StoredTestRun): TestRunView {
+    this.current ??= worktreeFingerprint(this.worktree);
+    const view = presentTestRun(run);
+    if (run.worktree === null || run.commit === null || this.current.worktree === null || this.current.commit === null) return { ...view, applies: "unknown", reason: "not_fingerprinted" };
+    return run.commit === this.current.commit && run.worktree === this.current.worktree
+      ? { ...view, applies: "current", reason: "same_state" }
+      : { ...view, applies: "stale", reason: "other_state" };
   }
 
   private ref(ref: StoredRef, imported: boolean): [Freshness, FreshnessReason] {
-    if (REMOTE_KINDS.has(ref.kind)) return ["unknown", "remote_unverified"];
-    if (ref.kind !== "code") return ["unknown", "not_checkable"];
+    if (!isLocalFile(ref)) return ["unknown", REMOTE_KINDS.has(ref.kind) ? "remote_unverified" : "not_checkable"];
     if (this.refsLeft-- <= 0) return ["unknown", "check_limit"];
     const path = worktreePath(this.worktree, ref.path ?? ref.locator);
     if (path === null) return ["unknown", "outside_worktree"];
@@ -394,6 +463,51 @@ function gitState(worktree: string, paths: readonly string[]): GitState | null {
     }
   }
   return state;
+}
+
+/**
+ * HEAD and a fingerprint of the working tree: "clean", or the SHA-256 of every changed or
+ * untracked path (ignored files excluded) with the hash of its current bytes. Bounded like
+ * freshness checks: a changed file over 1 MiB, or more than 8 MiB of changes, or Git failing,
+ * gives a null fingerprint (a test run then cannot be said to apply). Nothing is written.
+ */
+export function worktreeFingerprint(worktree: string): { commit: string | null; worktree: string | null } {
+  let out: string;
+  try {
+    out = execFileSync("git", ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all", "--ignored=no"], {
+      cwd: worktree,
+      env: GIT_ENV,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: 16 * 1024 * 1024,
+    });
+  } catch {
+    return { commit: null, worktree: null };
+  }
+  const fields = out.split("\0");
+  const head = fields.find((field) => field.startsWith("# branch.oid "))?.slice("# branch.oid ".length) ?? null;
+  const commit = head !== null && /^[0-9a-f]{40,64}$/.test(head) ? head : null;
+  // Each entry and the path whose bytes it names (porcelain v2; a rename's original path is the next field).
+  const entries: { line: string; path: string }[] = [];
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i] ?? "";
+    if (field.startsWith("1 ")) entries.push({ line: field, path: field.split(" ").slice(8).join(" ") });
+    else if (field.startsWith("2 ")) entries.push({ line: `${field}\0${fields[++i] ?? ""}`, path: field.split(" ").slice(9).join(" ") });
+    else if (field.startsWith("u ")) entries.push({ line: field, path: field.split(" ").slice(10).join(" ") });
+    else if (field.startsWith("? ")) entries.push({ line: field, path: field.slice(2) });
+  }
+  if (entries.length === 0) return { commit, worktree: "clean" };
+  entries.sort((a, b) => (a.line < b.line ? -1 : a.line > b.line ? 1 : 0));
+  const digest = createHash("sha256");
+  let budget: number = FRESHNESS_LIMITS.totalBytes;
+  for (const { line, path } of entries) {
+    digest.update(line).update("\0");
+    const content = hashFile(join(worktree, path), Math.min(FRESHNESS_LIMITS.fileBytes, budget));
+    if (content.kind === "too_large") return { commit, worktree: null };
+    if (content.kind === "hashed") budget -= content.bytes;
+    digest.update(content.kind === "hashed" ? content.hash : content.kind).update("\0");
+  }
+  return { commit, worktree: `sha256:${digest.digest("hex")}` };
 }
 
 /** Which of the given commit ids name a commit in this repository (one `cat-file` for all). */
