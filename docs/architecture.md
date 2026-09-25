@@ -63,7 +63,7 @@ Known limit: a fresh clone made after the original was deleted is indistinguisha
 
 One confident candidate binds automatically. With no candidate at all, the worktree gets a new workstream.
 
-**Ambiguity UX.** `scope.ambiguity = { question, candidates, omittedCandidates }`. Each candidate carries `workstreamId`, `label`, `branch`, `taskKey`, `headRevision`, `lastCheckpoint` (goal, status and first next step, clipped), `lastActiveAt` and `reasons` (`session_binding` / `worktree_binding` / `task` / `branch`, with a sentence). At most 5 are listed, the most recently active first. While ambiguous:
+**Ambiguity UX.** `scope.ambiguity = { question, candidates, omittedCandidates }`. Each candidate carries `workstreamId`, `label`, `branch`, `taskKey`, `headRevision`, `lastCheckpoint` (goal, status and first next step, clipped; a field is null when the body is not in the rendered checkpoint form), `lastActiveAt` and `reasons` (`session_binding` / `worktree_binding` / `task` / `branch`, with a sentence). At most 5 are listed, the most recently active first. While ambiguous:
 
 - the session row has `workstream_id NULL` (workspace-level);
 - `recall` and `read` see only workspace-level records, because eligibility binds a key no workstream has, and the pack notice says why;

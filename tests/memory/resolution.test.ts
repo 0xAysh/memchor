@@ -197,6 +197,41 @@ describe("workstream resolution", () => {
   });
 });
 
+describe("candidate checkpoint summaries", () => {
+  /** An orphaned workstream on `feat/sum` with one checkpoint, and a new worktree on that branch asking about it. */
+  function askAbout(checkpoint: { goal: string; status: string; nextSteps?: string[] }, rewriteBody?: string): Memory {
+    const home = tempDir();
+    const repo = initRepo();
+    const firstPath = addWorktree(repo, "feat/sum", true);
+    const orphan = open(firstPath, home);
+    orphan.bootstrap();
+    const { recordId } = orphan.checkpoint({ expectedRevision: 0, ...checkpoint });
+    const dbPath = orphan.status().storage.dbPath ?? "";
+    orphan.close();
+    if (rewriteBody !== undefined) {
+      // A checkpoint body in a form this Memchor did not render (e.g. an older format).
+      const db = new Database(dbPath);
+      db.prepare("UPDATE records SET body = ? WHERE id = ?").run(rewriteBody, recordId);
+      db.close();
+    }
+    git(repo, "worktree", "remove", "--force", firstPath);
+    return open(addWorktree(repo, "feat/sum"), home);
+  }
+
+  test("a status that itself contains heading-like lines is summarised whole, not cut at them", () => {
+    const status = "outbox drafted\n\nNotes:\n- the ledger stays append-only";
+    const scope = askAbout({ goal: "Make retries idempotent", status, nextSteps: ["wire the outbox", "load test"] }).bootstrap().scope;
+    expect(scope.ambiguity?.candidates[0]?.lastCheckpoint).toEqual({ goal: "Make retries idempotent", status, next: "wire the outbox" });
+  });
+
+  test("a checkpoint body without the expected headings yields null fields, never a misread slice", () => {
+    const scope = askAbout({ goal: "g", status: "s" }, "free-form checkpoint text from another format").bootstrap().scope;
+    const [candidate] = scope.ambiguity?.candidates ?? [];
+    expect(candidate?.lastCheckpoint).toEqual({ goal: null, status: null, next: null });
+    expect(scope.ambiguity?.question).toMatch(/r1: \(checkpoint summary unavailable\)/);
+  });
+});
+
 /** Every row of every table, plus the registry: the "status wrote nothing" check. */
 function storageState(home: string, dbPath: string): string {
   const db = new Database(dbPath, { readonly: true });

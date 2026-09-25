@@ -305,7 +305,13 @@ function ambiguous(db: Db, evidence: { row: WorkstreamRow; signal: CandidateSign
 function question(candidates: readonly WorkstreamCandidate[], omitted: number): string {
   const lines = candidates.map((c, i) => {
     const task = c.taskKey === null ? "" : ` [task ${c.taskKey}]`;
-    const state = c.lastCheckpoint === null ? "no checkpoint yet" : `r${c.headRevision}: ${c.lastCheckpoint.goal} (${c.lastCheckpoint.status})`;
+    const summary = c.lastCheckpoint;
+    const state =
+      summary === null
+        ? "no checkpoint yet"
+        : summary.goal === null
+          ? `r${c.headRevision}: (checkpoint summary unavailable)`
+          : `r${c.headRevision}: ${summary.goal}${summary.status === null ? "" : ` (${summary.status})`}`;
     return `${i + 1}. ${c.label}${task} (${c.workstreamId}): ${state}; last active ${c.lastActiveAt}. Why: ${c.reasons.map((r) => r.detail).join("; ")}.`;
   });
   return [
