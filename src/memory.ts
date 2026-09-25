@@ -558,7 +558,7 @@ class LocalMemory implements Memory {
           freshness: checked?.freshness ?? "unknown",
           warning: checked?.warning ?? null,
           externalRefs: checked?.externalRefs ?? [],
-          independentRoot: independentRoots(db, scope.workstreamId, [row.id]).get(row.id) ?? `record:${row.id}`,
+          independentRoot: rootOf(independentRoots(db, scope.workstreamId, [row.id]), row.id),
           links: linksOf(db, scope.workstreamId, row.id),
           checkpointRevision: revision?.revision ?? null,
           host: row.host,
@@ -809,7 +809,7 @@ class LocalMemory implements Memory {
       const groups = groupClaims(
         rows,
         (row) => normalizeClaim(row.body),
-        (row) => roots.get(row.id) ?? `record:${row.id}`,
+        (row) => rootOf(roots, row.id),
         (a, b) => a.created_at < b.created_at || (a.created_at === b.created_at && a.seq < b.seq),
       );
 
@@ -982,11 +982,22 @@ function itemPackable(
       sessionId: row.session_id,
       source: sources.get(row.id) ?? null,
       createdAt: row.created_at,
-      independentRoot: roots.get(row.id) ?? `record:${row.id}`,
+      independentRoot: rootOf(roots, row.id),
       corroboration: { independentRoots: group.independentRoots, records: group.records },
       copies,
     }),
   };
+}
+
+/**
+ * A record's independent root. `independentRoots` answers for every id it is given (its own
+ * `record:<id>` when nothing else applies), so a missing entry is a bug to surface, not a
+ * record to quietly present as its own observation.
+ */
+function rootOf(roots: ReadonlyMap<string, string>, recordId: string): string {
+  const root = roots.get(recordId);
+  if (root === undefined) throw new Error(`no independent root was computed for ${recordId}`);
+  return root;
 }
 
 const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
