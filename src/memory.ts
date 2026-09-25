@@ -297,7 +297,12 @@ export interface StatusScope {
   workstreamId: string | null;
   workstreamLabel: string | null;
   taskKey: string | null;
-  /** The signal bootstrap would bind by; null while ambiguous or when the database cannot be read yet. */
+  /**
+   * The signal bootstrap would bind by. Null while ambiguous; after a repository move, until a
+   * bootstrap re-points the moved worktree bindings (previewing against the old paths would
+   * disagree with what bootstrap then binds); while a schema migration is pending (the next
+   * bootstrap migrates first); and when the database cannot be read or is newer than this Memchor.
+   */
   resolvedBy: ResolutionBasis | null;
   /** The candidates bootstrap would ask the user to choose from, exactly as it would list them. */
   ambiguity: ScopeAmbiguity | null;
