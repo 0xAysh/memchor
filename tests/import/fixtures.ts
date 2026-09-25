@@ -102,6 +102,23 @@ export function renderCodexFixture(fixture: string, vars: CodexVars): string {
 }
 
 /**
+ * A synthetic Codex history for load and interruption tests: `transcripts` rollouts, each the
+ * `0.142.5/basic.jsonl` thread (one session_meta) followed by its turn repeated `turns` times with
+ * unique call and item ids (8 records per turn; event ids are byte offsets, so already unique).
+ */
+export function installSyntheticCodexHistory(home: string, cwd: string, options: { transcripts: number; turns: number }): InstalledTranscript[] {
+  const installed: InstalledTranscript[] = [];
+  for (let t = 0; t < options.transcripts; t++) {
+    const threadId = codexThreadId();
+    const [meta = "", ...body] = renderCodexFixture("0.142.5/basic.jsonl", { cwd, threadId }).split(/(?<=\n)/);
+    const turns: string[] = [meta];
+    for (let turn = 0; turn < options.turns; turn++) turns.push(body.join("").replace(/(call|ws|msg|rs)_(\d{4})/g, `$1_${turn}_$2`));
+    installed.push(installCodexRollout(home, "", { cwd, threadId, content: turns.join("") }));
+  }
+  return installed;
+}
+
+/**
  * Writes a rendered fixture where Codex keeps a thread's rollout:
  * `sessions/2026/01/01/rollout-2026-01-01T00-00-00-<thread>.jsonl`, or flat under
  * `archived_sessions/` once archived.

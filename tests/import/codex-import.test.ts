@@ -1,8 +1,9 @@
+import { appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { openMemory, type ContextPack, type Memory, type PackItem } from "../../src/memory.js";
 import { git, initRepo, onCleanup, tempDir } from "../helpers.js";
-import { codexHome, codexThreadId, installCodexRollout } from "./fixtures.js";
+import { codexHome, codexThreadId, installCodexRollout, renderCodexFixture } from "./fixtures.js";
 
 interface Env {
   home: string;
@@ -77,6 +78,47 @@ describe("Codex transcript import through the memory interface", () => {
 
     const replay = open(repo, e).bootstrap().import;
     expect(replay.currentProject?.counters.records).toBe(records);
+  });
+
+  test("a rollout Codex appended to since the last import imports only the new events, exactly once", () => {
+    const e = env();
+    const repo = initRepo();
+    const threadId = codexThreadId();
+    const full = renderCodexFixture("0.142.5/basic.jsonl", { cwd: repo, threadId });
+    // Cut after the first turn's last line (its task_complete), before the second user turn.
+    const cut = full.indexOf("\n", full.indexOf('"type":"task_complete"')) + 1;
+    const rollout = installCodexRollout(e.codex, "", { cwd: repo, threadId, content: full.slice(0, cut) });
+    const first = open(repo, e);
+    expect(first.bootstrap({ importChoice: "current_project" }).import.currentProject?.counters).toMatchObject({ records: 6, replayed: 0 });
+    first.close();
+
+    appendFileSync(rollout.path, full.slice(cut));
+    const second = open(repo, e);
+    const boot = second.bootstrap();
+    expect(boot.import.currentProject).toMatchObject({ complete: 1, pending: 0, counters: { records: 8, replayed: 0, conflicts: 0 } });
+    expect(second.status().counts?.records).toBe(8);
+    expect(open(repo, e).bootstrap().import.currentProject?.counters).toMatchObject({ records: 8, replayed: 0 });
+  });
+
+  test("a partial trailing line (Codex still writing) is left for later and imported once complete", () => {
+    const e = env();
+    const repo = initRepo();
+    const threadId = codexThreadId();
+    const full = renderCodexFixture("0.142.5/basic.jsonl", { cwd: repo, threadId });
+    const lastAssistant = full.lastIndexOf('{"timestamp"', full.lastIndexOf('"type":"agent_message"'));
+    const midLine = lastAssistant + 60;
+    const rollout = installCodexRollout(e.codex, "", { cwd: repo, threadId, content: full.slice(0, midLine) });
+    const first = open(repo, e);
+    const partial = first.bootstrap({ importChoice: "current_project" }).import;
+    expect(partial.currentProject?.counters.records).toBe(7);
+    expect(partial.currentProject?.counters.excluded.malformed).toBeUndefined(); // not read yet, so not counted as damage
+    expect(first.recall({ query: "Root cause idempotency key" }).items.some((i) => i.host === "codex" && i.attribution === "agent_inference")).toBe(false);
+    first.close();
+
+    appendFileSync(rollout.path, full.slice(midLine));
+    const second = open(repo, e);
+    expect(second.bootstrap().import.currentProject).toMatchObject({ complete: 1, counters: { records: 8, replayed: 0, conflicts: 0 } });
+    expect(second.recall({ query: "Root cause idempotency key" }).items.some((i) => i.host === "codex" && i.attribution === "agent_inference")).toBe(true);
   });
 
   test("two different Codex threads with identical content at identical offsets stay two independent observations", () => {
