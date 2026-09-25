@@ -548,17 +548,17 @@ function describeCall(tool: string, input: unknown, raw: unknown, cwd: string): 
       const path = str("path");
       return { summary: `view_image ${path === null ? "(no path)" : at(path)}`, paths: path === null ? [] : [at(path)], urls: [], toolKind: "artifact_access" };
     }
-    // A command that only prints files is a file read (see shell-reads.ts); its paths resolve
-    // against the call's own workdir, which Codex runs it in, else the turn's cwd.
+    // A command that only prints files inside the turn's cwd is a file read (see shell-reads.ts);
+    // its paths resolve against the call's own workdir, which Codex runs it in, else that cwd.
     case "exec_command":
-      return { summary: `$ ${str("cmd") ?? ""}`, urls: [], ...shellCall(str("cmd"), at(str("workdir") ?? cwd)) };
+      return { summary: `$ ${str("cmd") ?? ""}`, urls: [], ...shellCall(str("cmd"), at(str("workdir") ?? cwd), cwd) };
     case "shell": {
       const command = args["command"];
       const argv = Array.isArray(command) ? (command as unknown[]) : null;
-      return { summary: `$ ${argv === null ? "" : argv.filter((c) => typeof c === "string").join(" ")}`, urls: [], ...shellCall(argv, at(str("workdir") ?? cwd)) };
+      return { summary: `$ ${argv === null ? "" : argv.filter((c) => typeof c === "string").join(" ")}`, urls: [], ...shellCall(argv, at(str("workdir") ?? cwd), cwd) };
     }
     case "shell_command":
-      return { summary: `$ ${str("command") ?? ""}`, urls: [], ...shellCall(str("command"), at(str("workdir") ?? cwd)) };
+      return { summary: `$ ${str("command") ?? ""}`, urls: [], ...shellCall(str("command"), at(str("workdir") ?? cwd), cwd) };
     case "write_stdin": {
       // What was typed into a running process can be a password; only the session is described.
       const session = args["session_id"];

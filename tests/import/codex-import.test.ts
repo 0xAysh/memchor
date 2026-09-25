@@ -193,6 +193,26 @@ describe("Codex transcript import through the memory interface", () => {
     expect(read?.excerpt).toMatch(/file content not stored/);
   });
 
+  test("output a shell command reads from outside the working tree is kept as command output, except from a sensitive path", () => {
+    const e = env();
+    const repo = initRepo();
+    installCodexRollout(e.codex, "0.142.5/shell-outside.jsonl", { cwd: repo });
+    const memory = open(repo, e);
+    const boot = memory.bootstrap({ importChoice: "current_project" });
+    // ~/.aws/credentials, an absolute credentials file, an absolute .env, and the worktree's own .env.
+    expect(boot.import.currentProject?.counters).toMatchObject({ withheld: 4, fileContents: 1 });
+    const stored = allItems(memory)
+      .map((item) => memory.read({ recordId: item.recordId, maxBytes: 32_000 }))
+      .map((read) => `${read.title ?? ""}\n${read.body}`)
+      .join("\n");
+    expect(stored).toContain("SYNTHETIC-COMMAND-OUTPUT log line from outside the worktree");
+    expect(stored).toContain("SYNTHETIC-COMMAND-OUTPUT notes from a sibling directory");
+    expect(stored).toContain("SYNTHETIC-COMMAND-OUTPUT log line after cd");
+    expect(stored).not.toMatch(/SYNTHETIC-SECRET-VALUE/);
+    expect(stored).not.toContain("SYNTHETIC-FILE-CONTENT");
+    expect(stored.match(/output withheld by Memchor: the call touched a sensitive path/g)).toHaveLength(4);
+  });
+
   test("a turn that moves the thread into another worktree quarantines the rollout from that line", () => {
     const e = env();
     const repo = initRepo();

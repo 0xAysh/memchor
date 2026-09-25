@@ -1,4 +1,4 @@
-import { basename, isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import type { ToolKind } from "./normalized-event.js";
 
 /**
@@ -9,9 +9,12 @@ import type { ToolKind } from "./normalized-event.js";
  * read tool, so without this their file contents would be kept as tool-output passages.
  *
  * The parse is deliberately narrow and never evaluates anything. A command is a pure read only
- * when every part of it is understood: a reader from {@link READERS} with its options, `cd`, or
- * an `echo` separator, joined by `|`, `&&`, `;` or newlines, optionally inside one `bash|sh|zsh
- * -c` wrapper. Anything else (an expansion, a substitution, a redirect other than `2>/dev/null` /
+ * when every part of it is understood: a reader from {@link READERS} with options from its
+ * allow-list, reading files inside the event's working directory, `cd`, or an `echo`
+ * separator, joined by `|`, `&&`, `;` or newlines, optionally inside one `bash|sh|zsh -c`
+ * wrapper. What an `echo` prints goes with the file content (the importer stores the call as
+ * its tool and first path, not the command), a price paid for recognising `echo '---'`
+ * between reads. Anything else (an expansion, a substitution, a redirect other than `2>/dev/null` /
  * `2>&1`, `||`, a subshell, an unknown option, `sed -i`, a sed script that does more than print,
  * a search such as `grep`) makes the whole command "not a pure read", and the importer keeps its
  * output as a bounded passage, exactly as before. A wrong "not a read" costs nothing new; a
@@ -145,10 +148,11 @@ type Token = Word | { op: "|" | "&&" | ";" };
 /**
  * The absolute paths a command reads, when it is a pure file read; null otherwise (including
  * a command it cannot fully parse). `command` is a shell string or an argv array (Codex's
- * `shell` tool); relative paths resolve against `cwd` and any `cd` before them. A path given as
- * a glob is a read but has no single path, so it is left out of the list.
+ * `shell` tool); relative paths resolve against `cwd` and any `cd` before them, and every one
+ * must be inside `root`. A path given as a glob is a read but has no single path, so it is
+ * left out of the list.
  */
-export function shellFileReads(command: string | readonly string[], cwd: string, depth = 0): string[] | null {
+export function shellFileReads(command: string | readonly string[], cwd: string, root: string, depth = 0): string[] | null {
   if (depth > 2) return null;
   let tokens: Token[] | null;
   if (typeof command === "string") tokens = tokenize(command);
@@ -159,7 +163,7 @@ export function shellFileReads(command: string | readonly string[], cwd: string,
   const first = tokens[0];
   if (first !== undefined && "word" in first && SHELLS.has(basename(first.word))) {
     const script = unwrapShell(tokens);
-    return script === null ? null : shellFileReads(script, cwd, depth + 1);
+    return script === null ? null : shellFileReads(script, cwd, root, depth + 1);
   }
 
   const paths: string[] = [];
@@ -186,23 +190,35 @@ export function shellFileReads(command: string | readonly string[], cwd: string,
       const read = readerPaths(name.word, words.slice(1));
       if (read === null) return null;
       // The head of a pipeline must name a file; later stages only filter what it printed.
-      if (i === 0 && read.literal.length === 0 && !read.glob) return null;
-      if (read.literal.length > 0 || read.glob) reads = true;
-      for (const path of read.literal) paths.push(isAbsolute(path) ? path : resolve(base, path));
+      if (i === 0 && read.literal.length === 0 && read.globs.length === 0) return null;
+      if (read.literal.length > 0 || read.globs.length > 0) reads = true;
+      const resolved = (path: string): string => (isAbsolute(path) ? path : resolve(base, path));
+      // Output read from outside the working tree is not a file Memchor can reference (the
+      // importer keeps only in-tree paths), so it stays bounded command output instead of
+      // disappearing. A glob's directory is checked the same way (its pattern resolves as a name).
+      if (![...read.literal, ...read.globs].every((path) => within(resolved(path), root))) return null;
+      for (const path of read.literal) paths.push(resolved(path));
     }
   }
   return reads ? [...new Set(paths)] : null;
 }
 
 /**
- * Paths and kind of a shell tool call: a pure file read is `artifact_access` (its output is
- * stored as a reference only, like the host's read tool); anything else is `other`.
+ * Paths and kind of a shell tool call run in `cwd`: a pure read of files inside `root` (the
+ * event's working directory) is `artifact_access` (its output is stored as a reference only,
+ * like the host's read tool); anything else is `other`.
  */
-export function shellCall(command: string | readonly unknown[] | null, cwd: string): { paths: string[]; toolKind: ToolKind } {
+export function shellCall(command: string | readonly unknown[] | null, cwd: string, root: string): { paths: string[]; toolKind: ToolKind } {
   let reads: string[] | null = null;
-  if (typeof command === "string") reads = shellFileReads(command, cwd);
-  else if (command !== null && command.every((c): c is string => typeof c === "string")) reads = shellFileReads(command, cwd);
+  if (typeof command === "string") reads = shellFileReads(command, cwd, root);
+  else if (command !== null && command.every((c): c is string => typeof c === "string")) reads = shellFileReads(command, cwd, root);
   return reads === null ? { paths: [], toolKind: "other" } : { paths: reads, toolKind: "artifact_access" };
+}
+
+/** Whether `path` is `root` or below it (both absolute, compared lexically: no filesystem access). */
+function within(path: string, root: string): boolean {
+  const rel = relative(root, path);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 /** The script of `bash|sh|zsh [-l] -c <script>` (flags may be combined, e.g. `-lc`), or null. */
@@ -250,7 +266,7 @@ function split(tokens: Token[]): Word[][][] | null {
 }
 
 /** The file operands of one reader invocation, or null when it is not a known pure read. */
-function readerPaths(name: string, args: Word[]): { literal: string[]; glob: boolean } | null {
+function readerPaths(name: string, args: Word[]): { literal: string[]; globs: string[] } | null {
   let operands: Word[] | null;
   if (name === "sed") operands = sedOperands(args);
   else {
@@ -259,7 +275,7 @@ function readerPaths(name: string, args: Word[]): { literal: string[]; glob: boo
   }
   if (operands === null) return null;
   // `-` is stdin: in a pipeline it filters what came before, like no operand at all.
-  return { literal: operands.filter((o) => !o.glob && o.word !== "-").map((o) => o.word), glob: operands.some((o) => o.glob) };
+  return { literal: operands.filter((o) => !o.glob && o.word !== "-").map((o) => o.word), globs: operands.filter((o) => o.glob).map((o) => o.word) };
 }
 
 function readerOperands(args: Word[], reader: Reader): Word[] | null {

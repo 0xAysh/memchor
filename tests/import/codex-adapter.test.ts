@@ -221,6 +221,22 @@ describe("Codex adapter", () => {
     ]);
   });
 
+  test("a shell read is a file read only when every path it reads is inside the turn's working tree", () => {
+    const { chunk } = readAll("0.142.5/shell-outside.jsonl");
+    const calls = chunk.events.filter((e) => e.type === "tool_call").map((e) => [e.summary, e.toolKind, e.paths]);
+    expect(calls).toEqual([
+      // Outside the tree the output is not a file Memchor can reference, so it stays bounded command output.
+      ["$ cat /tmp/memchor-example/test.log", "other", []],
+      ["$ tail -n 5 ../sibling/notes.md", "other", []],
+      ["$ cd /tmp/memchor-example && cat test.log", "other", []],
+      ["$ cat ~/.aws/credentials", "other", []],
+      ["$ cat /home/placeholder/.aws/credentials", "other", []],
+      ["$ head -3 /home/placeholder/other/.env", "other", []],
+      ["$ cat .env", "artifact_access", [`${CWD}/.env`]],
+      ["$ echo '--- gateway'; cat src/gateway.ts", "artifact_access", [`${CWD}/src/gateway.ts`]],
+    ]);
+  });
+
   test("a 0.148.0-alpha.21 legacy rollout: audio is binary, new metadata types are skipped, and the MCP call triple yields one call and one result", () => {
     const { chunk } = readAll("0.148.0-alpha.21/basic.jsonl");
     expect(chunk.stop).toBeNull();
