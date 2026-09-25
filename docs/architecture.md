@@ -242,7 +242,7 @@ The proof is `tests/handoff/`:
 
 Each run writes the packs and the matrix, with temporary paths replaced by placeholders, to the git-ignored `tests/mcp/__artifacts__/handoff/`.
 
-The host connections are pinned to the releases they were tested with: Claude Code `2.1.281` (`tests/mcp/claude-connection.test.ts`: `claude mcp add -s user`, the `list`/`get` health checks, and a `claude -p` session against a localhost stub model) and `codex-cli 0.148.0-alpha.21` (`tests/mcp/codex-connection.test.ts`). Each host starts one `memchor mcp` per session in the session's working directory, which is how Memchor finds the repository. Claude Code passes its own environment to the server; Codex clears it, so `CODEX_HOME` and `MEMCHOR_HOME` must be given explicitly. The README has the exact commands.
+The host connections are pinned to the releases they were tested with: Claude Code `2.1.282` (`tests/mcp/claude-connection.test.ts`: `claude mcp add -s user`, the `list`/`get` health checks, and a `claude -p` session against a localhost stub model) and `codex-cli 0.148.0-alpha.21` (`tests/mcp/codex-connection.test.ts`). Each host starts one `memchor mcp` per session in the session's working directory, which is how Memchor finds the repository. Claude Code passes its own environment to the server; Codex clears it, so `CODEX_HOME` and `MEMCHOR_HOME` must be given explicitly. The README has the exact commands.
 
 ## Runtime gate
 
