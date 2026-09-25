@@ -1,12 +1,17 @@
 import { spawn, spawnSync } from "node:child_process";
 import { describe, expect, test } from "vitest";
 import { initRepo, tempDir } from "../helpers.js";
+import { codexHome, installCodexRollout } from "../import/fixtures.js";
 import { CLI, spawnServer } from "./harness.js";
 
 function memchor(cwd: string, home: string, ...args: string[]) {
+  return memchorWith({}, cwd, home, ...args);
+}
+
+function memchorWith(env: Record<string, string>, cwd: string, home: string, ...args: string[]) {
   const run = spawnSync(process.execPath, [CLI, ...args], {
     cwd,
-    env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: home, CLAUDE_CONFIG_DIR: process.env["CLAUDE_CONFIG_DIR"] ?? "" },
+    env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: home, CLAUDE_CONFIG_DIR: process.env["CLAUDE_CONFIG_DIR"] ?? "", CODEX_HOME: process.env["CODEX_HOME"] ?? "", ...env },
     encoding: "utf8",
   });
   return { code: run.status, stdout: run.stdout, stderr: run.stderr };
@@ -33,7 +38,7 @@ describe("memchor CLI", () => {
     expect(JSON.parse(memchor(repo, home, "diag", "reindex").stdout)).toEqual({ records: 2, chunks: 4 });
     const integrity = memchor(repo, home, "diag", "integrity");
     expect(integrity.code).toBe(0);
-    expect(JSON.parse(integrity.stdout)).toMatchObject({ exists: true, schemaVersion: 3, ok: true, sqlite: ["ok"], searchIndex: "ok", foreignKeyViolations: 0 });
+    expect(JSON.parse(integrity.stdout)).toMatchObject({ exists: true, schemaVersion: 4, ok: true, sqlite: ["ok"], searchIndex: "ok", foreignKeyViolations: 0 });
   });
 
   test("diag status is read-only: the first real bootstrap afterwards still creates the workstream", async () => {
@@ -47,6 +52,25 @@ describe("memchor CLI", () => {
 
     const server = await spawnServer({ cwd: repo, home, host: "codex" });
     expect(await server.ok("memory_bootstrap")).toMatchObject({ created: { workspace: true, workstream: true } });
+  });
+
+  test("diag consent and diag import manage Codex history with --host codex, reading $CODEX_HOME", () => {
+    const repo = initRepo();
+    const home = tempDir();
+    const codex = codexHome();
+    installCodexRollout(codex, "0.142.5/basic.jsonl", { cwd: repo });
+    const env = { CODEX_HOME: codex };
+
+    const asked = memchorWith(env, repo, home, "diag", "consent", "--host", "codex");
+    expect(asked.code).toBe(0);
+    expect(JSON.parse(asked.stdout)).toMatchObject({ consent: null, state: "consent_required", transcripts: { found: 1, currentProject: 1 }, transcriptsRoot: codex });
+    expect(JSON.parse(memchorWith(env, repo, home, "diag", "consent", "--host", "codex", "--set", "current_project").stdout)).toMatchObject({ consent: { choice: "current_project" } });
+    // Codex's decision is its own: Claude Code's is still unanswered.
+    expect(JSON.parse(memchor(repo, home, "diag", "consent").stdout)).toMatchObject({ consent: null });
+
+    const imported = memchorWith(env, repo, home, "diag", "import", "--host", "codex");
+    expect(imported.code).toBe(0);
+    expect(JSON.parse(imported.stdout)).toMatchObject({ import: { host: "codex", state: "complete", problem: null, currentProject: { complete: 1, counters: { records: 8 } } } });
   });
 
   test("diag demo runs the tracer flow against MEMCHOR_HOME and prints the recalled pack", () => {
@@ -75,10 +99,25 @@ describe("memchor CLI", () => {
     expect(memchor(initRepo(), tempDir(), "bogus").code).toBe(64);
   });
 
+  test("transcript commands accept only a host whose transcripts Memchor can import", () => {
+    const repo = initRepo();
+    const home = tempDir();
+    for (const host of ["bogus", "pi", "unknown"]) {
+      for (const subcommand of ["consent", "import"]) {
+        const run = memchor(repo, home, "diag", subcommand, "--host", host);
+        expect(run.code).toBe(64);
+        expect(run.stderr).toContain(`memchor: --host must be one of claude-code, codex (got ${host})`);
+      }
+    }
+    const codex = memchor(repo, home, "diag", "consent", "--host", "codex");
+    expect(codex.code).toBe(0);
+    expect(JSON.parse(codex.stdout)).toMatchObject({ consent: null });
+  });
+
   test("the MCP server closes and exits cleanly on SIGTERM", async () => {
     const child = spawn(process.execPath, [CLI, "mcp"], {
       cwd: initRepo(),
-      env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: tempDir(), CLAUDE_CONFIG_DIR: process.env["CLAUDE_CONFIG_DIR"] ?? "" },
+      env: { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: tempDir(), CLAUDE_CONFIG_DIR: process.env["CLAUDE_CONFIG_DIR"] ?? "", CODEX_HOME: process.env["CODEX_HOME"] ?? "" },
       stdio: ["pipe", "pipe", "pipe"],
     });
     await new Promise<void>((resolve) => child.stderr.on("data", (chunk: Buffer) => {

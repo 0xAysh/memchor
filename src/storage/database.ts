@@ -70,8 +70,7 @@ export function openDatabase(path: string, options: { busyTimeoutMs?: number } =
       });
     }
     db.pragma("synchronous = FULL");
-    db.pragma("foreign_keys = ON");
-    migrate(db);
+    migrate(db); // leaves foreign_keys = ON
     return db;
   } catch (error) {
     db?.close();

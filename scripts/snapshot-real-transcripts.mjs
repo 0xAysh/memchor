@@ -5,12 +5,14 @@
  *
  *   .real-transcripts/claude/projects/<project>/<session>.jsonl   (usable as CLAUDE_CONFIG_DIR)
  *   .real-transcripts/pi/sessions/<project>/<session>.jsonl
+ *   .real-transcripts/codex/{sessions/YYYY/MM/DD,archived_sessions}/rollout-*.jsonl   (usable as CODEX_HOME)
  *
  * Only `*.jsonl` transcripts are copied: never Claude settings or memory, never Pi's
- * auth.json, settings or models. Refuses to run unless git confirms the destination is
+ * auth.json, settings or models, never Codex's auth.json, config.toml, SQLite state or
+ * session_index.jsonl (it lives outside the two rollout directories). Refuses to run unless git confirms the destination is
  * ignored, so the snapshot cannot be committed by accident.
  *
- * Usage: npm run snapshot:transcripts   (CLAUDE_CONFIG_DIR / PI_AGENT_DIR override the sources)
+ * Usage: npm run snapshot:transcripts   (CLAUDE_CONFIG_DIR / PI_AGENT_DIR / CODEX_HOME override the sources)
  */
 import { execFileSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
@@ -30,6 +32,11 @@ try {
 const sources = [
   { name: "claude", from: join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects"), to: join(dest, "claude", "projects") },
   { name: "pi", from: join(process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent"), "sessions"), to: join(dest, "pi", "sessions") },
+  ...["sessions", "archived_sessions"].map((dir) => ({
+    name: `codex ${dir}`,
+    from: join(process.env.CODEX_HOME || join(homedir(), ".codex"), dir),
+    to: join(dest, "codex", dir),
+  })),
 ];
 
 for (const { name, from, to } of sources) {

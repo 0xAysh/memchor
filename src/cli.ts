@@ -5,32 +5,33 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveHome } from "./bootstrap/workspace-resolution.js";
 import { MemchorError } from "./errors.js";
+import { HOST_IDS, hostDescriptor, TRANSCRIPT_HOSTS } from "./hosts.js";
 import { type ImportStatus, openMemory, type Memory } from "./memory.js";
 import { IMPORT_CHOICES, type ImportChoice, LIMITS } from "./schemas.js";
 import { assertEmbeddedRuntime } from "./storage/database.js";
 import { runStdioServer } from "./transports/mcp.js";
 
 const USAGE = `Usage:
-  memchor mcp [--host claude-code|codex|pi|unknown]   Serve MCP over stdio (started by the agent host)
+  memchor mcp [--host ${HOST_IDS.join("|")}]
+                                                      Serve MCP over stdio (started by the agent host)
   memchor diag status                                 Runtime, storage and scope health
   memchor diag records [--query <text>] [--kind <k>]  List eligible records for this worktree
   memchor diag reindex                                Rebuild the search index from canonical records
   memchor diag integrity                              SQLite, foreign-key and search-index checks
   memchor diag demo [--temp-home]                     Run bootstrap → record → checkpoint → recall here and print the pack
                                                       (writes demo records to $MEMCHOR_HOME, or to a new temp home)
-  memchor diag consent [--set all|current_project|none] [--host claude-code]
+  memchor diag consent [--set ${IMPORT_CHOICES.join("|")}] [--host ${TRANSCRIPT_HOSTS.join("|")}]
                                                       Show (or change) the host's transcript-import decision
-  memchor diag import [--host claude-code]            Import approved transcripts to completion and print progress
+  memchor diag import [--host ${TRANSCRIPT_HOSTS.join("|")}]
+                                                      Import approved transcripts to completion and print progress
 
 Scope is always the Git worktree of the current directory. Storage: $MEMCHOR_HOME or ~/.memchor.`;
-
-const HOSTS = ["claude-code", "codex", "pi", "unknown"];
 
 async function main(argv: string[]): Promise<number> {
   const [command, subcommand] = argv;
   if (command === "mcp") {
     const { values } = parseArgs({ args: argv.slice(1), options: { host: { type: "string" } }, strict: true });
-    if (values.host !== undefined && !HOSTS.includes(values.host)) return usage(`unknown --host ${values.host}`);
+    if (values.host !== undefined && hostDescriptor(values.host) === null) return usage(`unknown --host ${values.host}`);
     // Fail at startup, visibly, rather than on the first tool call inside the host.
     assertEmbeddedRuntime();
     await runStdioServer({ cwd: process.cwd(), ...(values.host === undefined ? {} : { host: values.host }) });
@@ -51,6 +52,10 @@ async function main(argv: string[]): Promise<number> {
     const home = values["temp-home"] === true ? mkdtempSync(join(tmpdir(), "memchor-demo-")) : resolveHome(undefined);
     // Transcript commands act as the host whose history they manage; the rest as a diagnostic tool.
     const transcripts = subcommand === "consent" || subcommand === "import";
+    // A host that cannot import would only report "unsupported" for a mistyped name.
+    if (transcripts && values.host !== undefined && !(TRANSCRIPT_HOSTS as string[]).includes(values.host)) {
+      return usage(`--host must be one of ${TRANSCRIPT_HOSTS.join(", ")} (got ${values.host})`);
+    }
     const host = values.host ?? (transcripts ? "claude-code" : "memchor-diag");
     if (values.set !== undefined && !IMPORT_CHOICES.includes(values.set as ImportChoice)) return usage(`--set must be one of ${IMPORT_CHOICES.join(", ")}`);
     const memory = openMemory({ cwd: process.cwd(), host, home });

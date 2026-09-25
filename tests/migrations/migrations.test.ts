@@ -6,6 +6,7 @@ import { rebuildSearchIndex } from "../../src/retrieval/search.js";
 import { openDatabase, SCHEMA_VERSION, writeTransaction } from "../../src/storage/database.js";
 import { sql as schemaV1 } from "../../src/storage/migrations/0001-initial.js";
 import { sql as schemaV2 } from "../../src/storage/migrations/0002-transcript-import.js";
+import { sql as schemaV3 } from "../../src/storage/migrations/0003-import-source-fingerprint.js";
 import { catchMemchorError, initRepo, tempDir } from "../helpers.js";
 
 const CANONICAL_TABLES = [
@@ -50,11 +51,48 @@ function atVersionZero(setup = ""): string {
 }
 
 describe("migrations", () => {
-  test("this build introduces schema version 3", () => {
-    expect(SCHEMA_VERSION).toBe(3);
+  test("this build introduces schema version 4", () => {
+    expect(SCHEMA_VERSION).toBe(4);
   });
 
-  test("a version-1 database with memory upgrades to version 3 and keeps every row", () => {
+  test.each([1, 2, 3])("a version-%i database upgrades to version 4: sessions may be workspace-level and every reference survives", (from) => {
+    const path = join(tempDir(), "memory.sqlite");
+    const old = new Database(path);
+    old.pragma("foreign_keys = ON");
+    for (const step of [schemaV1, schemaV2, schemaV3].slice(0, from)) old.exec(step);
+    old.pragma(`user_version = ${from}`);
+    old.exec(`INSERT INTO workstreams (id, label, created_at) VALUES ('wst_1', 'feat/x', 'now');
+      INSERT INTO sessions (id, host, host_session_id, workstream_id, started_at) VALUES ('ses_1', 'claude-code', 'host-1', 'wst_1', 'now');
+      INSERT INTO records (id, kind, body, workstream_id, session_id, host, attribution, content_hash, created_at)
+        VALUES ('rec_1', 'note', 'kept across the upgrade', 'wst_1', 'ses_1', 'claude-code', 'agent_inference', 'h', 'now');
+      INSERT INTO operations (key, operation, request_hash, result_json, session_id, created_at) VALUES ('op', 'record', 'h', '{}', 'ses_1', 'now');`);
+    if (from >= 2) {
+      old.exec(`INSERT INTO sources (id, kind, host, locator, created_at) VALUES ('src_1', 'transcript', 'claude-code', 't', 'now');
+        INSERT INTO import_cursors (host, transcript_id, path, source_id, session_id, workstream_id, updated_at) VALUES ('claude-code', 't', '/t.jsonl', 'src_1', 'ses_1', 'wst_1', 'now');`);
+    }
+    old.close();
+
+    const db = openDatabase(path);
+    try {
+      expect(db.pragma("user_version", { simple: true })).toBe(4);
+      expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+      expect(db.prepare("SELECT id, host, host_session_id, workstream_id FROM sessions").all()).toEqual([
+        { id: "ses_1", host: "claude-code", host_session_id: "host-1", workstream_id: "wst_1" },
+      ]);
+      expect(db.prepare("SELECT id, label, branch, task_key FROM workstreams").all()).toEqual([{ id: "wst_1", label: "feat/x", branch: "feat/x", task_key: null }]);
+      expect(db.prepare("SELECT session_id FROM records").all()).toEqual([{ session_id: "ses_1" }]);
+      // A workspace-level session (no workstream chosen yet) is now representable; references still enforced.
+      db.prepare("INSERT INTO sessions (id, host, workstream_id, started_at) VALUES ('ses_2', 'codex', NULL, 'now')").run();
+      expect(() => db.prepare("INSERT INTO sessions (id, host, workstream_id, started_at) VALUES ('ses_3', 'codex', 'wst_missing', 'now')").run()).toThrow(/FOREIGN KEY/);
+      expect(() => db.prepare("DELETE FROM sessions WHERE id = 'ses_1'").run()).toThrow(/FOREIGN KEY/);
+    } finally {
+      db.close();
+    }
+    expect(inspect(path).tables).toEqual(CANONICAL_TABLES);
+  });
+
+  test("a version-1 database with memory upgrades to the current version and keeps every row", () => {
     const path = join(tempDir(), "memory.sqlite");
     const v1 = new Database(path);
     v1.exec(schemaV1);
@@ -66,7 +104,7 @@ describe("migrations", () => {
     v1.close();
 
     openDatabase(path).close();
-    expect(inspect(path)).toEqual({ version: 3, tables: CANONICAL_TABLES });
+    expect(inspect(path)).toEqual({ version: SCHEMA_VERSION, tables: CANONICAL_TABLES });
     const db = new Database(path, { readonly: true });
     expect(db.prepare("SELECT id, body FROM records").all()).toEqual([{ id: "rec_1", body: "kept across the upgrade" }]);
     const cursorColumns = (db.pragma("table_info(import_cursors)") as { name: string }[]).map((c) => c.name);

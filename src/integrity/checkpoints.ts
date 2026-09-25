@@ -99,16 +99,69 @@ export function headCheckpointRecordId(db: Db, workstreamId: string): string | n
   return row?.record_id ?? null;
 }
 
+/**
+ * A bounded glimpse of a checkpoint, enough to tell workstreams apart when choosing one.
+ * A field is null when the body does not carry it in the form {@link renderCheckpoint} writes
+ * (e.g. a body from another format): unknown, never a guess.
+ */
+export interface CheckpointSummary {
+  goal: string | null;
+  status: string | null;
+  /** The first next step, if any. */
+  next: string | null;
+}
+
+/** The list sections of a checkpoint body, in rendering order. */
+const SECTIONS = [
+  ["decisions", "Decisions"],
+  ["failedAttempts", "Failed attempts"],
+  ["openQuestions", "Open questions"],
+  ["nextSteps", "Next steps"],
+  ["preferences", "Preferences"],
+] as const;
+
+const GOAL = "Goal: ";
+const STATUS = "\n\nStatus: ";
+const sectionStart = (heading: string): string => `\n\n${heading}:\n- `;
+const ENTRY = "\n- ";
+
+/**
+ * Reads back the fields {@link renderCheckpoint} wrote, each clipped (goal 200, status 300,
+ * next 200 characters). Parsing is anchored on the exact markers the renderer emits, in its
+ * section order, so text inside a field that merely looks like a heading is kept as text.
+ * Rendered text cannot mark where free text ends; a field that itself contains an exact
+ * marker (e.g. "\n\nNext steps:\n- ") ends there.
+ */
+export function summarizeCheckpoint(body: string): CheckpointSummary {
+  const clip = (text: string, chars: number): string => (text.length <= chars ? text : `${text.slice(0, chars - 1)}…`);
+  const statusAt = body.startsWith(GOAL) ? body.indexOf(STATUS) : -1;
+  if (statusAt === -1) return { goal: null, status: null, next: null };
+  const goal = body.slice(GOAL.length, statusAt);
+  const rest = body.slice(statusAt + STATUS.length);
+  // Sections appear in rendering order, so the status ends at the first section marker found
+  // searching in that order, and each marker is searched for only after the previous one.
+  const starts = new Map<string, number>();
+  let from = 0;
+  for (const [, heading] of SECTIONS) {
+    const at = rest.indexOf(sectionStart(heading), from);
+    if (at === -1) continue;
+    starts.set(heading, at);
+    from = at + sectionStart(heading).length;
+  }
+  const status = rest.slice(0, Math.min(rest.length, ...starts.values()));
+  const nextAt = starts.get("Next steps");
+  let next: string | null = null;
+  if (nextAt !== undefined) {
+    const entries = rest.slice(nextAt + sectionStart("Next steps").length);
+    const ends = [entries.indexOf(ENTRY), entries.indexOf(sectionStart("Preferences"))].filter((at) => at !== -1);
+    next = entries.slice(0, Math.min(entries.length, ...ends));
+  }
+  return { goal: clip(goal, 200), status: clip(status, 300), next: next === null ? null : clip(next, 200) };
+}
+
 /** Canonical checkpoint body: stable section order, one bullet per entry, empty sections omitted. */
 function renderCheckpoint(content: CheckpointContent): string {
   const section = (heading: string, entries: readonly string[]): string =>
     entries.length === 0 ? "" : `\n\n${heading}:\n${entries.map((entry) => `- ${entry}`).join("\n")}`;
-  return (
-    `Goal: ${content.goal}\n\nStatus: ${content.status}` +
-    section("Decisions", content.decisions) +
-    section("Failed attempts", content.failedAttempts) +
-    section("Open questions", content.openQuestions) +
-    section("Next steps", content.nextSteps) +
-    section("Preferences", content.preferences)
-  );
+  return `${GOAL}${content.goal}${STATUS}${content.status}` + SECTIONS.map(([field, heading]) => section(heading, content[field])).join("");
 }

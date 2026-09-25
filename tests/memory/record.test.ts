@@ -41,8 +41,9 @@ describe("record", () => {
       citations: [{ recordId: evidence.recordId, relation: "supported_by" }],
       applicability: { commit: git(repo, "rev-parse", "HEAD") },
     });
+    // The file does not exist, so Memchor had nothing to fingerprint: freshness is unknown.
     expect(byId.get(evidence.recordId)?.externalRefs).toEqual([
-      { kind: "code", locator: "src/checkout/retry.ts", path: "src/checkout/retry.ts", lines: [40, 82] },
+      { kind: "code", locator: "src/checkout/retry.ts", path: "src/checkout/retry.ts", lines: [40, 82], freshness: "unknown", reason: "not_observed" },
     ]);
   });
 

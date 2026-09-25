@@ -1,15 +1,42 @@
 import { createHash } from "node:crypto";
 import { ZodError, type z } from "zod";
-import { bindScope, type BoundScope, findBinding } from "./bootstrap/workstream-resolution.js";
+import {
+  bindScope,
+  type BoundScope,
+  previewScope,
+  requireWorkstream,
+  type ResolutionBasis,
+  type ResolutionPreview,
+  type ScopeAmbiguity,
+  type ScopeHints,
+} from "./bootstrap/workstream-resolution.js";
 import { headCommit, locateWorkspace, registerWorkspace, resolveHome, type WorkspaceLocation } from "./bootstrap/workspace-resolution.js";
 import { type ErrorCode, MemchorError } from "./errors.js";
 import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integrity/checkpoints.js";
-import { claudeCodeAdapter } from "./import/adapters/claude.js";
+import { hostDescriptor } from "./hosts.js";
 import type { TranscriptAdapter } from "./import/normalized-event.js";
 import { type ImportStatus, TranscriptImporter, unsupportedHostStatus } from "./import/reconcile.js";
-import { type Citation, citationsFor, importedFrom, type ImportedSource, linksOf } from "./integrity/provenance.js";
-import { type ContinuationState, ITEM_EXCERPT_BYTES, openContinuation, packPage, type Packable, sealContinuation, usage } from "./retrieval/context-pack.js";
+import { type Citation, citationsFor, importedFrom, type ImportedSource, independentRoots, linksOf } from "./integrity/provenance.js";
+import {
+  type ClaimGroup,
+  type ContinuationState,
+  CUT_MARKER,
+  EMPTY_PAGE,
+  groupClaims,
+  ITEM_EXCERPT_BYTES,
+  LISTED_COPIES,
+  normalizeClaim,
+  openContinuation,
+  packPage,
+  type PackedPage,
+  packWithinBudget,
+  planPage,
+  type Packable,
+  sealContinuation,
+  usage,
+} from "./retrieval/context-pack.js";
 import { requireVisibleRecord, type RecordRow } from "./retrieval/eligibility.js";
+import { captureObservations, type CheckedRef, checkFreshness, freshnessFloor, type RecordFreshness, type StoredRef } from "./retrieval/freshness.js";
 import { type Candidate, clipToBytes, loadCandidates, PAGE_CANDIDATES, rankSequence, rebuildSearchIndex, SEQUENCE_CAP, toFtsQuery } from "./retrieval/search.js";
 import {
   type Applicability,
@@ -18,8 +45,6 @@ import {
   CheckpointInput,
   ContinueImportInput,
   effectiveBudget,
-  estimateTokens,
-  type ExternalRef,
   type Freshness,
   LIMITS,
   type LinkRelation,
@@ -46,8 +71,11 @@ import {
 import { appendRecord, recordFields } from "./storage/records.js";
 
 export type { ImportedSource, Citation } from "./integrity/provenance.js";
+export type { CheckedRef, FreshnessReason } from "./retrieval/freshness.js";
 export type { ImportCounters, ImportGap, ImportStatus } from "./import/reconcile.js";
 export type { IntegrityReport } from "./storage/database.js";
+export type { CandidateSignal, ResolutionBasis, ScopeAmbiguity, WorkstreamCandidate } from "./bootstrap/workstream-resolution.js";
+export type { CheckpointSummary } from "./integrity/checkpoints.js";
 
 // ───────────────────────────── Public interface ─────────────────────────────
 
@@ -64,21 +92,33 @@ export interface OpenMemoryOptions {
   busyTimeoutMs?: number;
   /** Claude Code's config directory (transcripts live in its `projects/`). Defaults to `$CLAUDE_CONFIG_DIR`, then `~/.claude`. */
   claudeConfigDir?: string;
+  /** Codex's home directory (rollouts live in its `sessions/` and `archived_sessions/`). Defaults to `$CODEX_HOME`, then `~/.codex`. */
+  codexHome?: string;
   /** Alternate host-format adapter, primarily for compatibility and privacy integration tests. */
   transcriptAdapter?: TranscriptAdapter;
   /** How long `bootstrap` may spend importing the current project's transcripts before returning. Default 3000 ms. */
   importBudgetMs?: number;
 }
 
-/** The scope this Memory instance is bound to. Fixed for the instance's lifetime. */
+/**
+ * The scope this Memory instance is bound to. The workspace is fixed for the instance's
+ * lifetime; the workstream changes only through `bootstrap({ workstream | task })`.
+ */
 export interface Scope {
   workspaceId: string;
   workspaceLabel: string;
-  workstreamId: string;
-  workstreamLabel: string;
+  /** Null while `ambiguity` is set: the session is workspace-level until the user chooses. */
+  workstreamId: string | null;
+  workstreamLabel: string | null;
+  /** The workstream's normalised explicit task identity (e.g. "#20"), if it has one. */
+  taskKey: string | null;
+  /** Which signal chose the workstream (see docs/architecture.md, "Scope"); null while ambiguous. */
+  resolvedBy: ResolutionBasis | null;
+  /** Set when more than one workstream could continue here, or signals conflict: ask the user (`question`). */
+  ambiguity: ScopeAmbiguity | null;
   branch: string;
   worktree: string;
-  /** Current head checkpoint revision (0 = none yet); pass it as `expectedRevision`. */
+  /** Current head checkpoint revision (0 = none yet, or no workstream); pass it as `expectedRevision`. */
   headRevision: number;
   sessionId: string;
   host: string;
@@ -88,20 +128,54 @@ export interface PackItem {
   recordId: string;
   kind: RecordKind;
   title: string | null;
-  /** A passage of the body (the best-matching one for a query). Use `read` for the rest. */
+  /**
+   * A passage of the body (the best-matching one for a query). Use `read` for the rest.
+   * A passage cut to fit the budget ends with an explicit "cut by Memchor" marker.
+   */
   excerpt: string;
   /** True when `excerpt` is not the whole body. */
   truncated: boolean;
   attribution: Attribution;
   reviewState: ReviewState;
-  /** Always "unknown" until freshness validation ships; verify live artifacts before acting. */
+  /**
+   * Checked now, against the live worktree: the worst of `externalRefs` (stale > unknown >
+   * current); "unknown" for a record without references. Memory never replaces live code.
+   */
   freshness: Freshness;
+  /** What to do before relying on this record (read the current file, verify remote state); null when every reference is current or there are none. */
+  warning: string | null;
   applicability: Applicability;
   citations: Citation[];
-  externalRefs: ExternalRef[];
+  /** Each reference with its own freshness and reason (see `FreshnessReason`). */
+  externalRefs: CheckedRef[];
   workspaceLevel: boolean;
   host: string;
+  /** Memchor session that wrote (or imported) the record. */
+  sessionId: string | null;
   /** Where an imported record came from (host, transcript, event); null for records agents wrote. */
+  source: ImportedSource | null;
+  /** When the content was observed (the event time for imported records). */
+  createdAt: string;
+  /**
+   * The observation this claim comes from: `event:<host>/<eventId>` for imported records
+   * (shared by every transcript copy of that event), else `record:<recordId>` of the
+   * record it was derived from or rests on, else its own.
+   */
+  independentRoot: string;
+  /**
+   * `independentRoots`: distinct roots among the loaded records stating this same claim;
+   * `records`: how many records state it. Copies of one root never count twice.
+   */
+  corroboration: { independentRoots: number; records: number };
+  /** Other records with the same claim and root, collapsed into this item (at most 5 listed). */
+  copies: PackCopy[];
+}
+
+/** A record folded into an item because it repeats the item's claim from the same root. */
+export interface PackCopy {
+  recordId: string;
+  host: string;
+  sessionId: string | null;
   source: ImportedSource | null;
   createdAt: string;
 }
@@ -111,17 +185,20 @@ export interface PackCheckpoint {
   revision: number;
   excerpt: string;
   truncated: boolean;
+  freshness: Freshness;
+  warning: string | null;
   citations: Citation[];
-  externalRefs: ExternalRef[];
+  externalRefs: CheckedRef[];
   host: string;
+  sessionId: string | null;
   createdAt: string;
 }
 
 export interface Omission {
   /**
    * `budget`: more of the sequence follows (use `continuation`).
-   * `exceeds_budget`: records too large for this budget even alone (read them directly).
-   * `candidate_limit`: eligible matches beyond the 500-record sequence cap; refine the query.
+   * `exceeds_budget`: records too large for this budget even alone (read them directly); at most 5 per page, later ones on continuation pages.
+   * `candidate_limit`: eligible matches the sequence does not carry: beyond the 500-record cap, or more than a continuation can hold within this budget (at most a quarter of it). Refine the query or raise the budget.
    */
   reason: "budget" | "exceeds_budget" | "candidate_limit";
   count: number;
@@ -142,6 +219,7 @@ export interface ContextPack {
    * after page 1 are not part of the sequence.
    */
   continuation: string | null;
+  /** `usedBytes` is the UTF-8 length of this whole pack as JSON, scope and continuation included; it exceeds `maxBytes` only when the budget cannot hold the scope itself (then the pack has no entries and says so). */
   budget: { maxTokens: number; maxBytes: number; usedTokens: number; usedBytes: number };
   /** True when nothing eligible was found: an honest miss, not a reason to invent continuity. */
   empty: boolean;
@@ -155,7 +233,7 @@ export interface BootstrapResult {
   runtime: { sqliteVersion: string; fts5: boolean; schemaVersion: number };
   /** Transcript import: the consent question on first use, else progress and capture gaps. */
   import: ImportStatus;
-  /** Same as `recall({})` after this bootstrap's import: head checkpoint plus the most recent eligible records. */
+  /** Same as `recall({ maxTokens, maxBytes })` after this bootstrap's import: head checkpoint plus the most recent eligible records. */
   context: ContextPack;
 }
 
@@ -191,9 +269,12 @@ export interface ReadResult {
   totalLength: number;
   attribution: Attribution;
   reviewState: ReviewState;
+  /** Checked now against the live worktree, as in a pack item. */
   freshness: Freshness;
+  warning: string | null;
   applicability: Applicability;
-  externalRefs: ExternalRef[];
+  externalRefs: CheckedRef[];
+  independentRoot: string;
   /** Links in both directions whose other end is visible in this scope. */
   links: { recordId: string; relation: LinkRelation; direction: "outgoing" | "incoming" }[];
   workspaceLevel: boolean;
@@ -212,8 +293,19 @@ export interface StatusScope {
   workspaceLabel: string;
   worktree: string;
   branch: string;
+  /** Null when bootstrap would create a new workstream (`resolvedBy: "new_workstream"`) or ask (`ambiguity`). */
   workstreamId: string | null;
   workstreamLabel: string | null;
+  taskKey: string | null;
+  /**
+   * The signal bootstrap would bind by. Null while ambiguous; after a repository move, until a
+   * bootstrap re-points the moved worktree bindings (previewing against the old paths would
+   * disagree with what bootstrap then binds); while a schema migration is pending (the next
+   * bootstrap migrates first); and when the database cannot be read or is newer than this Memchor.
+   */
+  resolvedBy: ResolutionBasis | null;
+  /** The candidates bootstrap would ask the user to choose from, exactly as it would list them. */
+  ambiguity: ScopeAmbiguity | null;
   headRevision: number | null;
   /** This instance's session, once an operation other than status has bound scope. */
   sessionId: string | null;
@@ -229,11 +321,12 @@ export interface StatusResult {
     supportedSchemaVersion: number;
     journalMode: string | null;
   };
-  /** What bootstrap would bind; `workstreamId` is null while this worktree has no workstream yet. */
+  /** What bootstrap (without `task` or `workstream`) would resolve, by the same rules, without binding anything. */
   scope: StatusScope | null;
   counts: { records: number; checkpoints: number; workstreams: number; sessions: number } | null;
   /** Set when scope or storage could not be resolved; status itself never throws for these. */
   problem: { code: ErrorCode; message: string } | null;
+  /** `freshnessValidation`: recall and read check local code references against the live worktree. */
   capabilities: { operations: string[]; freshnessValidation: boolean; transcriptImport: boolean };
   /** Consent, discovered transcripts, this project's import progress and capture gaps; null when scope is unresolved. */
   import: ImportStatus | null;
@@ -245,14 +338,16 @@ export interface StatusResult {
  * Invariants callers can rely on:
  * - **Scope is not an input.** It is resolved once from the trusted `cwd` (lazily on the
  *   first operation, or by `bootstrap`) and enforced inside every operation. Payloads are
- *   strict: unknown keys such as `workspaceId` or `path` are `invalid_input`.
+ *   strict: unknown keys such as `workspaceId` or `path` are `invalid_input`. The only scope
+ *   input is bootstrap's `workstream`, the user's answer to `scope.ambiguity`, which can only
+ *   name a workstream of the already-resolved workspace.
  * - **Every write is one IMMEDIATE transaction**: record + provenance links + search
  *   chunks + idempotency row commit together or not at all. An acknowledged write is
  *   durable (WAL, synchronous=FULL).
  * - **Idempotency**: an `operationKey` replays its stored result for the same request and
  *   is `idempotency_conflict` for a different one.
  * - **Checkpoints are compare-and-swap** on `expectedRevision`; never merged.
- * - **Recall filters before ranking** and never exceeds its budget.
+ * - **Recall filters before ranking** and the whole pack stays within its budget (unless the budget cannot hold even its scope).
  * - Methods are synchronous and throw only `MemchorError` for expected failures.
  */
 export interface Memory {
@@ -261,6 +356,11 @@ export interface Memory {
    * project's approved transcripts within a time budget, and returns scope plus initial
    * context. On a host's first use it returns the import consent question instead of
    * importing; `importChoice` records (or changes) the answer.
+   *
+   * When more than one workstream could continue here, `scope.ambiguity` lists them and no
+   * workstream is bound: recall shows only workspace-level memory and workstream-scoped
+   * writes fail with `scope_ambiguous`. `workstream` (an id from the candidates, or "new")
+   * answers it and becomes this worktree's binding; `task` names the task explicitly.
    */
   bootstrap(input?: BootstrapInput): BootstrapResult;
   /**
@@ -333,7 +433,7 @@ class LocalMemory implements Memory {
     this.home = resolveHome(options.home);
     this.busyTimeoutMs = options.busyTimeoutMs;
     this.hostSessionId = options.hostSessionId;
-    const adapter = options.transcriptAdapter ?? (this.host === "claude-code" ? claudeCodeAdapter(options.claudeConfigDir === undefined ? {} : { configDir: options.claudeConfigDir }) : null);
+    const adapter = options.transcriptAdapter ?? hostDescriptor(this.host)?.transcripts?.(options) ?? null;
     this.importer =
       adapter === null
         ? null
@@ -349,7 +449,7 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(BootstrapInput, input);
       if (parsed.hostSessionId !== undefined) this.adoptHostSessionId(parsed.hostSessionId);
-      const { db, scope, location } = this.bind();
+      const { db, scope, location } = this.bind({ task: parsed.task, workstream: parsed.workstream });
       const runtime = probeRuntime();
       const imported = this.importer === null ? unsupportedHostStatus(this.host) : this.importer.bootstrap({ location, db }, parsed.importChoice);
       return {
@@ -357,7 +457,7 @@ class LocalMemory implements Memory {
         created: { workspace: location.isNew, workstream: scope.createdWorkstream },
         runtime: { sqliteVersion: runtime.sqliteVersion, fts5: runtime.fts5, schemaVersion: SCHEMA_VERSION },
         import: imported,
-        context: this.pack(db, scope, parse(RecallInput, {})),
+        context: this.pack(db, scope, parse(RecallInput, { ...(parsed.maxTokens === undefined ? {} : { maxTokens: parsed.maxTokens }), ...(parsed.maxBytes === undefined ? {} : { maxBytes: parsed.maxBytes }) })),
       };
     });
   }
@@ -366,7 +466,11 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(RecordInput, input);
       const { db, scope } = this.bind();
+      if (!parsed.workspaceLevel) requireWorkstream(scope, "memory_record");
       const applicability = withHeadCommit(parsed.applicability, scope.worktree);
+      // Observed outside the write transaction (Git and file reads must not hold the lock),
+      // and not part of the idempotency hash, which covers only what the caller sent.
+      const externalRefs = captureObservations(scope.worktree, parsed.externalRefs);
       const links: Citation[] = [
         ...parsed.supportedBy.map((recordId) => ({ recordId, relation: "supported_by" as const })),
         ...parsed.links.map((link) => ({ recordId: link.to, relation: link.relation })),
@@ -382,7 +486,7 @@ class LocalMemory implements Memory {
           attribution: parsed.attribution,
           reviewState: parsed.reviewState,
           applicability,
-          externalRefs: parsed.externalRefs,
+          externalRefs,
           links,
         });
         return {
@@ -400,11 +504,13 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(CheckpointInput, input);
       const { db, scope } = this.bind();
+      requireWorkstream(scope, "memory_checkpoint");
       const applicability = withHeadCommit({}, scope.worktree);
+      const externalRefs = captureObservations(scope.worktree, parsed.externalRefs);
       // Replay is checked before the revision compare, so retrying a checkpoint that
       // already succeeded returns its result instead of a spurious conflict.
       return this.idempotent(db, scope, "checkpoint", parsed, () =>
-        publishCheckpoint(db, scope, parsed.expectedRevision, parsed, applicability),
+        publishCheckpoint(db, scope, parsed.expectedRevision, { ...parsed, externalRefs }, applicability),
       );
     });
   }
@@ -442,6 +548,9 @@ class LocalMemory implements Memory {
         const end = offset + body.length;
         const nextOffset = end < row.body.length ? end : null;
         const revision = db.prepare("SELECT revision FROM checkpoints WHERE record_id = ?").get(row.id) as { revision: number } | undefined;
+        const source = importedFrom(db, [row.id]).get(row.id) ?? null;
+        const fields = recordFields(row);
+        const checked = checkFreshness(scope.worktree, [{ recordId: row.id, refs: fields.externalRefs, imported: source !== null }]).get(row.id);
         return {
           recordId: row.id,
           title: row.title,
@@ -450,12 +559,16 @@ class LocalMemory implements Memory {
           nextOffset,
           truncated: nextOffset !== null,
           totalLength: row.body.length,
-          ...recordFields(row),
+          ...fields,
+          freshness: checked?.freshness ?? "unknown",
+          warning: checked?.warning ?? null,
+          externalRefs: checked?.externalRefs ?? [],
+          independentRoot: rootOf(independentRoots(db, scope.workstreamId, [row.id]), row.id),
           links: linksOf(db, scope.workstreamId, row.id),
           checkpointRevision: revision?.revision ?? null,
           host: row.host,
           sessionId: row.session_id,
-          source: importedFrom(db, [row.id]).get(row.id) ?? null,
+          source,
           contentHash: row.content_hash,
           createdAt: row.created_at,
           budget: { ...budget, ...usage(Buffer.byteLength(body, "utf8")) },
@@ -473,7 +586,7 @@ class LocalMemory implements Memory {
         scope: null,
         counts: null,
         problem: null,
-        capabilities: { operations: OPERATIONS, freshnessValidation: false, transcriptImport: this.importer !== null },
+        capabilities: { operations: OPERATIONS, freshnessValidation: true, transcriptImport: this.importer !== null },
         import: null,
       };
       let db: Db | null = null;
@@ -488,6 +601,9 @@ class LocalMemory implements Memory {
           branch: location.branch,
           workstreamId: null,
           workstreamLabel: null,
+          taskKey: null,
+          resolvedBy: null,
+          ambiguity: null,
           headRevision: null,
           sessionId: this.bound?.scope.sessionId ?? null,
           host: this.host,
@@ -498,6 +614,8 @@ class LocalMemory implements Memory {
         };
         db = openReadOnly(location.dbPath);
         if (db === null) {
+          // No database yet: the first bootstrap can only start a new workstream.
+          result.scope.resolvedBy = "new_workstream";
           reportImport(null);
           return result;
         }
@@ -516,11 +634,23 @@ class LocalMemory implements Memory {
           return result; // migrated by the next bootstrap
         }
         reportImport(db);
-        const workstream = findBinding(db, location.worktree);
-        if (workstream !== null) {
-          result.scope.workstreamId = workstream.id;
-          result.scope.workstreamLabel = workstream.label;
-          result.scope.headRevision = headRevision(db, workstream.id);
+        // A bound instance keeps its workstream (bootstrap re-resolves it only while ambiguous);
+        // otherwise preview the resolution bootstrap would run, with this instance's session.
+        const bound = this.bound?.scope;
+        const resolution: ResolutionPreview | null =
+          bound?.workstream != null && bound.resolvedBy !== null
+            ? { status: "bound", workstream: bound.workstream, basis: bound.resolvedBy }
+            : previewScope(db, location, { host: this.host, hostSessionId: this.hostSessionId, ...(bound === undefined ? {} : { sessionId: bound.sessionId }) });
+        if (resolution?.status === "ambiguous") {
+          result.scope.ambiguity = resolution.ambiguity;
+        } else if (resolution !== null) {
+          result.scope.resolvedBy = resolution.basis;
+          if (resolution.workstream !== null) {
+            result.scope.workstreamId = resolution.workstream.id;
+            result.scope.workstreamLabel = resolution.workstream.label;
+            result.scope.taskKey = resolution.workstream.taskKey;
+            result.scope.headRevision = headRevision(db, resolution.workstream.id);
+          }
         }
         const count = (table: string): number => (db?.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
         result.counts = { records: count("records"), checkpoints: count("checkpoints"), workstreams: count("workstreams"), sessions: count("sessions") };
@@ -555,15 +685,25 @@ class LocalMemory implements Memory {
 
   // ── internals ──
 
-  /** Resolves and binds scope exactly once per instance; later calls reuse it. */
-  private bind(): Bound {
+  /**
+   * Resolves and binds scope once per instance; later calls reuse it. Only bootstrap passes
+   * `hints`: it re-resolves this session when it is still ambiguous, or when the agent gives an
+   * explicit choice or task.
+   */
+  private bind(hints?: ScopeHints): Bound {
     if (this.closed) throw new MemchorError("storage_unavailable", "This Memory has been closed.");
-    if (this.bound !== undefined) return this.bound;
+    if (this.bound !== undefined) {
+      const { db, location, scope } = this.bound;
+      if (hints !== undefined && (hints.task !== undefined || hints.workstream !== undefined || scope.workstream === null)) {
+        this.bound.scope = bindScope(db, location, { host: this.host, hostSessionId: this.hostSessionId, sessionId: scope.sessionId }, hints);
+      }
+      return this.bound;
+    }
     const location = locateWorkspace(this.cwd, this.home);
     registerWorkspace(location);
     const db = openDatabase(location.dbPath, this.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: this.busyTimeoutMs });
     try {
-      const scope = bindScope(db, location, this.host, this.hostSessionId);
+      const scope = bindScope(db, location, { host: this.host, hostSessionId: this.hostSessionId }, hints);
       this.bound = { db, scope, location };
       return this.bound;
     } catch (error) {
@@ -631,10 +771,6 @@ class LocalMemory implements Memory {
   /**
    * Builds one page of a context pack inside a single read transaction, so the head
    * checkpoint, the candidates, and their citations come from one consistent snapshot.
-   */
-  /**
-   * Builds one page of a context pack inside a single read transaction, so the head
-   * checkpoint, the candidates, and their citations come from one consistent snapshot.
    *
    * Page 1 ranks and freezes the whole sequence (≤ SEQUENCE_CAP seqs); the continuation
    * carries the unreturned remainder. Later pages only load records by seq, re-checking
@@ -674,8 +810,15 @@ class LocalMemory implements Memory {
       const rows = loadCandidates(db, { workstreamId: scope.workstreamId, match, seqs: window });
       const citations = citationsFor(db, scope.workstreamId, [...rows.map((r) => r.id), ...(checkpointRow ? [checkpointRow.id] : [])]);
       const sources = importedFrom(db, rows.map((r) => r.id));
+      const roots = independentRoots(db, scope.workstreamId, rows.map((r) => r.id));
+      const groups = groupClaims(
+        rows,
+        (row) => normalizeClaim(row.body),
+        (row) => rootOf(roots, row.id),
+        (a, b) => a.created_at < b.created_at || (a.created_at === b.created_at && a.seq < b.seq),
+      );
 
-      const checkpointPackable: Packable<PackCheckpoint> | null =
+      const checkpointPackable = (freshness: RecordFreshness): Packable<PackCheckpoint> | null =>
         checkpointRow === null
           ? null
           : {
@@ -685,60 +828,108 @@ class LocalMemory implements Memory {
               build: (excerpt, truncated) => ({
                 recordId: checkpointRow.id,
                 revision: view.headRevision,
-                excerpt,
+                excerpt: truncated ? excerpt + CUT_MARKER : excerpt,
                 truncated,
+                freshness: freshness.freshness,
+                warning: freshness.warning,
                 citations: citations.get(checkpointRow.id) ?? [],
-                externalRefs: recordFields(checkpointRow).externalRefs,
+                externalRefs: freshness.externalRefs,
                 host: checkpointRow.host,
+                sessionId: checkpointRow.session_id,
                 createdAt: checkpointRow.created_at,
               }),
             };
-      const page = packPage(budget, checkpointPackable, rows.map((row) => itemPackable(row, citations.get(row.id) ?? [], sources.get(row.id) ?? null)));
+      const itemPackables = (count: number, freshnessOf: (row: Candidate) => RecordFreshness): Packable<PackItem>[] =>
+        groups.slice(0, count).map((group) => itemPackable(group, freshnessOf(group.representative), citations, sources, roots));
 
-      // Resume at the first unconsumed row; records dropped as ineligible leave the sequence.
-      const next = rows[page.consumed];
-      const remaining = next === undefined ? sequence.slice(window.length) : sequence.slice(sequence.indexOf(next.seq));
-      const omissions: Omission[] = [];
-      if (page.oversized.length > 0) omissions.push({ reason: "exceeds_budget", count: page.oversized.length, recordIds: page.oversized });
-      if (remaining.length > 0) omissions.push({ reason: "budget", count: remaining.length });
-      if (beyondCap > 0) omissions.push({ reason: "candidate_limit", count: beyondCap });
-      const truncated = omissions.length > 0 || page.checkpoint?.truncated === true;
-      const empty = page.checkpoint === null && page.items.length === 0 && omissions.length === 0;
-
-      let notice: string | null = null;
-      if (empty) {
-        notice =
-          continued === null && query === null
-            ? "No memory has been recorded for this workstream yet. There is no prior context; do not assume any."
-            : "No eligible memory matches this request. Nothing is known about it; do not assume prior context.";
-      } else if (truncated) {
-        notice =
-          beyondCap > 0 && remaining.length === 0
-            ? `More than ${SEQUENCE_CAP} records match; only the top ${SEQUENCE_CAP} are sequenced. Refine the query to see the rest.`
-            : "Budget reached before all eligible memory was returned. Pass `continuation` for more, or read a recordId to expand it.";
-      }
-
-      return {
-        scope: view,
-        checkpoint: page.checkpoint,
-        items: page.items,
-        omissions,
-        truncated,
-        continuation:
-          remaining.length > 0
-            ? sealContinuation(scope.continuationSecret, {
-                workspaceId: scope.workspaceId,
-                workstreamId: scope.workstreamId,
-                query,
-                kinds: sequenceKinds,
-                remaining,
-                beyondCap,
-              })
-            : null,
-        budget: { ...budget, usedBytes: page.usedBytes, usedTokens: estimateTokens(page.usedBytes) },
-        empty,
-        notice,
+      // Resume at the first unconsumed group. Copies folded into a returned item leave the
+      // sequence with it; records dropped as ineligible leave it too.
+      const loaded = new Set(rows.map((row) => row.seq));
+      const windowed = new Set(window);
+      const remainingAfter = (page: PackedPage<PackCheckpoint, PackItem>): number[] => {
+        const consumed = new Set(groups.slice(0, page.consumed).flatMap((group) => [group.representative, ...group.copies].map((row) => row.seq)));
+        return sequence.filter((seq) => (windowed.has(seq) ? loaded.has(seq) && !consumed.has(seq) : true));
       };
+      // The whole pack for a page: the budget covers all of it (see context-pack.ts).
+      const assemble = (page: PackedPage<PackCheckpoint, PackItem>, carry: number, starved: boolean): ContextPack => {
+        const remaining = remainingAfter(page);
+        const carried = remaining.slice(0, carry);
+        const uncarried = beyondCap + remaining.length - carried.length;
+        const omissions: Omission[] = [];
+        if (page.oversized.length > 0) omissions.push({ reason: "exceeds_budget", count: page.oversized.length, recordIds: page.oversized });
+        if (carried.length > 0) omissions.push({ reason: "budget", count: carried.length });
+        if (uncarried > 0) omissions.push({ reason: "candidate_limit", count: uncarried });
+        const truncated = omissions.length > 0 || page.checkpoint?.truncated === true;
+        const empty = page.checkpoint === null && page.items.length === 0 && omissions.length === 0;
+        let notice: string | null = null;
+        if (starved) {
+          notice = "This budget is too small for even the pack's scope and envelope, so nothing was returned. Recall again with a larger maxBytes/maxTokens.";
+        } else if (empty) {
+          notice =
+            continued === null && query === null
+              ? "No memory has been recorded for this workstream yet. There is no prior context; do not assume any."
+              : "No eligible memory matches this request. Nothing is known about it; do not assume prior context.";
+        } else if (truncated) {
+          notice =
+            uncarried > 0 && carried.length === 0
+              ? `${uncarried} more eligible record${uncarried === 1 ? "" : "s"} match than this sequence carries (at most ${SEQUENCE_CAP} are sequenced, fewer when a small budget limits the continuation). Refine the query, or recall with a larger budget.`
+              : "Budget reached before all eligible memory was returned. Pass `continuation` for more, or read a recordId to expand it.";
+        }
+        return {
+          scope: view,
+          checkpoint: page.checkpoint,
+          items: page.items,
+          omissions,
+          truncated,
+          continuation:
+            carried.length > 0
+              ? sealContinuation(scope.continuationSecret, {
+                  workspaceId: scope.workspaceId,
+                  workstreamId: scope.workstreamId,
+                  query,
+                  kinds: sequenceKinds,
+                  remaining: carried,
+                  beyondCap: uncarried,
+                })
+              : null,
+          budget: { ...budget, usedBytes: 0, usedTokens: 0 },
+          empty,
+          notice: withScopeNotice(scope, notice, empty),
+        };
+      };
+      const plan = planPage(budget.maxBytes, assemble, (page) => remainingAfter(page).length);
+
+      // Two passes keep validation to what the budget can return. The first selects with
+      // the smallest annotation freshness could produce; only that prefix is checked
+      // against the live worktree; the second packs the prefix with the real annotations,
+      // which can only shrink it, so no unchecked record is ever returned.
+      const refsOf = (row: RecordRow): StoredRef[] => recordFields(row).externalRefs;
+      const selection =
+        plan === null
+          ? EMPTY_PAGE
+          : packPage(
+              plan,
+              checkpointPackable(freshnessFloor(checkpointRow === null ? [] : refsOf(checkpointRow))),
+              itemPackables(groups.length, (row) => freshnessFloor(refsOf(row))),
+            );
+      const selected = groups.slice(0, selection.consumed).map((group) => group.representative);
+      const checked = checkFreshness(scope.worktree, [
+        ...(checkpointRow === null ? [] : [{ recordId: checkpointRow.id, refs: refsOf(checkpointRow), imported: false }]),
+        ...selected.map((row) => ({ recordId: row.id, refs: refsOf(row), imported: sources.has(row.id) })),
+      ]);
+      const freshnessOf = (row: RecordRow): RecordFreshness => {
+        const result = checked.get(row.id);
+        if (result === undefined) throw new Error(`record ${row.id} was packed without a freshness check`);
+        return result;
+      };
+      return packWithinBudget(
+        budget.maxBytes,
+        plan,
+        checkpointRow === null ? null : checkpointPackable(freshnessOf(checkpointRow)),
+        itemPackables(selection.consumed, freshnessOf),
+        assemble,
+        (page) => remainingAfter(page).length,
+      );
     })();
   }
 
@@ -753,30 +944,65 @@ class LocalMemory implements Memory {
   }
 }
 
-function itemPackable(row: Candidate, citations: Citation[], source: ImportedSource | null): Packable<PackItem> {
+/**
+ * One pack entry per claim group. Everything but the excerpt (freshness, warning,
+ * citations, provenance, copies) is fixed-size metadata that `fit` measures first, so
+ * a tight budget cuts the body, never the warnings or citations.
+ */
+function itemPackable(
+  group: ClaimGroup<Candidate>,
+  freshness: RecordFreshness,
+  citations: ReadonlyMap<string, Citation[]>,
+  sources: ReadonlyMap<string, ImportedSource>,
+  roots: ReadonlyMap<string, string>,
+): Packable<PackItem> {
+  const row = group.representative;
   const fields = recordFields(row);
+  const copies = group.copies.slice(0, LISTED_COPIES).map((copy) => ({
+    recordId: copy.id,
+    host: copy.host,
+    sessionId: copy.session_id,
+    source: sources.get(copy.id) ?? null,
+    createdAt: copy.created_at,
+  }));
   return {
     recordId: row.id,
     source: row.excerpt_source,
     maxExcerptBytes: ITEM_EXCERPT_BYTES,
-    build: (excerpt, truncated) => ({
+    build: (excerpt, cut) => ({
       recordId: row.id,
       kind: fields.kind,
       title: row.title,
-      excerpt,
-      truncated: truncated || row.excerpt_source !== row.body,
+      excerpt: cut ? excerpt + CUT_MARKER : excerpt,
+      truncated: cut || row.excerpt_source !== row.body,
       attribution: fields.attribution,
       reviewState: fields.reviewState,
-      freshness: fields.freshness,
+      freshness: freshness.freshness,
+      warning: freshness.warning,
       applicability: fields.applicability,
-      citations,
-      externalRefs: fields.externalRefs,
+      citations: citations.get(row.id) ?? [],
+      externalRefs: freshness.externalRefs,
       workspaceLevel: fields.workspaceLevel,
       host: row.host,
-      source,
+      sessionId: row.session_id,
+      source: sources.get(row.id) ?? null,
       createdAt: row.created_at,
+      independentRoot: rootOf(roots, row.id),
+      corroboration: { independentRoots: group.independentRoots, records: group.records },
+      copies,
     }),
   };
+}
+
+/**
+ * A record's independent root. `independentRoots` answers for every id it is given (its own
+ * `record:<id>` when nothing else applies), so a missing entry is a bug to surface, not a
+ * record to quietly present as its own observation.
+ */
+function rootOf(roots: ReadonlyMap<string, string>, recordId: string): string {
+  const root = roots.get(recordId);
+  if (root === undefined) throw new Error(`no independent root was computed for ${recordId}`);
+  return root;
 }
 
 const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
@@ -791,14 +1017,25 @@ function scopeView(db: Db, scope: BoundScope): Scope {
   return {
     workspaceId: scope.workspaceId,
     workspaceLabel: scope.workspaceLabel,
-    workstreamId: scope.workstreamId,
-    workstreamLabel: scope.workstreamLabel,
+    workstreamId: scope.workstream?.id ?? null,
+    workstreamLabel: scope.workstream?.label ?? null,
+    taskKey: scope.workstream?.taskKey ?? null,
+    resolvedBy: scope.resolvedBy,
+    ambiguity: scope.ambiguity,
     branch: scope.branch,
     worktree: scope.worktree,
-    headRevision: headRevision(db, scope.workstreamId),
+    headRevision: scope.workstream === null ? 0 : headRevision(db, scope.workstream.id),
     sessionId: scope.sessionId,
     host: scope.host,
   };
+}
+
+/** While no workstream is bound, a pack says why it holds only workspace-level memory. */
+function withScopeNotice(scope: BoundScope, notice: string | null, empty: boolean): string | null {
+  if (scope.ambiguity === null) return notice;
+  const why =
+    "No workstream is bound yet (scope.ambiguity lists the candidates), so this holds only workspace-level memory. Ask the user which workstream to continue, then call memory_bootstrap with workstream set to its id or \"new\".";
+  return empty || notice === null ? why : `${why} ${notice}`;
 }
 
 function withHeadCommit(applicability: Applicability, worktree: string): Applicability {

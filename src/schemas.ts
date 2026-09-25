@@ -7,7 +7,9 @@ import { z } from "zod";
  *
  * Every object is strict: unknown keys are rejected. In particular a payload cannot
  * carry `workspaceId`, `workstreamId`, `cwd` or `path` — scope comes only from the
- * process's trusted context (see `openMemory`).
+ * process's trusted context (see `openMemory`). The one exception is bootstrap's
+ * `workstream`, the user's answer to an ambiguity: it can only name a workstream of the
+ * workspace already resolved from that context, so it never widens scope.
  */
 
 export const LIMITS = {
@@ -17,6 +19,8 @@ export const LIMITS = {
   operationKeyChars: 200,
   queryChars: 1_000,
   hostSessionIdChars: 200,
+  /** An explicit task identity: an issue/PR number or URL, or a tracker key. */
+  taskChars: 500,
   /** Host names longer than this are cut (they are labels, not identities). */
   hostChars: 100,
   linksPerRecord: 20,
@@ -71,11 +75,19 @@ export type ReviewState = z.infer<typeof ReviewState>;
 export const LinkRelation = z.enum(["supported_by", "derived_from", "references", "related_to"]);
 export type LinkRelation = z.infer<typeof LinkRelation> | "supersedes";
 
-/** Only "unknown" is produced until freshness validation ships (#21). */
+/**
+ * Whether what a record observed still holds. Computed at recall/read time against the live
+ * worktree (src/retrieval/freshness.ts), never trusted from storage: the stored column stays
+ * "unknown". Local code references compare commit, dirty state and a bounded file hash;
+ * issue/PR/URL/document references are always "unknown" (historical). Test-result and
+ * document applicability arrive with #21.
+ */
 export const Freshness = z.enum(["current", "stale", "unknown"]);
 export type Freshness = z.infer<typeof Freshness>;
 
 export const RecordId = z.string().regex(/^rec_[0-9a-f]{32}$/, "expected a record id like rec_<32 hex>");
+
+export const WorkstreamId = z.string().regex(/^wst_[0-9a-f]{32}$/, 'expected a workstream id like wst_<32 hex>, or "new"');
 
 export const ExternalRef = z.strictObject({
   kind: z.enum(["code", "document", "issue", "pr", "url", "other"]),
@@ -83,7 +95,12 @@ export const ExternalRef = z.strictObject({
   locator: z.string().min(1).max(500),
   path: z.string().min(1).max(500).optional(),
   lines: z.tuple([z.int().min(1), z.int().min(1)]).optional(),
+  /**
+   * Pins the reference to a version. Leave `commit` and `observedHash` out for code as it is
+   * on disk now: Memchor then records the commit, dirty state and a `sha256:` hash itself.
+   */
   commit: z.string().min(4).max(64).optional(),
+  /** `sha256:<hex>` of the whole file; any other format cannot be compared (freshness stays unknown). */
   observedHash: z.string().min(1).max(200).optional(),
   observedAt: z.iso.datetime({ offset: true }).optional(),
 });
@@ -119,6 +136,24 @@ export const BootstrapInput = z.strictObject({
     .describe(
       "Only after asking the user the question in import.question (or when they ask to change it): all = import every project's local transcripts, current_project = only this repository's, none = import nothing. Stored per host; pass it again to change it.",
     ),
+  task: z
+    .string()
+    .trim()
+    .min(1)
+    .max(LIMITS.taskChars)
+    .optional()
+    .describe(
+      'The task the user explicitly named, if any: "#20", an issue or PR URL, or a tracker key like PROJ-7. It selects the workstream of that task over branch similarity; never invent one.',
+    ),
+  workstream: z
+    .union([z.literal("new"), WorkstreamId])
+    .optional()
+    .describe(
+      'Only after asking the user to choose from scope.ambiguity.candidates: the chosen workstreamId, or "new" for a fresh workstream. The choice becomes this worktree\'s workstream.',
+    ),
+  /** Budget for the returned `context` pack, exactly as for recall. */
+  maxTokens: MaxTokens.optional().describe("Budget for the returned context pack (default 2000 tokens), as for memory_recall"),
+  maxBytes: MaxBytes.optional(),
 });
 export type BootstrapInput = z.input<typeof BootstrapInput>;
 

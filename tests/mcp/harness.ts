@@ -24,7 +24,7 @@ export const NO_NETWORK = resolve(import.meta.dirname, "no-network.mjs");
 
 /**
  * Spawns `node dist/cli.js mcp` in `cwd` with an isolated MEMCHOR_HOME (and, if given, an
- * isolated Claude config dir) and connects an SDK client. `networkLog` preloads a guard that
+ * isolated Claude config dir or Codex home) and connects an SDK client. `networkLog` preloads a guard that
  * records and refuses every network attempt.
  */
 export async function spawnServer(options: {
@@ -33,7 +33,10 @@ export async function spawnServer(options: {
   host?: string;
   clientName?: string;
   claudeConfigDir?: string;
+  codexHome?: string;
   networkLog?: string;
+  /** Sent as `_meta` on every tools/call, as a host does (Codex: `{ threadId }`). */
+  meta?: Record<string, unknown>;
 }): Promise<ServerHandle> {
   const args = [...(options.networkLog === undefined ? [] : ["--import", NO_NETWORK]), CLI, "mcp", ...(options.host === undefined ? [] : ["--host", options.host])];
   const transport = new StdioClientTransport({
@@ -46,6 +49,7 @@ export async function spawnServer(options: {
       MEMCHOR_HOME: options.home,
       // Never let a spawned server read the developer's real transcripts.
       CLAUDE_CONFIG_DIR: options.claudeConfigDir ?? resolve(options.home, "no-claude-config"),
+      CODEX_HOME: options.codexHome ?? resolve(options.home, "no-codex-home"),
       ...(options.networkLog === undefined ? {} : { MEMCHOR_NETWORK_LOG: options.networkLog }),
     },
     stderr: "pipe",
@@ -56,7 +60,7 @@ export async function spawnServer(options: {
   if (pid === null) throw new Error("server did not start");
 
   const call = async (name: string, callArgs: Record<string, unknown> = {}): Promise<ToolOutcome> => {
-    const result = await client.callTool({ name, arguments: callArgs });
+    const result = await client.callTool({ name, arguments: callArgs, ...(options.meta === undefined ? {} : { _meta: options.meta }) });
     const content = result.content as { type: string; text?: string }[];
     return {
       isError: result.isError === true,

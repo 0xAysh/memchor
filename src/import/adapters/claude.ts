@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type {
@@ -12,6 +12,9 @@ import type {
   TranscriptFile,
   TranscriptHead,
 } from "../normalized-event.js";
+import { asObject, type JsonObject, listDir, parseObject, readLines } from "../jsonl.js";
+import { shellCall } from "../shell-reads.js";
+import { inCompatibility } from "../versions.js";
 
 /**
  * Claude Code transcripts → normalized events.
@@ -79,9 +82,6 @@ const INJECTED = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
 
 /** The first entries carry the cwd; this bounds what discovery reads from each transcript. */
 const HEAD_BYTES = 64 * 1024;
-const READ_CHUNK = 1 << 20;
-/** A single entry larger than this (e.g. a pasted multi-megabyte image) is skipped unparsed. */
-const MAX_LINE_BYTES = 32 << 20;
 
 export function claudeCodeAdapter(options: { configDir?: string } = {}): TranscriptAdapter {
   // An empty CLAUDE_CONFIG_DIR means unset (Claude Code's own default), never "the cwd".
@@ -118,18 +118,10 @@ function discover(root: string): TranscriptFile[] {
   return files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 }
 
-function listDir(dir: string): import("node:fs").Dirent[] {
-  try {
-    return readdirSync(dir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-}
-
 function inspect(file: TranscriptFile): TranscriptHead {
   for (const line of readLines(file.path, 0, HEAD_BYTES)) {
     if (line.text === null) continue;
-    const entry = parseJson(line.text);
+    const entry = parseObject(line.text);
     if (entry !== null && typeof entry["cwd"] === "string") {
       const hostVersion = typeof entry["version"] === "string" ? entry["version"] : null;
       return { cwd: entry["cwd"], hostVersion, supported: hostVersion !== null && isSupported(hostVersion) };
@@ -149,7 +141,7 @@ function read(file: TranscriptFile, from: number, maxBytes: number): TranscriptC
       chunk.end = line.end;
       continue;
     }
-    const entry = parseJson(line.text);
+    const entry = parseObject(line.text);
     if (entry === null) {
       exclude("malformed");
       chunk.end = line.end;
@@ -167,7 +159,7 @@ function read(file: TranscriptFile, from: number, maxBytes: number): TranscriptC
   return chunk;
 }
 
-type Entry = Record<string, unknown>;
+type Entry = JsonObject;
 type Excluder = (reason: ExclusionReason, n?: number) => void;
 
 function normalizeEntry(entry: Entry, line: { start: number; end: number }, out: NormalizedEvent[], exclude: Excluder): void {
@@ -245,7 +237,7 @@ function normalizeEntry(entry: Entry, line: { start: number; end: number }, out:
       return;
     }
     if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string") {
-      out.push({ ...origin, eventId: eventId(index), type: "tool_call", callId: b.id, tool: b.name, ...describeCall(b.name, asEntry(b.input)) });
+      out.push({ ...origin, eventId: eventId(index), type: "tool_call", callId: b.id, tool: b.name, ...describeCall(b.name, asObject(b.input), cwd) });
       return;
     }
     exclude("unsupported_entry");
@@ -263,7 +255,7 @@ function normalizeEntry(entry: Entry, line: { start: number; end: number }, out:
 }
 
 /** One-line description, touched paths and semantic kind of a tool call, from its input. */
-function describeCall(name: string, input: Entry): { summary: string; paths: string[]; urls: string[]; toolKind: ToolKind; inputDigest?: string } {
+function describeCall(name: string, input: Entry, cwd: string): { summary: string; paths: string[]; urls: string[]; toolKind: ToolKind; inputDigest?: string } {
   const str = (key: string): string | null => (typeof input[key] === "string" ? input[key] : null);
   const memchor = MEMCHOR_TOOL.exec(name);
   if (memchor !== null) return { summary: `${memchor[1] ?? name} ${JSON.stringify(input)}`, paths: [], urls: [], toolKind: "memchor" };
@@ -276,7 +268,8 @@ function describeCall(name: string, input: Entry): { summary: string; paths: str
   }
   switch (name) {
     case "Bash":
-      return { summary: `$ ${str("command") ?? ""}`, paths: [], urls: [], toolKind: "other" };
+      // A command that only prints files inside the cwd is a file read, like Read (see shell-reads.ts).
+      return { summary: `$ ${str("command") ?? ""}`, urls: [], ...shellCall(str("command"), cwd, cwd) };
     case "Grep":
     case "Glob": {
       const path = str("path");
@@ -317,93 +310,6 @@ function resultText(content: unknown, exclude: Excluder): string {
   return parts.join("\n");
 }
 
-function asEntry(value: unknown): Entry {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Entry) : {};
-}
-
-function parseJson(text: string): Entry | null {
-  try {
-    const value: unknown = JSON.parse(text);
-    return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Entry) : null;
-  } catch {
-    return null;
-  }
-}
-
 function isSupported(version: string): boolean {
-  return COMPATIBILITY.some((row) => compare(version, row.from) >= 0 && compare(version, row.below) < 0);
-}
-
-/** Numeric dotted-version comparison; anything non-numeric sorts below every real version. */
-function compare(a: string, b: string): number {
-  const pa = a.split(".").map((p) => (/^\d+$/.test(p) ? Number(p) : -1));
-  const pb = b.split(".").map((p) => (/^\d+$/.test(p) ? Number(p) : -1));
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (diff !== 0) return diff;
-  }
-  return 0;
-}
-
-interface Line {
-  start: number;
-  end: number;
-  /** null when the line exceeded MAX_LINE_BYTES and was skipped unread. */
-  text: string | null;
-}
-
-/**
- * Complete, newline-terminated lines from `from` until at least `maxBytes` are consumed
- * (always at least one line when one is complete). The unterminated tail of a file that is
- * still being written is never returned, so it is read again once finished.
- */
-function readLines(path: string, from: number, maxBytes: number): Line[] {
-  const lines: Line[] = [];
-  let fd: number;
-  try {
-    fd = openSync(path, "r");
-  } catch {
-    return lines;
-  }
-  try {
-    const buffer = Buffer.alloc(Math.min(READ_CHUNK, Math.max(maxBytes, 4096)));
-    let pending: Buffer[] = [];
-    let pendingBytes = 0;
-    let skipping = false;
-    let lineStart = from;
-    let position = from;
-    for (;;) {
-      const n = readSync(fd, buffer, 0, buffer.length, position);
-      if (n === 0) break;
-      let cursor = 0;
-      while (cursor < n) {
-        const newline = buffer.indexOf(10, cursor);
-        const stop = newline === -1 || newline >= n ? n : newline;
-        if (!skipping) {
-          pending.push(Buffer.from(buffer.subarray(cursor, stop)));
-          pendingBytes += stop - cursor;
-          if (pendingBytes > MAX_LINE_BYTES) {
-            skipping = true;
-            pending = [];
-          }
-        }
-        if (stop === n) {
-          cursor = n;
-          break;
-        }
-        const end = position + stop + 1;
-        lines.push({ start: lineStart, end, text: skipping ? null : Buffer.concat(pending).toString("utf8") });
-        pending = [];
-        pendingBytes = 0;
-        skipping = false;
-        lineStart = end;
-        cursor = stop + 1;
-        if (end - from >= maxBytes) return lines;
-      }
-      position += n;
-    }
-    return lines;
-  } finally {
-    closeSync(fd);
-  }
+  return inCompatibility(version, COMPATIBILITY);
 }

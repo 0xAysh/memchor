@@ -4,19 +4,26 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, test } from "vitest";
 import { initRepo, tempDir } from "../helpers.js";
-import { claudeConfigDir, installSyntheticHistory } from "../import/fixtures.js";
+import { claudeConfigDir, codexHome, installSyntheticCodexHistory, installSyntheticHistory } from "../import/fixtures.js";
 import { CLI } from "./harness.js";
 
 interface ImportRun {
   import: { state: string; problem: unknown; currentProject: { complete: number; pending: number; counters: { records: number; replayed: number; conflicts: number } } };
 }
 
-function env(home: string, config: string): NodeJS.ProcessEnv {
-  return { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: home, CLAUDE_CONFIG_DIR: config };
+/** Each host's history lives in its own directory; the other host's points at an empty one. */
+interface HostHistory {
+  host: "claude-code" | "codex";
+  claudeConfig: string;
+  codexHome: string;
 }
 
-function memchor(cwd: string, home: string, config: string, ...args: string[]): ImportRun {
-  const run = spawnSync(process.execPath, [CLI, ...args], { cwd, env: env(home, config), encoding: "utf8" });
+function env(home: string, history: HostHistory): NodeJS.ProcessEnv {
+  return { PATH: process.env["PATH"] ?? "", HOME: process.env["HOME"] ?? "", MEMCHOR_HOME: home, CLAUDE_CONFIG_DIR: history.claudeConfig, CODEX_HOME: history.codexHome };
+}
+
+function memchor(cwd: string, home: string, history: HostHistory, ...args: string[]): ImportRun {
+  const run = spawnSync(process.execPath, [CLI, ...args, "--host", history.host], { cwd, env: env(home, history), encoding: "utf8" });
   if (run.status !== 0) throw new Error(`memchor ${args.join(" ")} exited ${String(run.status)}: ${run.stderr}`);
   return JSON.parse(run.stdout) as ImportRun;
 }
@@ -28,16 +35,36 @@ function workspaceDb(home: string): string | null {
   return id === undefined || id === "" ? null : join(root, id, "memory.sqlite");
 }
 
-describe("interrupted import", () => {
+const HOSTS = [
+  {
+    host: "claude-code" as const,
+    recordsPerTurn: 7,
+    install: (repo: string, transcripts: number, turns: number): HostHistory => {
+      const history = { host: "claude-code" as const, claudeConfig: claudeConfigDir(), codexHome: codexHome() };
+      installSyntheticHistory(history.claudeConfig, repo, { transcripts, turns });
+      return history;
+    },
+  },
+  {
+    host: "codex" as const,
+    recordsPerTurn: 8,
+    install: (repo: string, transcripts: number, turns: number): HostHistory => {
+      const history = { host: "codex" as const, claudeConfig: claudeConfigDir(), codexHome: codexHome() };
+      installSyntheticCodexHistory(history.codexHome, repo, { transcripts, turns });
+      return history;
+    },
+  },
+];
+
+describe.each(HOSTS)("interrupted $host import", ({ install, recordsPerTurn }) => {
   test("SIGKILL mid-import leaves no partial batch or advanced cursor; the resumed import equals a clean one", async () => {
     const repo = initRepo();
-    const config = claudeConfigDir();
-    installSyntheticHistory(config, repo, { transcripts: 8, turns: 150 }); // 8,400 records
-    const expected = 8 * 150 * 7;
+    const history = install(repo, 8, 150);
+    const expected = 8 * 150 * recordsPerTurn;
 
     // Killed run: consent triggers the bootstrap import; SIGKILL it once batches are committing.
     const killedHome = tempDir();
-    const child = spawn(process.execPath, [CLI, "diag", "consent", "--set", "current_project"], { cwd: repo, env: env(killedHome, config), stdio: "ignore" });
+    const child = spawn(process.execPath, [CLI, "diag", "consent", "--set", "current_project", "--host", history.host], { cwd: repo, env: env(killedHome, history), stdio: "ignore" });
     let atKill = 0;
     for (let tries = 0; tries < 400 && atKill === 0; tries++) {
       await new Promise((r) => setTimeout(r, 10));
@@ -57,11 +84,11 @@ describe("interrupted import", () => {
     expect(atKill).toBeGreaterThan(0);
     expect(atKill).toBeLessThan(expected);
 
-    const resumed = memchor(repo, killedHome, config, "diag", "import");
+    const resumed = memchor(repo, killedHome, history, "diag", "import");
     const clean = (() => {
       const home = tempDir();
-      memchor(repo, home, config, "diag", "consent", "--set", "current_project");
-      return memchor(repo, home, config, "diag", "import");
+      memchor(repo, home, history, "diag", "consent", "--set", "current_project");
+      return memchor(repo, home, history, "diag", "import");
     })();
 
     for (const run of [resumed, clean]) {

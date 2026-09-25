@@ -17,10 +17,10 @@ function mkdirp(file: string): void {
   mkdirSync(dirname(file), { recursive: true });
 }
 
-/** A pack with the per-session scope fields removed, for comparing across instances. */
+/** A pack with the per-session scope fields (and the byte usage they change) removed, for comparing across instances. */
 function stable(memory: Memory, query?: string) {
-  const { scope, ...pack } = memory.recall(query === undefined ? {} : { query });
-  return { workspaceId: scope.workspaceId, workstreamId: scope.workstreamId, headRevision: scope.headRevision, ...pack };
+  const { scope, budget, ...pack } = memory.recall(query === undefined ? {} : { query });
+  return { workspaceId: scope.workspaceId, workstreamId: scope.workstreamId, headRevision: scope.headRevision, maxBytes: budget.maxBytes, ...pack };
 }
 
 describe("durability", () => {
@@ -213,7 +213,7 @@ describe("storage failures", () => {
     const status = memory.status();
     expect(status.runtime).toMatchObject({ fts5: true, supported: true, requiredSqliteVersion: "3.51.3" });
     expect(status.runtime.sqliteVersion).toMatch(/^3\.\d+\.\d+$/);
-    expect(status.storage).toMatchObject({ schemaVersion: 3, supportedSchemaVersion: 3, journalMode: "wal" });
+    expect(status.storage).toMatchObject({ schemaVersion: 4, supportedSchemaVersion: 4, journalMode: "wal" });
     expect(status.counts).toEqual({ records: 0, checkpoints: 0, workstreams: 1, sessions: 1 });
     expect(status.problem).toBeNull();
   });

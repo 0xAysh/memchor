@@ -20,14 +20,15 @@ function pathWithRealGit(): string | undefined {
 }
 
 const PATH = pathWithRealGit();
-/** Tests never read the developer's real Claude Code history unless a test passes its own config dir. */
+/** Tests never read the developer's real Claude Code or Codex history unless a test passes its own directory. */
 const CLAUDE_CONFIG_DIR = join(tmpdir(), "memchor-tests-no-claude-config");
+const CODEX_HOME = join(tmpdir(), "memchor-tests-no-codex-home");
 
 export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
     globalSetup: ["tests/global-setup.ts"],
-    env: { CLAUDE_CONFIG_DIR, ...(PATH === undefined ? {} : { PATH }) },
+    env: { CLAUDE_CONFIG_DIR, CODEX_HOME, ...(PATH === undefined ? {} : { PATH }) },
     // Storage tests open real SQLite files and spawn `git` and server processes; give them headroom.
     testTimeout: 30_000,
     hookTimeout: 30_000,

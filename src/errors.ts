@@ -9,11 +9,10 @@ export const ERROR_CODES = [
   /** The process cwd is not inside a Git worktree, so no workspace can be derived. */
   "scope_unresolved",
   /**
-   * More than one workstream could own this scope; Memchor refuses to guess. Transcript
-   * import reports it as a gap reason when a transcript's signals conflict (it moves to
-   * another worktree or repository, or Memchor output in it names a different workstream):
-   * the transcript is quarantined rather than attached. No operation throws it yet; a live
-   * session always binds to its worktree's workstream.
+   * More than one workstream could own this scope, or its signals conflict; Memchor refuses
+   * to guess. Thrown by workstream-scoped writes (`record` without `workspaceLevel`,
+   * `checkpoint`) while bootstrap's `scope.ambiguity` is unanswered. Transcript import also
+   * reports it as a gap reason for a transcript that is held or quarantined instead of attached.
    */
   "scope_ambiguous",
   /** The target exists but belongs to another workstream. */

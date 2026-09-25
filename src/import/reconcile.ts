@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { closeSync, existsSync, openSync, readSync } from "node:fs";
 import { relative, sep } from "node:path";
-import { ensureWorkspace, ensureWorkstream } from "../bootstrap/workstream-resolution.js";
+import { ensureWorkspace, resolveWorkstream, type ScopeAmbiguity } from "../bootstrap/workstream-resolution.js";
 import { locateWorkspace, registerWorkspace, type WorkspaceLocation } from "../bootstrap/workspace-resolution.js";
 import { type ErrorCode, MemchorError } from "../errors.js";
+import { VISIBLE_SQL } from "../retrieval/eligibility.js";
 import { type ExternalRef, IMPORT_CHOICES, type ImportChoice } from "../schemas.js";
 import { type Db, openDatabase, prepared, toStorageError, writeTransaction } from "../storage/database.js";
 import { appendRecord } from "../storage/records.js";
@@ -30,11 +31,18 @@ import { boundPassage, PASSAGE_LIMITS, redactSecrets, touchesSensitivePath } fro
  * - **Reconciliation.** Unchanged file → skip. Grown file whose bytes before the cursor still
  *   match (`anchor_hash`) → append. Anything else (rewritten, truncated) → a new pass from the
  *   start under a new epoch; events not seen again are counted as `missing`, never deleted.
- * - **Scope.** A transcript belongs to the workstream bound to the worktree of its first event
- *   (creating the binding exactly as a live bootstrap would). An event from another worktree
- *   or repository, or a Memchor echo naming a different existing workstream, is a conflicting
- *   signal: the transcript is quarantined from that event on (`scope_ambiguous`), its cursor
- *   held there, and nothing past it is imported.
+ * - **Scope.** A transcript's workstream is decided once, before its first batch, by the same
+ *   {@link resolveWorkstream} a live bootstrap uses: the Memchor output in that batch naming
+ *   the session's workstream, or a live session with the same host session id (step 1), then
+ *   its first event's worktree binding (step 2), else a new workstream for that worktree. When
+ *   that is ambiguous the transcript is *held*: nothing is written, it is reported as a
+ *   `scope_ambiguous` gap, and it is re-resolved on the next bootstrap (e.g. after the user
+ *   chose a workstream there). Ambiguous history is never stored workspace-level, because
+ *   workspace-level records are recalled in every workstream: that would put it into current
+ *   guidance. After the first batch, an event from another worktree or repository, or Memchor
+ *   output naming a different existing workstream, is a conflicting signal: the transcript is
+ *   quarantined from that event on (`scope_ambiguous`), its cursor held there, and nothing past
+ *   it is imported.
  * - **No network, no model.** Only the transcript files, `git` and SQLite are touched.
  */
 
@@ -123,7 +131,12 @@ const BATCH_BYTES = 1 << 20;
 const ANCHOR_BYTES = 4096;
 
 /** A resolved workspace a transcript can be imported into. */
-type Target = WorkspaceLocation & { registered: boolean };
+type Target = WorkspaceLocation;
+
+/** Consent follows the workspace across moves: approving its old path approves it. */
+function approvesTarget(consent: Consent | null, target: Target): boolean {
+  return [target.repositoryKey, ...target.formerRepositoryKeys].some((key) => approves(consent, key));
+}
 
 interface Discovered {
   file: TranscriptFile;
@@ -165,12 +178,30 @@ interface CallMeta {
 
 class Contended extends Error {}
 
+/** Thrown out of a transcript's first batch (rolling it back) when its workstream is ambiguous. */
+class Held extends Error {
+  constructor(readonly ambiguity: ScopeAmbiguity) {
+    super("transcript scope is ambiguous");
+  }
+}
+
 export class TranscriptImporter {
   private readonly locations = new Map<string, Target | null>();
   private readonly heads = new Map<string, { size: number; mtimeMs: number; cwd: string | null; supported: boolean }>();
   private readonly others = new Map<string, Db>();
   /** Gaps met while backfilling other projects in this process (their cursors live in other databases). */
   private readonly otherGaps = new Map<string, ImportGap>();
+  /**
+   * Transcripts whose workstream was ambiguous before anything was imported. Nothing about
+   * them is stored; they are retried when the file changes or at the next bootstrap.
+   */
+  private readonly held = new Map<string, { size: number; mtimeMs: number; gap: ImportGap }>();
+  /**
+   * Transcripts that stop at their very first line (e.g. a Codex rollout created by an
+   * unsupported version): nothing is readable, so nothing is stored for them, not even a cursor.
+   * They are reported as stopped with their gap, and read again on every pass.
+   */
+  private readonly unreadable = new Map<string, ImportGap>();
   /** Fingerprint of the other projects' approved transcripts when this process last finished reconciling them. */
   private reconciledOthers: string | null = null;
   private batches = 0;
@@ -191,7 +222,9 @@ export class TranscriptImporter {
       // A declined host's transcripts are not even inventoried.
       if (consent?.choice === "none") return this.report(current, consent, null);
       entries = this.inventory();
-      if (approves(consent, current.location.repositoryKey)) {
+      // A bootstrap may just have bound a worktree (e.g. the user's choice): held transcripts get another look.
+      this.held.clear();
+      if (approvesTarget(consent, current.location)) {
         this.run(current, this.plan(entries, consent, current, true), Date.now() + this.options.bootstrapBudgetMs);
       }
       return this.report(current, consent, entries);
@@ -277,14 +310,14 @@ export class TranscriptImporter {
   }
 
   private approvedOthers(entries: Discovered[], consent: Consent, current: CurrentWorkspace): Discovered[] {
-    return entries.filter((e) => e.target !== null && e.target.workspaceId !== current.location.workspaceId && approves(consent, e.target.repositoryKey));
+    return entries.filter((e) => e.target !== null && e.target.workspaceId !== current.location.workspaceId && approvesTarget(consent, e.target));
   }
 
   /** Approved transcripts in import order: the current workspace first, then newest first. */
   private plan(entries: Discovered[], consent: Consent | null, current: CurrentWorkspace, currentOnly: boolean): (Discovered & { target: Target })[] {
     const own = current.location.workspaceId;
     return entries
-      .filter((e): e is Discovered & { target: Target } => e.target !== null && approves(consent, e.target.repositoryKey))
+      .filter((e): e is Discovered & { target: Target } => e.target !== null && approvesTarget(consent, e.target))
       .filter((e) => !currentOnly || e.target.workspaceId === own)
       .sort((a, b) => Number(b.target.workspaceId === own) - Number(a.target.workspaceId === own) || b.file.mtimeMs - a.file.mtimeMs);
   }
@@ -324,6 +357,8 @@ export class TranscriptImporter {
     const { file } = entry;
     const cursor = readCursor(db, this.host, file.transcriptId);
     if (cursor?.state === "quarantined") return "done";
+    const held = this.held.get(file.transcriptId);
+    if (cursor === undefined && held?.size === file.size && held.mtimeMs === file.mtimeMs) return "done";
 
     let offset = 0;
     let epoch = 0;
@@ -350,7 +385,12 @@ export class TranscriptImporter {
       // Nothing complete past the cursor right now (EOF, or a line still being written).
       const caughtUp = chunk.stop === null && (!progressed || chunk.end >= file.size);
       if (!progressed && !rewritten) {
-        if (known === null) return "done"; // a new transcript with no complete line yet: nothing to record
+        if (known === null) {
+          // A new transcript with no complete line yet, or one unreadable from its first line: nothing to record.
+          if (chunk.stop === null) this.unreadable.delete(file.transcriptId);
+          else this.unreadable.set(file.transcriptId, unsupportedGap(file.transcriptId, this.options.adapter.displayName, chunk.stop.hostVersion));
+          return "done";
+        }
         if (chunk.stop === null && known.state === "active" && known.finished) return "done";
         if (chunk.stop !== null && known.state === "stopped") return "done"; // still the same unsupported entry
       }
@@ -367,7 +407,7 @@ export class TranscriptImporter {
           const live = readCursor(db, this.host, file.transcriptId);
           const liveKey = live === undefined ? null : { offset: live.byte_offset, epoch: live.epoch };
           if (JSON.stringify(liveKey) !== JSON.stringify(expected)) throw new Contended();
-          const scope = live ?? this.openTranscript(db, entry, now);
+          const scope = live ?? this.openTranscript(db, entry, now, chunk.events);
           const counters = emptyCounters();
           if (rewritten) counters.rewrites = 1;
           addExcluded(counters, chunk.excluded);
@@ -385,6 +425,7 @@ export class TranscriptImporter {
             workspaceId: entry.target.workspaceId,
             counters,
             calls: new Map(),
+            echoed: new Map(),
             locate: (cwd) => this.locations.get(cwd) ?? null,
           };
           const quarantine = applyEvents(batch, chunk.events);
@@ -399,12 +440,7 @@ export class TranscriptImporter {
           } else if (chunk.stop !== null) {
             state = "stopped";
             newOffset = chunk.stop.offset;
-            gap = {
-              transcriptId: file.transcriptId,
-              reason: "unsupported_version",
-              hostVersion: chunk.stop.hostVersion,
-              message: `${this.options.adapter.displayName} ${chunk.stop.hostVersion} is not in Memchor's compatibility table; this transcript is imported up to that entry and will resume once a Memchor that supports it is installed.`,
-            };
+            gap = unsupportedGap(file.transcriptId, this.options.adapter.displayName, chunk.stop.hostVersion);
           }
           if (state === "active" && caughtUp && epoch > 0) {
             counters.missing = (
@@ -445,8 +481,24 @@ export class TranscriptImporter {
         });
       } catch (error) {
         if (error instanceof Contended) return "contended";
+        if (error instanceof Held) {
+          const candidates = error.ambiguity.candidates.map((c) => c.workstreamId).join(", ");
+          this.held.set(file.transcriptId, {
+            size: file.size,
+            mtimeMs: file.mtimeMs,
+            gap: {
+              transcriptId: file.transcriptId,
+              reason: "scope_ambiguous",
+              message: `Memchor could not tell which workstream this transcript belongs to (candidates: ${candidates}), so none of it was imported. It is imported once its worktree's workstream is chosen (memory_bootstrap with workstream).`,
+              cwd: entry.target.worktree,
+            },
+          });
+          return "done";
+        }
         throw error;
       }
+      this.held.delete(file.transcriptId);
+      this.unreadable.delete(file.transcriptId);
       this.batches++;
       expected = { offset: next.offset, epoch };
       known = { state: next.state, finished: next.finished };
@@ -456,12 +508,27 @@ export class TranscriptImporter {
     }
   }
 
-  /** First batch of a transcript: bind it to its worktree's workstream and create its session, source and cursor rows. */
-  private openTranscript(db: Db, entry: Discovered & { target: Target }, now: string): CursorRow {
+  /**
+   * First batch of a transcript: resolve its workstream exactly as a live bootstrap in its
+   * worktree would, then create its session, source and cursor rows. Throws {@link Held}
+   * (rolling the batch back) when the workstream is ambiguous.
+   */
+  private openTranscript(db: Db, entry: Discovered & { target: Target }, now: string, events: readonly NormalizedEvent[]): CursorRow {
     ensureWorkspace(db, entry.target, now);
-    const { workstream } = ensureWorkstream(db, entry.target, now);
     const key = `${this.host}\u0000${entry.file.transcriptId}`;
     const sessionId = `ses_${digest(`session\u0000${key}`).slice(0, 32)}`;
+    const resolution = resolveWorkstream(
+      db,
+      {
+        worktree: entry.target.worktree,
+        branch: entry.target.branch,
+        session: { host: this.host, hostSessionId: entry.file.transcriptId, sessionId },
+        namedWorkstreams: workstreamsNamedAtStart(events),
+      },
+      now,
+    );
+    if (resolution.status === "ambiguous") throw new Held(resolution.ambiguity);
+    const { workstream } = resolution;
     const sourceId = `src_${digest(`source\u0000${key}`).slice(0, 32)}`;
     prepared(db,
       "INSERT OR IGNORE INTO sessions (id, host, host_session_id, workstream_id, capabilities, started_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -516,7 +583,7 @@ export class TranscriptImporter {
       return status;
     }
     if (consent.choice === "none") return { ...status, state: "declined" };
-    if (!approves(consent, own.repositoryKey)) return { ...status, state: "not_approved" };
+    if (!approvesTarget(consent, own)) return { ...status, state: "not_approved" };
 
     const cursors = current.db === null ? new Map<string, CursorRow & { transcript_id: string }>() : readCursors(current.db, this.host);
     const progress = { transcripts: mine.length, complete: 0, pending: 0, stopped: 0, quarantined: 0, counters: emptyCounters() };
@@ -524,10 +591,16 @@ export class TranscriptImporter {
       progress.counters = mergeCounters(progress.counters, parseCounters(cursor.stats), false);
       if (cursor.gap !== null) status.gaps.push(JSON.parse(cursor.gap) as ImportGap);
     }
+    const held = (entry: Discovered): boolean => !cursors.has(entry.file.transcriptId) && this.held.has(entry.file.transcriptId);
+    const unreadable = (entry: Discovered): boolean => !cursors.has(entry.file.transcriptId) && this.unreadable.has(entry.file.transcriptId);
+    for (const entry of entries) {
+      const gap = held(entry) ? this.held.get(entry.file.transcriptId)?.gap : unreadable(entry) ? this.unreadable.get(entry.file.transcriptId) : undefined;
+      if (gap !== undefined) status.gaps.push(entry.target?.workspaceId === own.workspaceId ? gap : { ...gap, workspace: entry.target?.label ?? "" });
+    }
     for (const entry of mine) {
       const cursor = cursors.get(entry.file.transcriptId);
-      if (cursor?.state === "quarantined") progress.quarantined++;
-      else if (cursor?.state === "stopped") progress.stopped++;
+      if (cursor?.state === "quarantined" || held(entry)) progress.quarantined++;
+      else if (cursor?.state === "stopped" || unreadable(entry)) progress.stopped++;
       else if (cursor !== undefined && cursor.file_size === entry.file.size && cursor.file_mtime_ms === entry.file.mtimeMs) progress.complete++;
       else progress.pending++;
     }
@@ -543,6 +616,15 @@ export class TranscriptImporter {
     status.state = progress.pending > 0 || !status.backfill.reconciled ? "in_progress" : "complete";
     return status;
   }
+}
+
+function unsupportedGap(transcriptId: string, hostName: string, hostVersion: string): ImportGap {
+  return {
+    transcriptId,
+    reason: "unsupported_version",
+    hostVersion,
+    message: `${hostName} ${hostVersion} is not in Memchor's compatibility table; this transcript is imported up to that entry and will resume once a Memchor that supports it is installed.`,
+  };
 }
 
 function consentQuestion(host: string, counts: NonNullable<ImportStatus["transcripts"]>): string {
@@ -577,11 +659,47 @@ interface Batch {
   counters: ImportCounters;
   /** Tool calls seen in this batch, by call id (earlier batches are looked up in import_events). */
   calls: Map<string, CallMeta>;
+  /** Per branch: the records Memchor output earlier in this pass showed the agent (see {@link restatedEchoes}). */
+  echoed: Map<string, Map<string, string[]>>;
   locate: (cwd: string) => Target | null;
 }
 
 const RECORD_ID = /\brec_[0-9a-f]{32}\b/g;
-const WORKSTREAM_ID = /\bwst_[0-9a-f]{32}\b/g;
+const WORKSTREAM_ID = /^wst_[0-9a-f]{32}$/;
+const WORKSTREAM_FIELD = /"workstreamId":"(wst_[0-9a-f]{32})"/g;
+
+/**
+ * The workstreams a piece of Memchor output reports this session as bound to: its
+ * `scope.workstreamId`. Candidate ids listed in an ambiguity, or ids in an error, are not a
+ * binding. Output that is not intact JSON (clipped by the host) falls back to every
+ * `"workstreamId"` field in it, so a clipped ambiguity lists several ids and resolves as a
+ * conflict rather than as a binding.
+ */
+function workstreamsBoundIn(text: string): string[] {
+  try {
+    const id = (JSON.parse(text) as { scope?: { workstreamId?: unknown } } | null)?.scope?.workstreamId;
+    return typeof id === "string" && WORKSTREAM_ID.test(id) ? [id] : [];
+  } catch {
+    return [...new Set([...text.matchAll(WORKSTREAM_FIELD)].map((match) => match[1] ?? ""))];
+  }
+}
+
+/**
+ * Step-1 evidence for a transcript's first batch: the workstreams Memchor output reported as
+ * bound, before the transcript leaves its first worktree (later output belongs to wherever it
+ * went, and the move itself quarantines the transcript).
+ */
+function workstreamsNamedAtStart(events: readonly NormalizedEvent[]): string[] {
+  const calls = new Set<string>();
+  const named = new Set<string>();
+  const cwd = events[0]?.cwd;
+  for (const event of events) {
+    if (event.cwd !== cwd) break;
+    if (event.type === "tool_call" && event.toolKind === "memchor") calls.add(event.callId);
+    if (event.type === "tool_result" && calls.has(event.callId)) for (const id of workstreamsBoundIn(event.text)) named.add(id);
+  }
+  return [...named];
+}
 
 /** Applies events in order; returns where to quarantine the transcript, or null. */
 function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset: number; message: string; cwd?: string } | null {
@@ -614,6 +732,7 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
       touch.run(batch.epoch, batch.host, batch.transcriptId, event.branch, event.eventId, hash);
       batch.counters.replayed++;
       if (event.type === "tool_call") batch.calls.set(event.callId, parseCallMeta(same.meta));
+      if (same.disposition === "echo") rememberEcho(batch, event.branch, (JSON.parse(same.meta) as { references?: string[] }).references ?? []);
       continue;
     }
     const previous = versions.find((v) => v.record_id !== null)?.record_id ?? null;
@@ -635,7 +754,7 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
         // Memchor's own output: keep which existing records it mentioned, never the text.
         const mentioned = [...new Set(event.text.match(RECORD_ID) ?? [])];
         const existing = mentioned.length === 0 ? [] : (prepared(db, "SELECT id FROM records WHERE id IN (SELECT value FROM json_each(?))").all(JSON.stringify(mentioned)) as { id: string }[]).map((r) => r.id);
-        const workstreams = [...new Set(event.text.match(WORKSTREAM_ID) ?? [])];
+        const workstreams = workstreamsBoundIn(event.text);
         const foreign = workstreams.length === 0 ? [] : (prepared(db, "SELECT id FROM workstreams WHERE id IN (SELECT value FROM json_each(?)) AND id <> ?").all(JSON.stringify(workstreams), batch.workstreamId) as { id: string }[]);
         if (foreign.length > 0) {
           return { offset: event.lineStart, message: `Memchor output in this transcript names workstream ${foreign[0]?.id ?? ""}, but its worktree is bound to ${batch.workstreamId}; the transcript is quarantined from here instead of guessing.` };
@@ -643,6 +762,7 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
         batch.counters.echoes++;
         batch.counters.echoReferences += existing.length;
         store("echo", null, { callId: event.callId, tool: call.tool, references: existing });
+        rememberEcho(batch, event.branch, existing);
         continue;
       }
       const written = appendImported(batch, event, previous, toolResultRecord(batch, call, event));
@@ -652,7 +772,9 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
       continue;
     }
 
-    const written = appendImported(batch, event, previous, messageRecord(batch, event));
+    // What the agent writes (a message or a host summary it wrote) may repeat memory it was shown.
+    const derivedFrom = event.type === "message" && event.role === "user" ? [] : restatedEchoes(batch, event.branch, event.text);
+    const written = appendImported(batch, event, previous, messageRecord(batch, event), derivedFrom);
     store("record", written, previous === null ? {} : { versionOf: previous });
   }
   return null;
@@ -718,7 +840,7 @@ function passage(batch: Batch, text: string, maxBytes: number, count = true): st
   return bounded.text;
 }
 
-function appendImported(batch: Batch, event: NormalizedEvent, previous: string | null, draft: Draft): string {
+function appendImported(batch: Batch, event: NormalizedEvent, previous: string | null, draft: Draft, derivedFrom: readonly string[] = []): string {
   const written = appendRecord(batch.db, batch.workstreamId, {
     kind: draft.kind,
     title: draft.title,
@@ -730,12 +852,71 @@ function appendImported(batch: Batch, event: NormalizedEvent, previous: string |
     reviewState: "unreviewed",
     applicability: { sourceVersion: `${batch.host} ${event.hostVersion}` },
     externalRefs: draft.externalRefs,
-    links: previous === null ? [] : [{ recordId: previous, relation: "related_to" }],
+    links: [...(previous === null ? [] : [{ recordId: previous, relation: "related_to" as const }]), ...derivedFrom.map((recordId) => ({ recordId, relation: "derived_from" as const }))],
     sourceId: batch.sourceId,
     createdAt: event.observedAt,
   });
   batch.counters.records++;
   return written.recordId;
+}
+
+/**
+ * Shortest normalised text that counts as a restatement of echoed memory. A shorter sentence
+ * ("Tests pass.", "Done.") recurs by itself, so containing it says nothing about copying.
+ */
+const MIN_RESTATED_CHARS = 40;
+
+function normalizeForEcho(text: string): string {
+  return text.toLowerCase().replace(/\s+/gu, " ").trim();
+}
+
+/** The texts whose verbatim appearance marks a copy of a record: its whole body and each long-enough sentence. */
+function restatable(body: string): string[] {
+  const pieces = [body, ...body.split(/\n+|(?<=[.!?])\s+/u)].map(normalizeForEcho).filter((piece) => piece.length >= MIN_RESTATED_CHARS);
+  return [...new Set(pieces)];
+}
+
+/**
+ * The records shown to the agent on `branch` earlier in this reconciliation pass, loaded once
+ * per batch from the echo rows this pass has written or replayed (`seen_epoch` = this epoch,
+ * so in a rewrite pass nothing later in the file is included), and kept current as echoes
+ * go by. Only records the transcript's workstream can see are kept: they are link targets.
+ */
+function echoesOn(batch: Batch, branch: string): Map<string, string[]> {
+  let echoed = batch.echoed.get(branch);
+  if (echoed !== undefined) return echoed;
+  echoed = new Map();
+  batch.echoed.set(branch, echoed);
+  const rows = prepared(batch.db, "SELECT meta FROM import_events WHERE host = ? AND transcript_id = ? AND branch = ? AND disposition = 'echo' AND seen_epoch = ?")
+    .all(batch.host, batch.transcriptId, branch, batch.epoch) as { meta: string }[];
+  rememberEcho(batch, branch, rows.flatMap((row) => (JSON.parse(row.meta) as { references?: string[] }).references ?? []));
+  return echoed;
+}
+
+function rememberEcho(batch: Batch, branch: string, recordIds: readonly string[]): void {
+  const echoed = echoesOn(batch, branch);
+  const fresh = [...new Set(recordIds)].filter((id) => !echoed.has(id));
+  if (fresh.length === 0) return;
+  const rows = prepared(batch.db, `SELECT r.id, r.body FROM records r WHERE r.id IN (SELECT value FROM json_each($ids)) AND ${VISIBLE_SQL}`)
+    .all({ ids: JSON.stringify(fresh), workstreamId: batch.workstreamId }) as { id: string; body: string }[];
+  for (const row of rows) echoed.set(row.id, restatable(row.body));
+}
+
+/**
+ * Records Memchor showed the agent earlier on this branch whose body, or one of whose
+ * sentences of at least {@link MIN_RESTATED_CHARS} characters, `text` contains verbatim
+ * (case and whitespace ignored). Such a text is a copy of that memory, so its record is
+ * stored `derived_from` it and inherits its independent root: echoed memory must never come
+ * back as independent corroboration (PRD §8.3, §17). The window is the rest of the branch,
+ * not the turn: the echo stays in the agent's context (and in compaction summaries) after the
+ * user speaks again. Only verbatim containment counts: a paraphrase cannot be told apart from
+ * a new observation, so it remains its own root.
+ */
+function restatedEchoes(batch: Batch, branch: string, text: string): string[] {
+  const echoed = echoesOn(batch, branch);
+  if (echoed.size === 0) return [];
+  const said = normalizeForEcho(text);
+  return [...echoed].filter(([, pieces]) => pieces.some((piece) => said.includes(piece))).map(([id]) => id);
 }
 
 function lookupCall(batch: Batch, callId: string): CallMeta | null {
