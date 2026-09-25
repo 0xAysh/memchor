@@ -25,6 +25,29 @@ describe("MCP protocol surface", () => {
     expect(server.client.getInstructions()).toMatch(/memory_bootstrap first/);
   });
 
+  test("the instructions fit Claude Code's 2048-character limit and keep every rule", async () => {
+    const server = await spawnServer({ cwd: initRepo(), home: tempDir() });
+    const instructions = server.client.getInstructions() ?? "";
+    // Claude Code truncates server instructions beyond 2048 characters, dropping whatever comes last.
+    expect(instructions.length).toBeLessThanOrEqual(2048);
+    for (const rule of [
+      /memory_bootstrap first/,
+      /scope\.ambiguity/,
+      /import\.question/,
+      /historical observations/i,
+      /stale.*unknown.*read the current file/is,
+      /independentRoots/,
+      /attribution/,
+      /never re-record/i,
+      /memory_checkpoint.*expectedRevision/s,
+      /checkpoint_conflict.*never overwrite/is,
+      /honest miss/i,
+    ]) {
+      expect(instructions).toMatch(rule);
+    }
+    await server.close();
+  });
+
   test("a payload carrying workspaceId or cwd is an invalid_input envelope", async () => {
     const server = await spawnServer({ cwd: initRepo(), home: tempDir() });
     await server.ok("memory_bootstrap");
