@@ -20,6 +20,7 @@ import {
   changeClaim,
   confirmationTargets,
   confirmForget,
+  forgetSession,
   type ForgetImpact,
   type ForgetTarget,
   openWorkspaceDatabase,
@@ -28,6 +29,7 @@ import {
   type RestoreResult,
 } from "./integrity/lifecycle.js";
 import { changesSince, type CorrectionNotice, type HistoryEntry, inspectRecord, lifecycleWatermark, type Related } from "./integrity/lifecycle-views.js";
+import { sessionIsPrivate } from "./integrity/private-session.js";
 import {
   ensureGlobalSession,
   locatePreference,
@@ -419,7 +421,19 @@ export type ManageResult =
   | { v: 1; action: "forget"; forgotten: string[]; affected: Affected; watermark: number; replayed: boolean }
   /** An agent-inferred change or removal of a preference: a question for the user, nothing applied. */
   | { v: 1; action: "proposal"; preference: PreferenceQuestion; replayed: false }
-  | { v: 1; action: "answer_preference"; preference: PreferenceQuestion };
+  | { v: 1; action: "answer_preference"; preference: PreferenceQuestion }
+  | {
+      v: 1;
+      action: "private_session";
+      sessionId: string;
+      /** It was already private; nothing more was done. */
+      alreadyPrivate: boolean;
+      /** What was forgotten: records this session wrote, and what was imported from its transcripts. */
+      forgotten: string[];
+      /** Transcripts of this session that will never be imported. */
+      transcripts: number;
+      notice: string;
+    };
 
 export interface StatusScope {
   workspaceId: string;
@@ -564,6 +578,8 @@ const OPERATIONS = Object.keys(OPERATION_SCHEMAS);
 /** A result before `idempotent` adds `replayed` (distributes over union members). */
 type Unreplayed<T> = T extends unknown ? Omit<T, "replayed"> : never;
 const INSPECT_BODY_BYTES = 4_096;
+const PRIVATE_NOTICE =
+  "This session will not be remembered: what it stored was forgotten, its transcript will not be imported, and Memchor refuses its writes. Tell the user so in one line. Its content may still be in the host's own transcript files.";
 const FORGET_NOTICE =
   "Nothing has been removed yet. Show the user the targets and the impact, and ask them to confirm explicitly; only then call memory_manage with action forget and this confirmToken. Forgetting cannot be undone. Records listed as invalidated or quarantined keep their own content (forget them too if the user wants). Host transcripts, loaded model contexts, exports and backups are not erased.";
 const DEFAULT_IMPORT_BUDGET_MS = 3_000;
@@ -635,6 +651,7 @@ class LocalMemory implements Memory {
     return this.guard((): RecordResult | PreferenceRecordResult => {
       const parsed = parse(RecordInput, input);
       const { db, scope } = this.bind();
+      this.refuseIfPrivate(db, scope);
       if (parsed.kind === "preference") {
         // A preference applies only once the user confirms it and says where (PRD §5.6).
         return { recordId: null, kind: "preference", preference: proposePreference(this.preferenceStores(db, scope), parsed.body, this.declinedPreferences), replayed: false };
@@ -681,6 +698,7 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(CheckpointInput, input);
       const { db, scope } = this.bind();
+      this.refuseIfPrivate(db, scope);
       requireWorkstream(scope, "memory_checkpoint");
       const applicability = withHeadCommit({}, scope.worktree);
       const externalRefs = captureObservations(scope.worktree, parsed.externalRefs);
@@ -761,6 +779,7 @@ class LocalMemory implements Memory {
   settlePreference(input: { candidateId: string; outcome: Settlement }): PreferenceQuestion {
     return this.guard(() => {
       const { db, scope } = this.bind();
+      this.refuseIfPrivate(db, scope);
       return settleCandidate(this.preferenceStores(db, scope), input.candidateId, input.outcome, "user", this.declinedPreferences);
     });
   }
@@ -771,6 +790,13 @@ class LocalMemory implements Memory {
       const { db, scope } = this.bind();
       const stores = this.preferenceStores(db, scope);
       // ManageInput's refinement guarantees each action's required fields; `given` restates that for the compiler.
+      if (parsed.action === "private_session") {
+        const session = { sessionId: scope.sessionId, host: scope.host, hostSessionId: this.hostSessionId, workstreamId: scope.workstreamId };
+        const actor = { sessionId: scope.sessionId, host: scope.host, attribution: "user_direction" as const, reason: "The user asked not to remember this session." };
+        const marked = writeTransaction(db, () => forgetSession(db, session, actor));
+        return { v: 1, action: "private_session", sessionId: scope.sessionId, ...marked, notice: PRIVATE_NOTICE };
+      }
+      if (parsed.action !== "inspect" && parsed.action !== "forget_preview") this.refuseIfPrivate(db, scope);
       if (parsed.action === "answer_preference") {
         const preference = settleCandidate(stores, given(parsed.candidateId), { answer: given(parsed.answer) }, "agent_reported", this.declinedPreferences);
         return { v: 1, action: "answer_preference", preference };
@@ -786,7 +812,7 @@ class LocalMemory implements Memory {
   private manageIn(target: { db: Db; scope: "global" | "repo" }, scope: BoundScope, parsed: z.output<typeof ManageInput>, stores: PreferenceStores): ManageResult {
     const { db } = target;
     const action = parsed.action;
-    if (action === "answer_preference") throw new Error("answer_preference is handled by manage");
+    if (action === "answer_preference" || action === "private_session") throw new Error(`${action} is handled by manage`);
     if (action === "inspect") return this.inspect(db, scope, given(parsed.recordId));
     const key = { secret: scope.continuationSecret, workspaceId: scope.workspaceId, workstreamId: scope.workstreamId };
     if (action === "forget_preview") {
@@ -801,7 +827,7 @@ class LocalMemory implements Memory {
     }
     const applicability = target.scope === "global" ? {} : withHeadCommit({}, scope.worktree);
     const own = { onlyChange: false };
-    const result = this.idempotent(db, scope, "manage", parsed, (): Unreplayed<Exclude<ManageResult, { action: "inspect" | "forget_preview" | "proposal" | "answer_preference" }>> => {
+    const result = this.idempotent(db, scope, "manage", parsed, (): Unreplayed<Exclude<ManageResult, { action: "inspect" | "forget_preview" | "proposal" | "answer_preference" | "private_session" }>> => {
       // Nothing in this scope changed since this session last heard: the change is news only to others.
       own.onlyChange = target.scope === "repo" && changesSince(db, scope.workstreamId, this.seenLifecycle) === null;
       if (target.scope === "global") ensureGlobalSession(db, stores.actor);
@@ -823,6 +849,14 @@ class LocalMemory implements Memory {
     });
     if (!result.replayed && own.onlyChange) this.seenLifecycle = result.watermark;
     return result;
+  }
+
+  /** A session the user asked not to remember writes nothing (it may still read). */
+  private refuseIfPrivate(db: Db, scope: BoundScope): void {
+    if (!sessionIsPrivate(db, { sessionId: scope.sessionId, host: scope.host, hostSessionId: this.hostSessionId })) return;
+    throw new MemchorError("session_private", "The user asked Memchor not to remember this session, so it stores nothing. Reads still work.", {
+      details: { sessionId: scope.sessionId },
+    });
   }
 
   /** The stores preference operations read and write for this session. */

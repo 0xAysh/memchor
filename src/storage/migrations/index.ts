@@ -5,7 +5,7 @@ import * as transcriptImport from "./0002-transcript-import.js";
 import * as importSourceFingerprint from "./0003-import-source-fingerprint.js";
 import * as scopeResolution from "./0004-scope-resolution.js";
 import * as lifecycle from "./0005-lifecycle.js";
-import * as preferences from "./0006-preferences.js";
+import * as preferences from "./0006-preferences-private-sessions.js";
 
 /**
  * Ordered schema migrations. Entry `i` upgrades `PRAGMA user_version` from `i` to `i + 1`.

@@ -10,6 +10,10 @@
  *   was asked directly and dismissed it).
  * - `sessions.private`: "don't remember this session". Its writes are refused, and transcripts
  *   that belong to it are never imported.
+ * - `transcript_sessions`: which Memchor sessions a transcript's Memchor output names, so that
+ *   marking a session private can find its transcript (Claude Code sends no session id).
+ * - `private_transcripts`: transcripts that are never imported again. No foreign keys: markers
+ *   outlive what they name, and a restored older database gets them back from the ledger.
  */
 export const sql = /* sql */ `
 CREATE TABLE preference_candidates (
@@ -28,4 +32,20 @@ CREATE TABLE preference_candidates (
 ) STRICT;
 
 ALTER TABLE sessions ADD COLUMN private INTEGER NOT NULL DEFAULT 0 CHECK (private IN (0, 1));
+
+CREATE TABLE transcript_sessions (
+  host          TEXT NOT NULL,
+  transcript_id TEXT NOT NULL,
+  session_id    TEXT NOT NULL,
+  PRIMARY KEY (host, transcript_id, session_id)
+) STRICT;
+CREATE INDEX transcript_sessions_session ON transcript_sessions (session_id);
+
+CREATE TABLE private_transcripts (
+  host          TEXT NOT NULL,
+  transcript_id TEXT NOT NULL,
+  session_id    TEXT,
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (host, transcript_id)
+) STRICT;
 `;

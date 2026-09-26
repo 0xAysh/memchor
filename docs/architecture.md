@@ -93,6 +93,7 @@ The agent shows `question`, then calls `bootstrap({workstream})`. That choice be
 | `chunks`, `chunks_fts` | **Derived** search projection | A pure function of `records`; rebuildable |
 | `sources` | One row per imported transcript | `records.source_id` points here |
 | `preference_candidates` (v6) | Preference questions the user has not answered | Never records: nothing here is recalled, read or injected |
+| `transcript_sessions`, `private_transcripts` (v6) | Which sessions a transcript's Memchor output named; transcripts never imported again | No foreign keys: markers outlive what they name |
 | `import_cursors` (v2) | Per-transcript reconciliation position | Advances only in the transaction that stores the batch's records; `anchor_hash` detects rewrites |
 | `import_events` (v2) | Event identity → record | PK = host + transcript + branch + event id + content hash, so replay is a no-op and an edit is a new version |
 | `consents` | Reserved | The import decision is host-level, so it lives in `$MEMCHOR_HOME/consent.json`, not in a workspace |
@@ -304,6 +305,22 @@ Decline is not "no": headless hosts answer questions on their own. Observed on t
 
 Known limits: lifecycle changes to global preferences are not reported through the `corrections` watermark (a session sees them at its next start); a paraphrase of an active preference is proposed again (text is compared case- and whitespace-insensitively only).
 
+## Private sessions
+
+"Don't remember this session" is `memory_manage private_session`. One transaction (`forgetSession` in `lifecycle.ts`; markers in `private-session.ts`):
+
+```text
+transcripts of the session   Codex: the thread id (host session id) · Claude Code: transcripts whose Memchor output
+                             named it as scope.sessionId (transcript_sessions, recorded at import)
+forget (no preview; the request is its own confirmation)   records the session wrote + records imported from those transcripts
+mark                         sessions.private = 1 · private_transcripts += those transcripts
+ledger                       forget entries + a private_session entry (a restored older copy is marked again)
+```
+
+Afterwards `record`, `checkpoint`, `settlePreference` and every changing `memory_manage` action throw `session_private` (reads still work). A later Memchor session of the same host session (a resumed Codex thread) is private too. The importer never reads a private transcript again, and a batch whose Memchor output names a private session as its scope drops what that transcript brought in and marks it private. Only `scope.sessionId` links (in every result it directly follows `headRevision`): recalled items name their writer's session, and recalling a private session's records does not make a transcript that session's. Marking twice does nothing more.
+
+Known limits: the host's own transcript file is untouched; a Claude Code transcript is recognized only once Memchor output appears in it (before the session's first Memchor call there is none), and a resumed Claude Code session gets a new Memchor session that starts non-private (its transcript, if it is the same file, stays private).
+
 ## Handoff
 
 The V1 story (Claude Code → a fresh Codex session → a fresh Claude Code session in one worktree) needs no handoff-specific code: each host runs its own `memchor mcp` process, and they meet only in `$MEMCHOR_HOME` through the pieces above.
@@ -344,6 +361,7 @@ At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix f
 | `lifecycle_conflict` | `memory_manage` found the claim in the wrong state (already corrected, or restoring what was not retracted here); `details.lifecycle` / `replacementId`. Also an agent relaying an answer to a preference question the user dismissed (`details.relay: refused`) |
 | `invalid_input` | Schema violation, unknown key, oversized content, or a bad continuation |
 | `idempotency_conflict` | The operation key was reused with a different request |
+| `session_private` | The user asked not to remember this session: its writes are refused |
 | `checkpoint_conflict` | The head ≠ `expectedRevision`; `details.currentRevision` gives the head |
 | `storage_busy` | The busy timeout was exceeded (`retryable: true`) |
 | `storage_full` | The disk or database is full; nothing was acknowledged |
@@ -355,7 +373,7 @@ At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix f
 `src/storage/migrations/` holds an append-only ordered list, and `PRAGMA user_version` is the applied count:
 
 - Each step runs in its own `BEGIN IMMEDIATE` transaction together with the version bump, so a failed step leaves the previous version intact.
-- Steps run with foreign keys off, as SQLite's documented table-rebuild procedure requires. v4 rebuilds `sessions` to make `workstream_id` nullable. v5 adds `records.lifecycle` and the `taints`, `lifecycle_events` and `suppressions` tables. v6 adds `preference_candidates` and `sessions.private`. Each step runs `foreign_key_check` before committing, and rolls back on any violation.
+- Steps run with foreign keys off, as SQLite's documented table-rebuild procedure requires. v4 rebuilds `sessions` to make `workstream_id` nullable. v5 adds `records.lifecycle` and the `taints`, `lifecycle_events` and `suppressions` tables. v6 adds `preference_candidates`, `sessions.private`, `transcript_sessions` and `private_transcripts`. Each step runs `foreign_key_check` before committing, and rolls back on any violation.
 - Concurrent openers serialise, and the second finds nothing to do.
 - A database newer than the build fails closed before any pragma changes it.
 - A shipped migration is never edited.
