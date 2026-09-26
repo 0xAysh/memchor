@@ -4,11 +4,12 @@ import { relative, sep } from "node:path";
 import { ensureWorkspace, resolveWorkstream, type ScopeAmbiguity } from "../bootstrap/workstream-resolution.js";
 import { locateWorkspace, registerWorkspace, type WorkspaceLocation } from "../bootstrap/workspace-resolution.js";
 import { type ErrorCode, MemchorError } from "../errors.js";
+import { forgetTranscript, openWorkspaceDatabase } from "../integrity/lifecycle.js";
+import { isPrivateTranscript, linkTranscriptSessions } from "../integrity/private-session.js";
 import { quarantineLateSummary, suppressedEvent } from "../integrity/taints.js";
 import { restatable, restates } from "../integrity/restatement.js";
 import { IN_SCOPE_SQL } from "../retrieval/eligibility.js";
 import { type ExternalRef, IMPORT_CHOICES, type ImportChoice } from "../schemas.js";
-import { openWorkspaceDatabase } from "../integrity/lifecycle.js";
 import { type Db, prepared, toStorageError, writeTransaction } from "../storage/database.js";
 import { appendRecord } from "../storage/records.js";
 import { approves, type Consent, readConsent, writeConsent } from "./consent.js";
@@ -360,6 +361,8 @@ export class TranscriptImporter {
 
   private importTranscript(db: Db, entry: Discovered & { target: Target }, deadline: number): "done" | "deadline" | "contended" {
     const { file } = entry;
+    // A transcript of a session the user asked not to remember is never read again.
+    if (isPrivateTranscript(db, this.host, file.transcriptId)) return "done";
     const cursor = readCursor(db, this.host, file.transcriptId);
     if (cursor?.state === "quarantined") return "done";
     const held = this.held.get(file.transcriptId);
@@ -433,7 +436,18 @@ export class TranscriptImporter {
             echoed: new Map(),
             locate: (cwd) => this.locations.get(cwd) ?? null,
           };
-          const quarantine = applyEvents(batch, chunk.events);
+          const applied = applyEvents(batch, chunk.events);
+          if (applied !== null && "privateSessionId" in applied) {
+            // Memchor output in this transcript names a session the user asked not to remember:
+            // drop what this transcript brought in, and never read it again.
+            forgetTranscript(db, { host: this.host, transcriptId: file.transcriptId, privateSessionId: applied.privateSessionId, workstreamId: batch.workstreamId }, {
+              sessionId: batch.sessionId,
+              host: this.host,
+              attribution: "user_direction",
+              reason: "The transcript belongs to a session the user asked not to remember.",
+            });
+          }
+          const quarantine = applied !== null && "offset" in applied ? applied : null;
 
           let state: CursorRow["state"] = "active";
           let gap: ImportGap | null = null;
@@ -706,8 +720,8 @@ function workstreamsNamedAtStart(events: readonly NormalizedEvent[]): string[] {
   return [...named];
 }
 
-/** Applies events in order; returns where to quarantine the transcript, or null. */
-function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset: number; message: string; cwd?: string } | null {
+/** Applies events in order; returns where to quarantine the transcript, that it belongs to a private session, or null. */
+function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset: number; message: string; cwd?: string } | { privateSessionId: string } | null {
   const { db } = batch;
   const findVersions = prepared(db,
     "SELECT content_hash, record_id, disposition, meta FROM import_events WHERE host = ? AND transcript_id = ? AND branch = ? AND event_id = ?",
@@ -766,6 +780,8 @@ function applyEvents(batch: Batch, events: readonly NormalizedEvent[]): { offset
         // Memchor's own output: keep which existing records it mentioned, never the text.
         const mentioned = [...new Set(event.text.match(RECORD_ID) ?? [])];
         const existing = mentioned.length === 0 ? [] : (prepared(db, "SELECT id FROM records WHERE id IN (SELECT value FROM json_each(?))").all(JSON.stringify(mentioned)) as { id: string }[]).map((r) => r.id);
+        const named = linkTranscriptSessions(db, batch.host, batch.transcriptId, event.text);
+        if (named.privateSessionId !== null) return { privateSessionId: named.privateSessionId };
         const workstreams = workstreamsBoundIn(event.text);
         const foreign = workstreams.length === 0 ? [] : (prepared(db, "SELECT id FROM workstreams WHERE id IN (SELECT value FROM json_each(?)) AND id <> ?").all(JSON.stringify(workstreams), batch.workstreamId) as { id: string }[]);
         if (foreign.length > 0) {

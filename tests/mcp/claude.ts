@@ -16,7 +16,7 @@ import { CLI, NO_NETWORK } from "./harness.js";
  */
 
 /** The Claude Code release these tests pin (native install, 2026-09). */
-export const CLAUDE_PINNED_VERSION = "2.1.282";
+export const CLAUDE_PINNED_VERSION = "2.1.283";
 export const CLAUDE_BIN = process.env["MEMCHOR_TEST_CLAUDE_BIN"] ?? onPath("claude") ?? join(homedir(), ".local/bin/claude");
 
 function onPath(name: string): string | undefined {

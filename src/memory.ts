@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { ZodError, type z } from "zod";
 import {
   bindScope,
@@ -16,7 +18,9 @@ import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integ
 import {
   type Affected,
   changeClaim,
+  confirmationTargets,
   confirmForget,
+  forgetSession,
   type ForgetImpact,
   type ForgetTarget,
   openWorkspaceDatabase,
@@ -25,6 +29,22 @@ import {
   type RestoreResult,
 } from "./integrity/lifecycle.js";
 import { changesSince, type CorrectionNotice, type HistoryEntry, inspectRecord, lifecycleWatermark, type Related } from "./integrity/lifecycle-views.js";
+import { sessionIsPrivate } from "./integrity/private-session.js";
+import {
+  ensureGlobalSession,
+  locatePreference,
+  preferenceBlock,
+  type PreferenceBlock,
+  type PreferenceQuestion,
+  type PreferenceStores,
+  dropSessionCandidates,
+  type HostReply,
+  inferredChange,
+  proposePreference,
+  reaskAtSessionStart,
+  type PreferenceScope,
+  settleCandidate,
+} from "./integrity/preferences.js";
 import { hostDescriptor } from "./hosts.js";
 import type { TranscriptAdapter } from "./import/normalized-event.js";
 import { type ImportStatus, TranscriptImporter, unsupportedHostStatus } from "./import/reconcile.js";
@@ -99,6 +119,7 @@ export type { CandidateSignal, ResolutionBasis, ScopeAmbiguity, WorkstreamCandid
 export type { CheckpointSummary } from "./integrity/checkpoints.js";
 export type { Affected, ForgetImpact, ForgetTarget } from "./integrity/lifecycle.js";
 export type { CorrectionNotice, HistoryEntry, LifecycleChange, Related } from "./integrity/lifecycle-views.js";
+export type { ActivePreference, HostReply, PreferenceAnswer, PreferenceBlock, PreferenceQuestion, PreferenceScope } from "./integrity/preferences.js";
 export type { Lifecycle, Taint } from "./retrieval/eligibility.js";
 
 // ───────────────────────────── Public interface ─────────────────────────────
@@ -270,6 +291,19 @@ export interface BootstrapResult {
   import: ImportStatus;
   /** Same as `recall({ maxTokens, maxBytes })` after this bootstrap's import: head checkpoint plus the most recent eligible records. */
   context: ContextPack;
+  /**
+   * The user's confirmed preferences (this repository's, then global ones; ≤ 4 KB, `omitted`
+   * counts the rest), and unanswered preference questions from earlier sessions, asked once more.
+   */
+  preferences: PreferenceBlock;
+}
+
+/** What `record` returns for `kind: "preference"`: a question for the user, not a stored record. */
+export interface PreferenceRecordResult {
+  recordId: null;
+  kind: "preference";
+  preference: PreferenceQuestion;
+  replayed: false;
 }
 
 export interface RecordResult {
@@ -386,7 +420,22 @@ export type ManageResult =
       expiresAt: string;
       notice: string;
     }
-  | { v: 1; action: "forget"; forgotten: string[]; affected: Affected; watermark: number; replayed: boolean };
+  | { v: 1; action: "forget"; forgotten: string[]; affected: Affected; watermark: number; replayed: boolean }
+  /** An agent-inferred change or removal of a preference: a question for the user, nothing applied. */
+  | { v: 1; action: "proposal"; preference: PreferenceQuestion; replayed: false }
+  | { v: 1; action: "answer_preference"; preference: PreferenceQuestion }
+  | {
+      v: 1;
+      action: "private_session";
+      sessionId: string;
+      /** It was already private; nothing more was done. */
+      alreadyPrivate: boolean;
+      /** What was forgotten: records this session wrote, and what was imported from its transcripts. */
+      forgotten: string[];
+      /** Transcripts of this session that will never be imported. */
+      transcripts: number;
+      notice: string;
+    };
 
 export interface StatusScope {
   workspaceId: string;
@@ -420,6 +469,8 @@ export interface StatusResult {
     schemaVersion: number | null;
     supportedSchemaVersion: number;
     journalMode: string | null;
+    /** Preferences the user confirmed for every repository (created on first use). */
+    globalDbPath: string;
   };
   /** What bootstrap (without `task` or `workstream`) would resolve, by the same rules, without binding anything. */
   scope: StatusScope | null;
@@ -469,8 +520,19 @@ export interface Memory {
    * alive; `done` is true once nothing approved remains. Each batch is one transaction.
    */
   continueImport(input?: ContinueImportInput): ImportStatus & { done: boolean };
-  /** Appends one attributed record with provenance links and external references. */
-  record(input: RecordInput): RecordResult;
+  /**
+   * Appends one attributed record with provenance links and external references. A
+   * `preference` is not stored: it becomes a question for the user (see `settlePreference`).
+   */
+  record(input: RecordInput & { kind: "preference" }): PreferenceRecordResult;
+  record(input: RecordInput & { kind: Exclude<RecordInput["kind"], "preference"> }): RecordResult;
+  record(input: RecordInput): RecordResult | PreferenceRecordResult;
+  /**
+   * Records what a host did with a preference question it put to the user directly (`asking`
+   * before it is shown, then the reply); the memory module decides what the reply means.
+   * Transports call it; it is not an agent tool (agents relay answers through `memory_manage`).
+   */
+  settlePreference(input: { candidateId: string; reply: HostReply }): PreferenceQuestion;
   /** Publishes the next checkpoint revision iff the head is still `expectedRevision`. */
   checkpoint(input: CheckpointInput): CheckpointResult;
   /** Returns a bounded, cited context pack: head checkpoint first, then ranked eligible records. */
@@ -517,6 +579,8 @@ const OPERATIONS = Object.keys(OPERATION_SCHEMAS);
 /** A result before `idempotent` adds `replayed` (distributes over union members). */
 type Unreplayed<T> = T extends unknown ? Omit<T, "replayed"> : never;
 const INSPECT_BODY_BYTES = 4_096;
+const PRIVATE_NOTICE =
+  "This session will not be remembered: what it stored was forgotten, its transcript will not be imported, and Memchor refuses its writes. Tell the user so in one line. Its content may still be in the host's own transcript files.";
 const FORGET_NOTICE =
   "Nothing has been removed yet. Show the user the targets and the impact, and ask them to confirm explicitly; only then call memory_manage with action forget and this confirmToken. Forgetting cannot be undone. Records listed as invalidated or quarantined keep their own content (forget them too if the user wants). Host transcripts, loaded model contexts, exports and backups are not erased.";
 const DEFAULT_IMPORT_BUDGET_MS = 3_000;
@@ -537,6 +601,9 @@ class LocalMemory implements Memory {
   private closed = false;
   /** The newest lifecycle change this session has been told about (the correction watermark). */
   private seenLifecycle = 0;
+  /** Preferences the user said no to in this session: not asked again while it lasts. */
+  private readonly declinedPreferences = new Set<string>();
+  private globalDb: Db | undefined;
   /** Null for hosts without a transcript adapter. */
   private readonly importer: TranscriptImporter | null;
 
@@ -565,7 +632,10 @@ class LocalMemory implements Memory {
       const { db, scope, location } = this.bind({ task: parsed.task, workstream: parsed.workstream });
       const runtime = probeRuntime();
       const imported = this.importer === null ? unsupportedHostStatus(this.host) : this.importer.bootstrap({ location, db }, parsed.importChoice);
+      const stores = this.preferenceStores(db, scope);
+      const preferences = preferenceBlock(stores, reaskAtSessionStart(stores));
       return {
+        preferences,
         scope: scopeView(db, scope),
         created: { workspace: location.isNew, workstream: scope.createdWorkstream },
         runtime: { sqliteVersion: runtime.sqliteVersion, fts5: runtime.fts5, schemaVersion: SCHEMA_VERSION },
@@ -575,10 +645,18 @@ class LocalMemory implements Memory {
     });
   }
 
-  record(input: RecordInput): RecordResult {
-    return this.guard(() => {
+  record(input: RecordInput & { kind: "preference" }): PreferenceRecordResult;
+  record(input: RecordInput & { kind: Exclude<RecordInput["kind"], "preference"> }): RecordResult;
+  record(input: RecordInput): RecordResult | PreferenceRecordResult;
+  record(input: RecordInput): RecordResult | PreferenceRecordResult {
+    return this.guard((): RecordResult | PreferenceRecordResult => {
       const parsed = parse(RecordInput, input);
       const { db, scope } = this.bind();
+      this.refuseIfPrivate(db, scope);
+      if (parsed.kind === "preference") {
+        // A preference applies only once the user confirms it and says where (PRD §5.6).
+        return { recordId: null, kind: "preference", preference: proposePreference(this.preferenceStores(db, scope), parsed.body, this.declinedPreferences), replayed: false };
+      }
       if (!parsed.workspaceLevel) requireWorkstream(scope, "memory_record");
       const applicability = withHeadCommit(parsed.applicability, scope.worktree);
       // Observed outside the write transaction (Git and file reads must not hold the lock),
@@ -589,7 +667,7 @@ class LocalMemory implements Memory {
         ...parsed.supportedBy.map((recordId) => ({ recordId, relation: "supported_by" as const })),
         ...parsed.links.map((link) => ({ recordId: link.to, relation: link.relation })),
       ];
-      return this.idempotent(db, scope, "record", parsed, (): Omit<RecordResult, "replayed"> => {
+      return this.idempotent(db, scope, "record", parsed, scope.workstreamId, (): Omit<RecordResult, "replayed"> => {
         const written = appendRecord(db, scope.workstreamId, {
           kind: parsed.kind,
           title: parsed.title ?? null,
@@ -621,12 +699,13 @@ class LocalMemory implements Memory {
     return this.guard(() => {
       const parsed = parse(CheckpointInput, input);
       const { db, scope } = this.bind();
+      this.refuseIfPrivate(db, scope);
       requireWorkstream(scope, "memory_checkpoint");
       const applicability = withHeadCommit({}, scope.worktree);
       const externalRefs = captureObservations(scope.worktree, parsed.externalRefs);
       // Replay is checked before the revision compare, so retrying a checkpoint that
       // already succeeded returns its result instead of a spurious conflict.
-      return this.idempotent(db, scope, "checkpoint", parsed, () =>
+      return this.idempotent(db, scope, "checkpoint", parsed, scope.workstreamId, () =>
         publishCheckpoint(db, scope, parsed.expectedRevision, { ...parsed, externalRefs }, applicability),
       );
     });
@@ -698,44 +777,114 @@ class LocalMemory implements Memory {
     });
   }
 
+  settlePreference(input: { candidateId: string; reply: HostReply }): PreferenceQuestion {
+    return this.guard(() => {
+      const { db, scope } = this.bind();
+      this.refuseIfPrivate(db, scope);
+      return settleCandidate(this.preferenceStores(db, scope), input.candidateId, input.reply, this.declinedPreferences);
+    });
+  }
+
   manage(input: ManageInput): ManageResult {
     return this.guard(() => {
       const parsed = parse(ManageInput, input);
       const { db, scope } = this.bind();
+      const stores = this.preferenceStores(db, scope);
       // ManageInput's refinement guarantees each action's required fields; `given` restates that for the compiler.
-      const action = parsed.action;
-      if (action === "inspect") return this.inspect(db, scope, given(parsed.recordId));
-      const key = { secret: scope.continuationSecret, workspaceId: scope.workspaceId, workstreamId: scope.workstreamId };
-      if (action === "forget_preview") {
-        const recordIds = given(parsed.recordIds);
-        const preview = db.transaction(() => previewForget(db, scope, key, recordIds))();
-        return { v: 1, action, ...preview, notice: FORGET_NOTICE };
+      if (parsed.action === "private_session") {
+        const session = { sessionId: scope.sessionId, host: scope.host, hostSessionId: this.hostSessionId, workstreamId: scope.workstreamId };
+        const actor = { sessionId: scope.sessionId, host: scope.host, attribution: "user_direction" as const, reason: "The user asked not to remember this session." };
+        // Everything the session stored: memory and the questions it raised here, and any global preference it confirmed.
+        const marked = writeTransaction(db, () => {
+          const result = forgetSession(db, session, actor);
+          dropSessionCandidates(db, scope.sessionId);
+          return result;
+        });
+        const global = existsSync(this.globalDbPath()) ? stores.global() : null;
+        const globally = global === null ? [] : writeTransaction(global, () => forgetSession(global, { ...session, hostSessionId: undefined }, actor)).forgotten;
+        return { v: 1, action: "private_session", sessionId: scope.sessionId, ...marked, forgotten: [...marked.forgotten, ...globally], notice: PRIVATE_NOTICE };
       }
-      const actor = { sessionId: scope.sessionId, host: scope.host, attribution: given(parsed.attribution), reason: given(parsed.reason) };
-      const applicability = withHeadCommit({}, scope.worktree);
-      const own = { onlyChange: false };
-      const result = this.idempotent(db, scope, "manage", parsed, (): Unreplayed<Exclude<ManageResult, { action: "inspect" | "forget_preview" }>> => {
-        // Nothing in this scope changed since this session last heard: the change is news only to others.
-        own.onlyChange = changesSince(db, scope.workstreamId, this.seenLifecycle) === null;
-        switch (action) {
-          case "restore":
-            return { v: 1, action, ...restoreClaim(db, scope, { recordId: given(parsed.recordId), actor }) };
-          case "forget":
-            return { v: 1, action, ...confirmForget(db, scope, key, { confirmToken: given(parsed.confirmToken), actor }) };
-          case "retract": {
-            const changed = changeClaim(db, scope, { action, recordId: given(parsed.recordId), applicability, actor });
-            return { v: 1, action, recordId: changed.recordId, affected: changed.affected, watermark: changed.watermark };
-          }
-          case "correct":
-          case "supersede": {
-            const changed = changeClaim(db, scope, { action, recordId: given(parsed.recordId), body: given(parsed.body), applicability, actor });
-            return { v: 1, action, ...changed, replacementId: given(changed.replacementId) };
-          }
-        }
-      });
-      if (!result.replayed && own.onlyChange) this.seenLifecycle = result.watermark;
-      return result;
+      if (parsed.action !== "inspect" && parsed.action !== "forget_preview") this.refuseIfPrivate(db, scope);
+      if (parsed.action === "answer_preference") {
+        const preference = settleCandidate(stores, given(parsed.candidateId), { relayed: given(parsed.answer) }, this.declinedPreferences);
+        return { v: 1, action: "answer_preference", preference };
+      }
+      const action = parsed.action;
+      // Global preferences live in global.sqlite; every other record in this workspace's database.
+      const named = parsed.recordId ?? parsed.recordIds?.[0] ?? (parsed.confirmToken === undefined ? undefined : confirmationTargets(parsed.confirmToken)[0]);
+      const located = named === undefined ? null : locatePreference(stores, named, existsSync(this.globalDbPath()));
+      return this.manageIn(located ?? { db, scope: "repo" }, scope, { ...parsed, action }, stores);
     });
+  }
+
+  /** One lifecycle operation against the store that holds its record. */
+  private manageIn(
+    target: { db: Db; scope: PreferenceScope },
+    scope: BoundScope,
+    parsed: z.output<typeof ManageInput> & { action: Exclude<z.output<typeof ManageInput>["action"], "answer_preference" | "private_session"> },
+    stores: PreferenceStores,
+  ): ManageResult {
+    const { db } = target;
+    const action = parsed.action;
+    if (action === "inspect") return this.inspect(db, scope, given(parsed.recordId));
+    const key = { secret: scope.continuationSecret, workspaceId: scope.workspaceId, workstreamId: scope.workstreamId };
+    if (action === "forget_preview") {
+      const recordIds = given(parsed.recordIds);
+      const preview = db.transaction(() => previewForget(db, scope, key, recordIds))();
+      return { v: 1, action, ...preview, notice: FORGET_NOTICE };
+    }
+    const actor = { sessionId: scope.sessionId, host: scope.host, attribution: given(parsed.attribution), reason: given(parsed.reason) };
+    if (action === "correct" || action === "supersede" || action === "retract" || action === "restore") {
+      const proposal = inferredChange(stores, db, target.scope, { action, recordId: given(parsed.recordId), body: parsed.body, attribution: actor.attribution, reason: actor.reason });
+      if (proposal !== null) return { v: 1, action: "proposal", preference: proposal, replayed: false };
+    }
+    const applicability = target.scope === "global" ? {} : withHeadCommit({}, scope.worktree);
+    const own = { onlyChange: false };
+    // An operation key in global.sqlite belongs to no one workstream: the same change retried from another repository is the same request.
+    const result = this.idempotent(db, scope, "manage", parsed, target.scope === "global" ? "global" : scope.workstreamId, (): Unreplayed<Exclude<ManageResult, { action: "inspect" | "forget_preview" | "proposal" | "answer_preference" | "private_session" }>> => {
+      // Nothing in this scope changed since this session last heard: the change is news only to others.
+      own.onlyChange = target.scope === "repo" && changesSince(db, scope.workstreamId, this.seenLifecycle) === null;
+      if (target.scope === "global") ensureGlobalSession(db, stores.actor);
+      switch (action) {
+        case "restore":
+          return { v: 1, action, ...restoreClaim(db, scope, { recordId: given(parsed.recordId), actor }) };
+        case "forget":
+          return { v: 1, action, ...confirmForget(db, scope, key, { confirmToken: given(parsed.confirmToken), actor }) };
+        case "retract": {
+          const changed = changeClaim(db, scope, { action, recordId: given(parsed.recordId), applicability, actor });
+          return { v: 1, action, recordId: changed.recordId, affected: changed.affected, watermark: changed.watermark };
+        }
+        case "correct":
+        case "supersede": {
+          const changed = changeClaim(db, scope, { action, recordId: given(parsed.recordId), body: given(parsed.body), applicability, actor });
+          return { v: 1, action, ...changed, replacementId: given(changed.replacementId) };
+        }
+      }
+    });
+    if (!result.replayed && own.onlyChange) this.seenLifecycle = result.watermark;
+    return result;
+  }
+
+  /** A session the user asked not to remember writes nothing (it may still read). */
+  private refuseIfPrivate(db: Db, scope: BoundScope): void {
+    if (!sessionIsPrivate(db, { sessionId: scope.sessionId, host: scope.host, hostSessionId: this.hostSessionId })) return;
+    throw new MemchorError("session_private", "The user asked Memchor not to remember this session, so it stores nothing. Reads still work.", {
+      details: { sessionId: scope.sessionId },
+    });
+  }
+
+  /** The stores preference operations read and write for this session. */
+  private preferenceStores(db: Db, scope: BoundScope): PreferenceStores {
+    return {
+      repo: db,
+      global: () => (this.globalDb ??= openWorkspaceDatabase(this.globalDbPath(), this.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: this.busyTimeoutMs })),
+      workstreamId: scope.workstreamId,
+      actor: { sessionId: scope.sessionId, host: scope.host },
+    };
+  }
+
+  private globalDbPath(): string {
+    return join(this.home, "global.sqlite");
   }
 
   status(input: StatusInput = {}): StatusResult {
@@ -743,7 +892,7 @@ class LocalMemory implements Memory {
       parse(StatusInput, input);
       const result: StatusResult = {
         runtime: probeRuntime(),
-        storage: { home: this.home, dbPath: null, schemaVersion: null, supportedSchemaVersion: SCHEMA_VERSION, journalMode: null },
+        storage: { home: this.home, dbPath: null, schemaVersion: null, supportedSchemaVersion: SCHEMA_VERSION, journalMode: null, globalDbPath: this.globalDbPath() },
         scope: null,
         counts: null,
         problem: null,
@@ -839,6 +988,8 @@ class LocalMemory implements Memory {
 
   close(): void {
     this.closed = true;
+    this.globalDb?.close();
+    this.globalDb = undefined;
     this.importer?.close();
     this.bound?.db.close();
     this.bound = undefined;
@@ -948,13 +1099,14 @@ class LocalMemory implements Memory {
     scope: BoundScope,
     operation: string,
     parsed: { operationKey?: string | undefined },
+    hashScope: string,
     write: () => R,
   ): R & { replayed: boolean } {
     const { operationKey, ...request } = parsed;
     return writeTransaction(db, () => {
       if (operationKey === undefined) return { ...write(), replayed: false };
       const requestHash = createHash("sha256")
-        .update(canonicalJson({ operation, workstreamId: scope.workstreamId, request }))
+        .update(canonicalJson({ operation, workstreamId: hashScope, request }))
         .digest("hex");
       const stored = db.prepare("SELECT request_hash, result_json FROM operations WHERE key = ?").get(operationKey) as
         | { request_hash: string; result_json: string }

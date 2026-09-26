@@ -29,6 +29,11 @@ export const ERROR_CODES = [
    * its state and `details.replacementId` its replacement, if any.
    */
   "lifecycle_conflict",
+  /**
+   * The user asked Memchor not to remember this session (`memory_manage private_session`), so it
+   * cannot write memory. Reads still work. Not retryable: the session stays private.
+   */
+  "session_private",
   /** `expectedRevision` does not match the workstream's head; reread and reconcile deliberately. */
   "checkpoint_conflict",
   /** Another writer held the database past the bounded busy timeout. Safe to retry. */

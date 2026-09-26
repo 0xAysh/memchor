@@ -1,10 +1,11 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import Database from "better-sqlite3";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { openMemory, type BootstrapResult } from "../../src/memory.js";
 import { initRepo, onCleanup, tempDir } from "../helpers.js";
 import { CLI, NO_NETWORK } from "./harness.js";
-import { CODEX_PINNED_VERSION, codex, CodexAppServer, codexEnv, codexSkipReason, memchorAddArgs, startStubResponses, useStubProvider } from "./codex.js";
+import { CODEX_PINNED_VERSION, codex, codexAsync, CodexAppServer, codexEnv, codexSkipReason, memchorAddArgs, startStubResponses, useStubProvider } from "./codex.js";
 
 const SKIP = codexSkipReason();
 if (SKIP !== null) process.stderr.write(`codex connection tests skipped: ${SKIP}\n`);
@@ -84,6 +85,8 @@ describe.skipIf(SKIP !== null)(`real Codex ${CODEX_PINNED_VERSION} connection`, 
     expect(rollout.match(/"type":"mcp_tool_call_end"/g)).toHaveLength(2);
     expect(rollout).not.toContain("scope_unresolved");
     const live = /\\"workstreamId\\":\\"(wst_[0-9a-f]{32})\\",\\"workstreamLabel\\":\\"feat\/codex\\"/.exec(rollout)?.[1];
+    // The pinned Codex advertises form and url elicitation, so preference questions can go to the user directly.
+    expect(rollout).toContain('\\"elicitation\\":{\\"form\\":true,\\"url\\":true}');
     expect(live).toBeDefined();
 
     const memory = openMemory({ cwd: repo, home: memchorHome, host: "codex", codexHome });
@@ -96,6 +99,56 @@ describe.skipIf(SKIP !== null)(`real Codex ${CODEX_PINNED_VERSION} connection`, 
     const items = memory.recall({ maxTokens: 8_000 }).items;
     const ask = items.find((item) => item.excerpt === "Continue the codex handoff work.");
     expect(ask).toMatchObject({ host: "codex", source: { transcriptId: threadId } });
+    expect(existsSync(networkLog) ? readFileSync(networkLog, "utf8") : "").toBe("");
+  }, 60_000);
+
+  test("headless codex exec and a preference question: the tool call returns within Memchor's bound, and what Codex did is recorded", async () => {
+    const codexHome = tempDir("memchor-codex-home-");
+    const memchorHome = tempDir();
+    const networkLog = join(tempDir(), "network.log");
+    const env = codexEnv(codexHome, tempDir("memchor-codex-user-"));
+    const added = codex(env, tempDir(), ...memchorAddArgs({ codexHome, memchorHome, networkLog, env: { MEMCHOR_ELICITATION_TIMEOUT_MS: "5000" } }));
+    expect(added.code, added.stderr).toBe(0);
+    const repo = initRepo({ branch: "feat/codex" });
+    const stub = await startStubResponses({
+      calls: [
+        { tool: "memory_bootstrap", arguments: {} },
+        { tool: "memory_record", arguments: { kind: "preference", body: "Use bun instead of npm.", attribution: "user_direction" } },
+      ],
+      reply: "Asked.",
+    });
+    useStubProvider(codexHome, stub.port);
+    const started = Date.now();
+    // exec's approval policy is "never", which refuses MCP calls that need approval: pre-approve Memchor's tools.
+    const run = await codexAsync(env, repo, 50_000, "exec", "-c", 'mcp_servers.memchor.default_tools_approval_mode="approve"', "From now on use bun, not npm.");
+    const elapsedMs = Date.now() - started;
+
+    // What happened to the question, read from Memchor's own state rather than Codex's output.
+    const memory = openMemory({ cwd: repo, home: memchorHome, host: "codex", codexHome });
+    const dbPath = memory.status().storage.dbPath ?? "";
+    memory.close();
+    const db = new Database(dbPath, { readonly: true });
+    const candidate = db.prepare("SELECT relay FROM preference_candidates").get() as { relay: string } | undefined;
+    const countPreferences = (path: string): number => {
+      if (!existsSync(path)) return 0;
+      const store = new Database(path, { readonly: true });
+      try {
+        return (store.prepare("SELECT count(*) AS n FROM records WHERE kind = 'preference'").get() as { n: number }).n;
+      } finally {
+        store.close();
+      }
+    };
+    db.close();
+    const stored = countPreferences(dbPath) + countPreferences(join(memchorHome, "global.sqlite"));
+    // No row and nothing stored: the question was answered "no" (declined); a row: still pending.
+    const outcome = candidate === undefined ? (stored > 0 ? "answered" : "declined") : candidate.relay === "refused" ? "cancelled or timed out" : "unavailable";
+    const artifacts = join(import.meta.dirname, "__artifacts__");
+    mkdirSync(artifacts, { recursive: true });
+    writeFileSync(join(artifacts, "elicitation-headless-codex.json"), JSON.stringify({ codex: CODEX_PINNED_VERSION, mode: "codex exec", exitCode: run.code, outcome, elapsedMs }, null, 2));
+    expect(run.code, run.stderr.slice(-2_000)).toBe(0);
+    // codex exec declines on its own; that must not count as the user saying no.
+    expect(outcome).toBe("cancelled or timed out");
+    expect(elapsedMs).toBeLessThan(45_000);
     expect(existsSync(networkLog) ? readFileSync(networkLog, "utf8") : "").toBe("");
   }, 60_000);
 });

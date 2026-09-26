@@ -1,10 +1,11 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { MemchorError } from "../errors.js";
 import { eligibilityOf, IN_SCOPE_SQL, type Lifecycle, type RecordRow, requireInScopeRecord, type Taint } from "../retrieval/eligibility.js";
-import type { Applicability, Attribution, LinkRelation, RecordKind } from "../schemas.js";
+import type { Attribution, LinkRelation, RecordKind } from "../schemas.js";
 import { type Db, openDatabase, prepared, requireTransaction, writeTransaction } from "../storage/database.js";
-import { appendRecord } from "../storage/records.js";
-import { appendLedger, type LedgerEntry, readLedger } from "./ledger.js";
+import { appendRecord, type StoredApplicability } from "../storage/records.js";
+import { appendLedger, type LedgerEntry, type PrivateSessionEntry, readLedger } from "./ledger.js";
+import { applyPrivateSession, isPrivateTranscript, privateSessionApplied, sessionIsPrivate, transcriptsOf } from "./private-session.js";
 import { excerpt } from "./lifecycle-views.js";
 import { findDependents, insertTaints, type Propagation } from "./taints.js";
 
@@ -106,7 +107,7 @@ const TRANSITIONS: Record<Action, { from: (lifecycle: Lifecycle) => boolean; to:
 export function changeClaim(
   db: Db,
   scope: ChangeScope,
-  request: { action: ChangeAction; recordId: string; body?: string; applicability: Applicability; actor: LiveActor },
+  request: { action: ChangeAction; recordId: string; body?: string; applicability: StoredApplicability; actor: LiveActor },
 ): ChangeResult {
   requireTransaction(db, "changeClaim");
   const { action, actor } = request;
@@ -269,23 +270,101 @@ export function confirmForget(db: Db, scope: ChangeScope, key: ConfirmationKey, 
       details: { reason: "preview_outdated" },
     });
   }
-  const at = new Date(now).toISOString();
+  const { result, entries } = applyForget(db, scope, plan, request.actor, new Date(now).toISOString());
+  // Only once every group's effects succeeded: an entry must never describe a change that rolled back.
+  for (const entry of entries) appendLedger(db, entry);
+  return result;
+}
+
+export interface ForgetSessionResult {
+  /** The session was already private: nothing more was done. */
+  alreadyPrivate: boolean;
+  /** Records forgotten: what the session wrote, and what was imported from its transcripts. */
+  forgotten: string[];
+  /** Transcripts of this session that will never be imported again. */
+  transcripts: number;
+}
+
+/**
+ * "Don't remember this session", in the caller's write transaction: forgets what the session
+ * wrote and what was already imported from its transcripts (no preview: the request is its own
+ * confirmation), marks the session and those transcripts private (writes refused, never
+ * imported again), and ledgers all of it so a restored older copy is marked again.
+ */
+export function forgetSession(db: Db, session: { sessionId: string; host: string; hostSessionId: string | undefined; workstreamId: string }, actor: LiveActor): ForgetSessionResult {
+  requireTransaction(db, "forgetSession");
+  const transcripts = transcriptsOf(db, session);
+  if (sessionIsPrivate(db, session) && transcripts.every((t) => isPrivateTranscript(db, t.host, t.transcriptId))) {
+    return { alreadyPrivate: true, forgotten: [], transcripts: transcripts.length };
+  }
+  const forgotten = forgetPrivate(db, { sessionId: session.sessionId, host: session.host, transcripts, workstreamId: session.workstreamId, alsoWrittenBy: session.sessionId }, actor);
+  return { alreadyPrivate: false, forgotten, transcripts: transcripts.length };
+}
+
+/**
+ * The importer met Memchor output naming a private session in this transcript: forgets what the
+ * transcript brought in and marks it private, as if the session had been marked with it known.
+ */
+export function forgetTranscript(db: Db, transcript: { host: string; transcriptId: string; privateSessionId: string; workstreamId: string }, actor: LiveActor): string[] {
+  requireTransaction(db, "forgetTranscript");
+  return forgetPrivate(
+    db,
+    { sessionId: transcript.privateSessionId, host: transcript.host, transcripts: [{ host: transcript.host, transcriptId: transcript.transcriptId }], workstreamId: transcript.workstreamId, alsoWrittenBy: null },
+    actor,
+  );
+}
+
+/** Forgets what was imported from `transcripts` (and written by `alsoWrittenBy`), marks them private, and ledgers it. */
+function forgetPrivate(
+  db: Db,
+  target: { sessionId: string; host: string; transcripts: { host: string; transcriptId: string }[]; workstreamId: string; alsoWrittenBy: string | null },
+  actor: LiveActor,
+): string[] {
+  const at = new Date().toISOString();
+  const left = prepared(
+    db,
+    `SELECT r.id, r.workstream_id FROM records r
+     WHERE r.lifecycle <> 'forgotten' AND (r.session_id = $writer OR r.source_id IN (
+       SELECT c.source_id FROM import_cursors c JOIN json_each($transcripts) t
+         ON c.host = json_extract(t.value, '$.host') AND c.transcript_id = json_extract(t.value, '$.transcriptId')))
+     ORDER BY r.seq`,
+  ).all({ writer: target.alsoWrittenBy, transcripts: JSON.stringify(target.transcripts) }) as { id: string; workstream_id: string | null }[];
+  // Grouped by workstream, so each group is in the scope it is forgotten from.
+  const groups = new Map<string, string[]>();
+  for (const row of left) {
+    const workstreamId = row.workstream_id ?? target.workstreamId;
+    groups.set(workstreamId, [...(groups.get(workstreamId) ?? []), row.id]);
+  }
+  const forgotten: string[] = [];
+  const entries: (LedgerEntry | PrivateSessionEntry)[] = [];
+  for (const [workstreamId, ids] of groups) {
+    const applied = applyForget(db, { workstreamId }, planForget(db, { workstreamId }, ids), actor, at);
+    forgotten.push(...applied.result.forgotten);
+    entries.push(...applied.entries);
+  }
+  const marker: PrivateSessionEntry = { v: 1, kind: "private_session", id: `led_${randomUUID().replaceAll("-", "")}`, sessionId: target.sessionId, host: target.host, transcripts: target.transcripts, at };
+  applyPrivateSession(db, marker);
+  entries.push(marker);
+  // Only once every effect succeeded: an entry must never describe a change that rolled back.
+  for (const entry of entries) appendLedger(db, entry);
+  return forgotten;
+}
+
+function applyForget(db: Db, scope: ChangeScope, plan: ForgetPlan, actor: LiveActor, at: string): { result: ForgetResult; entries: LedgerEntry[] } {
   const forgotten = new Set(plan.groups.flatMap((group) => group.records));
   let watermark = 0;
   let suppressed = 0;
   const tainted = new Map<string, Taint>();
   const entries: LedgerEntry[] = [];
   for (const group of plan.groups) {
-    const entry = ledgerEntry("forget", group.target.id, null, request.actor, group.events, at);
-    const effects = applyEffects(db, entry, group.target, group.records, request.actor, forgotten);
+    const entry = ledgerEntry("forget", group.target.id, null, actor, group.events, at);
+    const effects = applyEffects(db, entry, group.target, group.records, actor, forgotten);
     entries.push(entry);
     watermark = effects.watermark;
     suppressed += effects.suppressed;
     for (const [id, kind] of effects.tainted) if (tainted.get(id) !== "invalidated") tainted.set(id, kind);
   }
-  // Only once every group's effects succeeded: an entry must never describe a change that rolled back.
-  for (const entry of entries) appendLedger(db, entry);
-  return { forgotten: [...forgotten], affected: describe(db, scope, [...forgotten], tainted, suppressed), watermark };
+  return { result: { forgotten: [...forgotten], affected: describe(db, scope, [...forgotten], tainted, suppressed), watermark }, entries };
 }
 
 function planForget(db: Db, scope: ChangeScope, recordIds: readonly string[]): ForgetPlan {
@@ -319,6 +398,19 @@ function planForget(db: Db, scope: ChangeScope, recordIds: readonly string[]): F
     .update(JSON.stringify([groups.map((g) => [g.target.id, g.target.lifecycle, g.records]), [...tainted].sort(), links, chunks, [...events].sort()]))
     .digest("base64url");
   return { groups, impact, digest };
+}
+
+/**
+ * The record ids a confirmToken names, read without verifying it: only to find which store to
+ * confirm the forget in, where the token is then verified. Empty for anything malformed.
+ */
+export function confirmationTargets(token: string): string[] {
+  try {
+    const decoded = JSON.parse(Buffer.from(token.split(".")[0] ?? "", "base64url").toString("utf8")) as { ids?: unknown };
+    return Array.isArray(decoded.ids) ? decoded.ids.filter((id): id is string => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
 function signConfirmation(key: ConfirmationKey, payload: string): string {
@@ -376,18 +468,21 @@ const REPLAYED = "Re-applied from the lifecycle ledger: this database was older 
  * missing: the check runs without the write lock, and only a gap takes it.
  */
 export function replayLedger(db: Db): number {
-  const missing = (): LedgerEntry[] => {
+  const missing = (): (LedgerEntry | PrivateSessionEntry)[] => {
     const entries = readLedger(db);
     if (entries.length === 0) return [];
     const applied = new Set((prepared(db, "SELECT ledger_id FROM lifecycle_events").all() as { ledger_id: string }[]).map((row) => row.ledger_id));
-    return entries.filter((entry) => !applied.has(entry.id));
+    return entries.filter((entry) => ("kind" in entry ? !privateSessionApplied(db, entry) : !applied.has(entry.id)));
   };
   if (missing().length === 0) return 0;
   // Re-read under the write lock: a change in flight in another process appends its entry
   // inside its own transaction, so it is either committed by now or was never committed.
   return writeTransaction(db, () => {
     const entries = missing();
-    for (const entry of entries) replayEntry(db, entry);
+    for (const entry of entries) {
+      if ("kind" in entry) applyPrivateSession(db, entry);
+      else replayEntry(db, entry);
+    }
     return entries.length;
   });
 }

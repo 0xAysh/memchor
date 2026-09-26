@@ -317,7 +317,7 @@ describe("Claude → fresh Codex → fresh Claude handoff across processes", () 
     // The main worktree's workstream is bound to a live worktree, so it is never offered elsewhere.
     const main = await spawn(repo, "claude-code");
     const mainScope = (await main.ok<BootstrapResult>("memory_bootstrap")).scope;
-    const shared = await main.ok<RecordResult>("memory_record", { kind: "preference", body: "Never log card numbers.", attribution: "user_direction", workspaceLevel: true });
+    const shared = await main.ok<RecordResult>("memory_record", { kind: "constraint", body: "Never log card numbers.", attribution: "user_direction", workspaceLevel: true });
     const mainOnly = await main.ok<RecordResult>("memory_record", { kind: "decision", body: "Main worktree decision about webhooks.", attribution: "user_direction" });
     await main.close();
 

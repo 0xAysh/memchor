@@ -7,6 +7,12 @@ import type { StoredTestRun } from "../retrieval/freshness.js";
 import type { Applicability, Attribution, ExternalRef, Freshness, RecordKind, ReviewState } from "../schemas.js";
 import { type Db, prepared, requireTransaction } from "./database.js";
 
+/**
+ * Applicability as stored: the caller's fields, plus what Memchor adds. A reported test run
+ * carries the state it ran against; a preference, how the user's confirmation arrived.
+ */
+export type StoredApplicability = Applicability & { testRun?: StoredTestRun; confirmation?: "user" | "agent_reported" };
+
 export interface NewRecord {
   kind: RecordKind;
   title: string | null;
@@ -17,8 +23,7 @@ export interface NewRecord {
   host: string;
   attribution: Attribution;
   reviewState: ReviewState;
-  /** A reported test run is stored with the applicability it has: the state it ran against. */
-  applicability: Applicability & { testRun?: StoredTestRun };
+  applicability: StoredApplicability;
   externalRefs: readonly ExternalRef[];
   links: readonly Citation[];
   /** The transcript or external source the record was imported from. */

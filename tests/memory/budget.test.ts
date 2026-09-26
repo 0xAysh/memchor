@@ -183,7 +183,7 @@ describe("context pack budgets", () => {
     const orphan = open(first, home);
     orphan.bootstrap();
     orphan.checkpoint({ expectedRevision: 0, goal: "an orphaned goal ".repeat(10), status: "still going ".repeat(20), nextSteps: ["resume it"] });
-    for (let i = 0; i < 12; i++) orphan.record({ kind: "preference", body: `repository-wide preference ${i}: ${"prefer small commits ".repeat(10)}`, attribution: "user_direction", workspaceLevel: true });
+    for (let i = 0; i < 12; i++) orphan.record({ kind: "constraint", body: `repository-wide constraint ${i}: ${"prefer small commits ".repeat(10)}`, attribution: "user_direction", workspaceLevel: true });
     orphan.close();
     git(repo, "worktree", "remove", "--force", first);
     const second = join(tempDir("memchor-wt-"), "wt");

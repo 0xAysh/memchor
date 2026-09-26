@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { type ElicitRequest, ElicitRequestSchema, type ElicitResult } from "@modelcontextprotocol/sdk/types.js";
 import { onCleanup } from "../helpers.js";
 
 export const CLI = resolve(import.meta.dirname, "../../dist/cli.js");
@@ -37,6 +38,13 @@ export async function spawnServer(options: {
   networkLog?: string;
   /** Sent as `_meta` on every tools/call, as a host does (Codex: `{ threadId }`). */
   meta?: Record<string, unknown>;
+  /**
+   * The client's elicitation capability as a host advertises it (Claude Code: `{}`; Codex:
+   * `{ form: {}, url: {} }`) and how the "user" answers; omitted = no elicitation support.
+   */
+  elicitation?: { capability: Record<string, unknown>; respond: (request: ElicitRequest["params"]) => Promise<ElicitResult> };
+  /** `MEMCHOR_ELICITATION_TIMEOUT_MS` for the server. */
+  elicitationTimeoutMs?: number;
 }): Promise<ServerHandle> {
   const args = [...(options.networkLog === undefined ? [] : ["--import", NO_NETWORK]), CLI, "mcp", ...(options.host === undefined ? [] : ["--host", options.host])];
   const transport = new StdioClientTransport({
@@ -51,10 +59,16 @@ export async function spawnServer(options: {
       CLAUDE_CONFIG_DIR: options.claudeConfigDir ?? resolve(options.home, "no-claude-config"),
       CODEX_HOME: options.codexHome ?? resolve(options.home, "no-codex-home"),
       ...(options.networkLog === undefined ? {} : { MEMCHOR_NETWORK_LOG: options.networkLog }),
+      ...(options.elicitationTimeoutMs === undefined ? {} : { MEMCHOR_ELICITATION_TIMEOUT_MS: String(options.elicitationTimeoutMs) }),
     },
     stderr: "pipe",
   });
-  const client = new Client({ name: options.clientName ?? "memchor-test", version: "0.0.0" });
+  const elicitation = options.elicitation;
+  const client = new Client(
+    { name: options.clientName ?? "memchor-test", version: "0.0.0" },
+    elicitation === undefined ? {} : { capabilities: { elicitation: elicitation.capability } },
+  );
+  if (elicitation !== undefined) client.setRequestHandler(ElicitRequestSchema, (request) => elicitation.respond(request.params));
   await client.connect(transport);
   const pid = transport.pid;
   if (pid === null) throw new Error("server did not start");

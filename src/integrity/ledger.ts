@@ -34,12 +34,23 @@ export interface LedgerEntry {
   at: string;
 }
 
+/** "Don't remember this session": the session and the transcripts that are never imported again. */
+export interface PrivateSessionEntry {
+  v: 1;
+  kind: "private_session";
+  id: string;
+  sessionId: string;
+  host: string;
+  transcripts: { host: string; transcriptId: string }[];
+  at: string;
+}
+
 export function ledgerPath(db: Db): string {
   return join(dirname(db.name), "lifecycle.jsonl");
 }
 
 /** Appends one entry durably. Called inside the change's write transaction, so a failure rolls the change back. */
-export function appendLedger(db: Db, entry: LedgerEntry): void {
+export function appendLedger(db: Db, entry: LedgerEntry | PrivateSessionEntry): void {
   requireTransaction(db, "appendLedger");
   const path = ledgerPath(db);
   let fd: number | undefined;
@@ -55,15 +66,17 @@ export function appendLedger(db: Db, entry: LedgerEntry): void {
 }
 
 /** Every well-formed entry, in order. A torn last line (a crash mid-append) is ignored. */
-export function readLedger(db: Db): LedgerEntry[] {
+export function readLedger(db: Db): (LedgerEntry | PrivateSessionEntry)[] {
   const path = ledgerPath(db);
   if (!existsSync(path)) return [];
-  const entries: LedgerEntry[] = [];
+  const entries: (LedgerEntry | PrivateSessionEntry)[] = [];
   for (const line of readFileSync(path, "utf8").split("\n")) {
     if (line.trim() === "") continue;
     try {
-      const entry = JSON.parse(line) as Partial<LedgerEntry> | null;
-      if (entry?.v === 1 && typeof entry.id === "string" && typeof entry.recordId === "string") entries.push(entry as LedgerEntry);
+      const entry = JSON.parse(line) as (Partial<LedgerEntry> & Partial<PrivateSessionEntry>) | null;
+      if (entry?.v !== 1 || typeof entry.id !== "string") continue;
+      if (entry.kind === "private_session" && typeof entry.sessionId === "string") entries.push(entry as PrivateSessionEntry);
+      else if (entry.kind === undefined && typeof entry.recordId === "string") entries.push(entry as LedgerEntry);
     } catch {
       // A partial line from an interrupted append; the change it described never committed.
     }

@@ -8,6 +8,7 @@ import { sql as schemaV1 } from "../../src/storage/migrations/0001-initial.js";
 import { sql as schemaV2 } from "../../src/storage/migrations/0002-transcript-import.js";
 import { sql as schemaV3 } from "../../src/storage/migrations/0003-import-source-fingerprint.js";
 import { sql as schemaV4 } from "../../src/storage/migrations/0004-scope-resolution.js";
+import { sql as schemaV5 } from "../../src/storage/migrations/0005-lifecycle.js";
 import { catchMemchorError, initRepo, tempDir } from "../helpers.js";
 
 const CANONICAL_TABLES = [
@@ -20,11 +21,14 @@ const CANONICAL_TABLES = [
   "lifecycle_events",
   "links",
   "operations",
+  "preference_candidates",
+  "private_transcripts",
   "records",
   "sessions",
   "sources",
   "suppressions",
   "taints",
+  "transcript_sessions",
   "workspaces",
   "workstreams",
   "worktree_bindings",
@@ -55,11 +59,36 @@ function atVersionZero(setup = ""): string {
 }
 
 describe("migrations", () => {
-  test("this build introduces schema version 5", () => {
-    expect(SCHEMA_VERSION).toBe(5);
+  test("this build introduces schema version 6", () => {
+    expect(SCHEMA_VERSION).toBe(6);
   });
 
-  test.each([1, 2, 3, 4])("a version-%i database upgrades to version 5: every record is active or keeps its retraction, and lifecycle tables start empty", (from) => {
+  test.each([1, 2, 3, 4, 5])("a version-%i database upgrades to version 6: every session is non-private, and there are no preference questions", (from) => {
+    const path = join(tempDir(), "memory.sqlite");
+    const old = new Database(path);
+    old.pragma("foreign_keys = ON");
+    for (const step of [schemaV1, schemaV2, schemaV3, schemaV4, schemaV5].slice(0, from)) old.exec(step);
+    old.pragma(`user_version = ${from}`);
+    old.exec(`INSERT INTO workstreams (id, label, created_at) VALUES ('wst_1', 'main', 'now');
+      INSERT INTO sessions (id, host, workstream_id, started_at) VALUES ('ses_1', 'codex', 'wst_1', 'now');`);
+    old.close();
+
+    const db = openDatabase(path);
+    try {
+      expect(db.pragma("user_version", { simple: true })).toBe(6);
+      expect(db.prepare("SELECT id, private FROM sessions").all()).toEqual([{ id: "ses_1", private: 0 }]);
+      expect(db.prepare("SELECT count(*) AS n FROM preference_candidates").get()).toEqual({ n: 0 });
+      // A new preference names no target; a proposed change or removal always does.
+      const insert = db.prepare("INSERT INTO preference_candidates (id, kind, body, target_id, session_id, host, created_at) VALUES (?, ?, 'b', ?, 'ses_1', 'codex', 'now')");
+      expect(() => insert.run("pc_1", "new", "rec_x")).toThrow(/CHECK/);
+      expect(() => insert.run("pc_2", "change", null)).toThrow(/CHECK/);
+      expect(() => db.prepare("UPDATE sessions SET private = 2").run()).toThrow(/CHECK/);
+    } finally {
+      db.close();
+    }
+  });
+
+  test.each([1, 2, 3, 4])("a version-%i database upgrades through version 5: every record is active or keeps its retraction, and lifecycle tables start empty", (from) => {
     const path = join(tempDir(), "memory.sqlite");
     const old = new Database(path);
     old.pragma("foreign_keys = ON");
@@ -75,7 +104,7 @@ describe("migrations", () => {
 
     const db = openDatabase(path);
     try {
-      expect(db.pragma("user_version", { simple: true })).toBe(5);
+      expect(db.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
       expect(db.prepare("SELECT id, lifecycle, review_state FROM records ORDER BY id").all()).toEqual([
         { id: "rec_gone", lifecycle: "retracted", review_state: "retracted" },
         { id: "rec_live", lifecycle: "active", review_state: "unreviewed" },

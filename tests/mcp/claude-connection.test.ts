@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { initRepo, snapshotTree, tempDir } from "../helpers.js";
@@ -95,12 +95,44 @@ describe.skipIf(SKIP !== null)(`real Claude Code ${CLAUDE_PINNED_VERSION} connec
     expect(traffic.uses).toEqual(["mcp__memchor__memory_bootstrap", "mcp__memchor__memory_status"]);
     const boot = JSON.parse(traffic.results[0] ?? "{}") as { scope?: Record<string, unknown> };
     expect(boot.scope).toMatchObject({ worktree: repo, branch: "feat/claude", workstreamLabel: "feat/claude", host: "claude-code", ambiguity: null });
-    const status = JSON.parse(traffic.results[1] ?? "{}") as { storage?: { home?: string } };
+    const status = JSON.parse(traffic.results[1] ?? "{}") as { storage?: { home?: string }; client?: unknown };
     expect(status.storage?.home).toBe(memchorHome);
+    // The pinned Claude Code advertises elicitation ({} = form mode), so preference questions can go to the user directly.
+    expect(status.client).toMatchObject({ name: "claude-code", elicitation: { form: true, url: false } });
     const registry = JSON.parse(readFileSync(join(memchorHome, "registry.json"), "utf8")) as { repositories: Record<string, unknown> };
     expect(Object.keys(registry.repositories)).toEqual([join(repo, ".git")]);
 
     expect(snapshotTree(repo)).toEqual(before);
     expect(networkAttempts(networkLog)).toBe("");
+  }, 60_000);
+
+  test("headless claude -p and a preference question: the tool call returns within Memchor's bound, and what Claude Code did is recorded", async () => {
+    const { sandbox, repo } = setup("feat/claude");
+    const stub = await startStubMessages({
+      calls: [
+        { tool: "memory_bootstrap", input: {} },
+        { tool: "memory_record", input: { kind: "preference", body: "Use bun instead of npm.", attribution: "user_direction" } },
+      ],
+      reply: "Asked.",
+    });
+    const env = claudeEnv(sandbox, { ANTHROPIC_BASE_URL: `http://127.0.0.1:${stub.port}`, ANTHROPIC_API_KEY: "sk-ant-stub-000", MEMCHOR_ELICITATION_TIMEOUT_MS: "5000" });
+    const started = Date.now();
+    const run = await claudeAsync(env, repo, "-p", "From now on use bun, not npm.", "--output-format", "json", "--allowedTools", "mcp__memchor__memory_bootstrap mcp__memchor__memory_record");
+    const elapsedMs = Date.now() - started;
+    expect(run.code, run.stderr).toBe(0);
+    const result = JSON.parse(run.stdout) as { session_id: string };
+    const traffic = sessionToolTraffic(sandbox, result.session_id);
+    const preference = (JSON.parse(traffic.results[1] ?? "{}") as { preference?: { state?: string; relay?: string | null } }).preference;
+    // Claude Code logs the question it received ("Elicitation request received in print mode").
+    const received = mcpServerLog(sandbox, "memchor").includes("Elicitation request received");
+    // pending + refused: the host answered cancel (or never); pending + allowed: the request failed; declined: it answered decline.
+    const outcome = preference?.state === "pending" ? (preference.relay === "refused" ? "cancelled" : "unavailable") : (preference?.state ?? null);
+    // Evidence, not an assertion about Claude Code's choice: -p has no one to ask.
+    const artifacts = join(import.meta.dirname, "__artifacts__");
+    mkdirSync(artifacts, { recursive: true });
+    writeFileSync(join(artifacts, "elicitation-headless-claude.json"), JSON.stringify({ claudeCode: CLAUDE_PINNED_VERSION, mode: "claude -p", questionReceived: received, outcome, state: preference?.state ?? null, relay: preference?.relay ?? null, elapsedMs }, null, 2));
+    expect(received).toBe(true);
+    expect(preference?.state).toMatch(/^(pending|declined|active)$/);
+    expect(elapsedMs).toBeLessThan(45_000);
   }, 60_000);
 });

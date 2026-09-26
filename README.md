@@ -37,7 +37,7 @@ Real transcripts hold account ids, file contents and credentials, so they never 
 
 `tests/mcp/codex-connection.test.ts` (and the Codex step of `tests/handoff/handoff-real-codex.test.ts`) drives the real Codex CLI (`codex mcp add/list/get`, `codex app-server`) in a temporary `CODEX_HOME`. It runs only against the pinned build, `codex-cli 0.148.0-alpha.21` (bundled at `/Applications/ChatGPT.app/Contents/Resources/codex`; override with `MEMCHOR_TEST_CODEX_BIN`), and is skipped, with the reason on stderr, when that binary is missing or reports another version.
 
-`tests/mcp/claude-connection.test.ts` drives the real Claude Code CLI: `claude mcp add/list/get`, and a `claude -p` session against a localhost stub of the Messages API that makes it call `memory_bootstrap` and `memory_status`. `HOME` and `CLAUDE_CONFIG_DIR` are temporary directories. On macOS each `claude` process also runs under `sandbox-exec` with a profile that denies `~/.claude.json`, `~/.claude`, Claude's cache, `~/.memchor` and every connection except to localhost. It runs only against the pinned build, Claude Code `2.1.282` (the first `claude` on `PATH`, else `~/.local/bin/claude`; override with `MEMCHOR_TEST_CLAUDE_BIN`), and is skipped, with the reason on stderr, when that binary is missing or reports another version.
+`tests/mcp/claude-connection.test.ts` drives the real Claude Code CLI: `claude mcp add/list/get`, and a `claude -p` session against a localhost stub of the Messages API that makes it call `memory_bootstrap` and `memory_status`. `HOME` and `CLAUDE_CONFIG_DIR` are temporary directories. On macOS each `claude` process also runs under `sandbox-exec` with a profile that denies `~/.claude.json`, `~/.claude`, Claude's cache, `~/.memchor` and every connection except to localhost. It runs only against the pinned build, Claude Code `2.1.283` (the first `claude` on `PATH`, else `~/.local/bin/claude`; override with `MEMCHOR_TEST_CLAUDE_BIN`), and is skipped, with the reason on stderr, when that binary is missing or reports another version.
 
 ## Commands
 
@@ -98,9 +98,9 @@ codex mcp get memchor     # command, args, env (masked), timeouts
 
 Codex rollouts written by 0.125.0-alpha.3 – 0.142.x and by 0.148.0-alpha.21 (legacy history mode) are imported; see [Transcript import](docs/architecture.md#transcript-import) for the table and known gaps.
 
-### Connect Claude Code (verified with Claude Code 2.1.282)
+### Connect Claude Code (verified with Claude Code 2.1.283)
 
-Tested against Claude Code `2.1.282` (native install; first verified on 2.1.281) by `tests/mcp/claude-connection.test.ts`, with `HOME` and `CLAUDE_CONFIG_DIR` in temporary directories.
+Tested against Claude Code `2.1.283` (native install; first verified on 2.1.281) by `tests/mcp/claude-connection.test.ts`, with `HOME` and `CLAUDE_CONFIG_DIR` in temporary directories.
 
 ```sh
 # With memchor installed on PATH (npm install -g); run by hand against 2.1.281 with memchor installed into a temporary prefix:
@@ -113,7 +113,7 @@ claude mcp get memchor     # Scope: User config …, Status: ✔ Connected, comm
 ```
 
 - **Use user scope (`-s user`).** Memchor serves every repository and finds the repository from its working directory. Claude Code starts a user-scope stdio server in the directory the session runs in: the test sees Memchor log `MCP server ready (cwd <repo>)`, and in a `claude -p` session its `memory_bootstrap` resolves that repository and branch. User and local scope are both stored in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when that is set). The default, `-s local`, registers Memchor for the current directory only. Avoid `-s project`: it writes `.mcp.json` into the repository, with your local paths, and Memchor otherwise writes nothing there.
-- **`--host claude-code` is explicit, not required.** Claude Code 2.1.282 identifies itself as `claude-code` in the MCP handshake, which Memchor would accept. The flag keeps the host from depending on it.
+- **`--host claude-code` is explicit, not required.** Claude Code 2.1.283 identifies itself as `claude-code` in the MCP handshake, which Memchor would accept. The flag keeps the host from depending on it.
 - **Environment is inherited.** Unlike Codex, Claude Code passes its own environment to the servers it starts (adding `CLAUDE_PROJECT_DIR`, `CLAUDE_CODE_SESSION_ID`, …), so a `MEMCHOR_HOME` or `CLAUDE_CONFIG_DIR` set when you launch `claude` reaches Memchor. To pin one however Claude is launched, add `-e` after the server name (`-e` takes several values, so a name placed after it is read as another pair):
 
   ```sh
@@ -125,6 +125,6 @@ claude mcp get memchor     # Scope: User config …, Status: ✔ Connected, comm
 - **Startup timeout.** Claude Code waits 30 s for a stdio server by default (its log: `Starting connection with timeout of 30000ms`). Start it with `MCP_TIMEOUT=<ms>` to change that (verified with `20000`). `memory_bootstrap` bounds its transcript import to 3 s and continues in the background.
 - **Instructions fit Claude Code's 2048-character limit.** Claude Code keeps only the first 2048 characters of a server's MCP `instructions`. Memchor's are kept under that limit, with detail in the tool descriptions; `tests/mcp/protocol.test.ts` enforces the length and checks every rule is still present.
 
-MCP tools: `memory_bootstrap`, `memory_recall`, `memory_read`, `memory_record`, `memory_checkpoint`, `memory_manage`, `memory_status`. The server's MCP `instructions` carry the agent protocol: bootstrap first, verify live state, record with honest attribution, cite evidence, correct or retract wrong memory with `memory_manage` when the user says so, and checkpoint with `expectedRevision` before finishing.
+MCP tools: `memory_bootstrap`, `memory_recall`, `memory_read`, `memory_record`, `memory_checkpoint`, `memory_manage`, `memory_status`. The server's MCP `instructions` carry the agent protocol: bootstrap first, verify live state, record with honest attribution, cite evidence, correct or retract wrong memory with `memory_manage` when the user says so, propose a preference only for lasting language (Memchor asks the user to confirm it and where it applies), and checkpoint with `expectedRevision` before finishing.
 
 See [docs/architecture.md](docs/architecture.md) for the interface, schema, invariants and error codes.

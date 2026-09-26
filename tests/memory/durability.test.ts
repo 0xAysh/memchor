@@ -213,7 +213,7 @@ describe("storage failures", () => {
     const status = memory.status();
     expect(status.runtime).toMatchObject({ fts5: true, supported: true, requiredSqliteVersion: "3.51.3" });
     expect(status.runtime.sqliteVersion).toMatch(/^3\.\d+\.\d+$/);
-    expect(status.storage).toMatchObject({ schemaVersion: 5, supportedSchemaVersion: 5, journalMode: "wal" });
+    expect(status.storage).toMatchObject({ schemaVersion: 6, supportedSchemaVersion: 6, journalMode: "wal" });
     expect(status.counts).toEqual({ records: 0, checkpoints: 0, workstreams: 1, sessions: 1 });
     expect(status.problem).toBeNull();
   });

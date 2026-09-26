@@ -58,7 +58,7 @@ describe("recall", () => {
     const theirs = open(worktree, home);
 
     const own = mine.record({ kind: "note", body: "flaky test in payments", attribution: "direct_observation" });
-    const shared = mine.record({ kind: "preference", body: "never mock payments in tests", attribution: "user_direction", workspaceLevel: true });
+    const shared = mine.record({ kind: "constraint", body: "never mock payments in tests", attribution: "user_direction", workspaceLevel: true });
     theirs.record({ kind: "note", body: "payments payments payments flaky flaky test", attribution: "direct_observation" });
 
     expect(mine.recall({ query: "payments flaky test" }).items.map((i) => i.recordId).sort()).toEqual([own.recordId, shared.recordId].sort());
@@ -104,9 +104,9 @@ describe("recall", () => {
   test("kinds narrow the items; the head checkpoint is still returned first", () => {
     const memory = open(initRepo(), tempDir());
     memory.record({ kind: "note", body: "alpha note", attribution: "agent_inference" });
-    const pref = memory.record({ kind: "preference", body: "alpha preference", attribution: "user_direction" });
+    const pref = memory.record({ kind: "constraint", body: "alpha constraint", attribution: "user_direction" });
     memory.checkpoint({ expectedRevision: 0, goal: "alpha", status: "going" });
-    const pack = memory.recall({ query: "alpha", kinds: ["preference"] });
+    const pack = memory.recall({ query: "alpha", kinds: ["constraint"] });
     expect(pack.items.map((i) => i.recordId)).toEqual([pref.recordId]);
     expect(pack.checkpoint?.revision).toBe(1);
   });
