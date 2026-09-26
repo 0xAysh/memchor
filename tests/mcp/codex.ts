@@ -31,6 +31,22 @@ export function codexEnv(codexHome: string, home: string): NodeJS.ProcessEnv {
   return { PATH: process.env["PATH"] ?? "", HOME: home, CODEX_HOME: codexHome, TMPDIR: process.env["TMPDIR"] ?? "/tmp", LANG: "C.UTF-8" };
 }
 
+/** Runs codex without blocking the event loop (a stub model in this process must keep answering). */
+export function codexAsync(env: NodeJS.ProcessEnv, cwd: string, timeoutMs: number, ...args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(CODEX_BIN, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString("utf8")));
+    child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
 export function codex(env: NodeJS.ProcessEnv, cwd: string, ...args: string[]): { code: number | null; stdout: string; stderr: string } {
   const run = spawnSync(CODEX_BIN, args, { cwd, env, encoding: "utf8", timeout: 30_000 });
   return { code: run.status, stdout: run.stdout, stderr: run.stderr };
@@ -41,11 +57,12 @@ export function codex(env: NodeJS.ProcessEnv, cwd: string, ...args: string[]): {
  * environment, so CODEX_HOME and MEMCHOR_HOME must be passed explicitly; the test also preloads
  * the no-network guard into the Memchor process.
  */
-export function memchorAddArgs(options: { codexHome: string; memchorHome: string; networkLog: string }): string[] {
+export function memchorAddArgs(options: { codexHome: string; memchorHome: string; networkLog: string; env?: Record<string, string> }): string[] {
   return [
     "mcp",
     "add",
     "memchor",
+    ...Object.entries(options.env ?? {}).flatMap(([key, value]) => ["--env", `${key}=${value}`]),
     "--env",
     `CODEX_HOME=${options.codexHome}`,
     "--env",

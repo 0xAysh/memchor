@@ -26,7 +26,7 @@ describe("MCP protocol surface", () => {
     // One flat object (a top-level union is not a valid tool schema for every host); fields are checked per action.
     const manage = tools.find((t) => t.name === "memory_manage");
     expect(manage?.inputSchema.required).toEqual(["action"]);
-    expect(Object.keys(manage?.inputSchema.properties ?? {})).toEqual(["v", "action", "recordId", "recordIds", "confirmToken", "body", "reason", "attribution", "operationKey"]);
+    expect(Object.keys(manage?.inputSchema.properties ?? {})).toEqual(["v", "action", "recordId", "recordIds", "confirmToken", "candidateId", "answer", "body", "reason", "attribution", "operationKey"]);
     expect(server.client.getInstructions()).toMatch(/memory_bootstrap first/);
   });
 
@@ -44,6 +44,8 @@ describe("MCP protocol surface", () => {
       /independentRoots/,
       /attribution/,
       /memory_manage/,
+      /Preferences are defaults; the current request wins/,
+      /lasting language or a repeated correction/,
       /never re-record/i,
       /memory_checkpoint.*expectedRevision/s,
       /checkpoint_conflict.*never overwrite/is,

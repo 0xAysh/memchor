@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { ZodError, type z } from "zod";
 import {
   bindScope,
@@ -16,6 +18,7 @@ import { headCheckpointRecordId, headRevision, publishCheckpoint } from "./integ
 import {
   type Affected,
   changeClaim,
+  confirmationTargets,
   confirmForget,
   type ForgetImpact,
   type ForgetTarget,
@@ -25,6 +28,19 @@ import {
   type RestoreResult,
 } from "./integrity/lifecycle.js";
 import { changesSince, type CorrectionNotice, type HistoryEntry, inspectRecord, lifecycleWatermark, type Related } from "./integrity/lifecycle-views.js";
+import {
+  ensureGlobalSession,
+  locatePreference,
+  preferenceBlock,
+  type PreferenceBlock,
+  type PreferenceQuestion,
+  type PreferenceStores,
+  proposeChange,
+  proposePreference,
+  reaskAtSessionStart,
+  type Settlement,
+  settleCandidate,
+} from "./integrity/preferences.js";
 import { hostDescriptor } from "./hosts.js";
 import type { TranscriptAdapter } from "./import/normalized-event.js";
 import { type ImportStatus, TranscriptImporter, unsupportedHostStatus } from "./import/reconcile.js";
@@ -99,6 +115,7 @@ export type { CandidateSignal, ResolutionBasis, ScopeAmbiguity, WorkstreamCandid
 export type { CheckpointSummary } from "./integrity/checkpoints.js";
 export type { Affected, ForgetImpact, ForgetTarget } from "./integrity/lifecycle.js";
 export type { CorrectionNotice, HistoryEntry, LifecycleChange, Related } from "./integrity/lifecycle-views.js";
+export type { ActivePreference, PreferenceAnswer, PreferenceBlock, PreferenceQuestion, Settlement } from "./integrity/preferences.js";
 export type { Lifecycle, Taint } from "./retrieval/eligibility.js";
 
 // ───────────────────────────── Public interface ─────────────────────────────
@@ -270,6 +287,19 @@ export interface BootstrapResult {
   import: ImportStatus;
   /** Same as `recall({ maxTokens, maxBytes })` after this bootstrap's import: head checkpoint plus the most recent eligible records. */
   context: ContextPack;
+  /**
+   * The user's confirmed preferences (this repository's, then global ones; ≤ 4 KB, `omitted`
+   * counts the rest), and unanswered preference questions from earlier sessions, asked once more.
+   */
+  preferences: PreferenceBlock;
+}
+
+/** What `record` returns for `kind: "preference"`: a question for the user, not a stored record. */
+export interface PreferenceRecordResult {
+  recordId: null;
+  kind: "preference";
+  preference: PreferenceQuestion;
+  replayed: false;
 }
 
 export interface RecordResult {
@@ -386,7 +416,10 @@ export type ManageResult =
       expiresAt: string;
       notice: string;
     }
-  | { v: 1; action: "forget"; forgotten: string[]; affected: Affected; watermark: number; replayed: boolean };
+  | { v: 1; action: "forget"; forgotten: string[]; affected: Affected; watermark: number; replayed: boolean }
+  /** An agent-inferred change or removal of a preference: a question for the user, nothing applied. */
+  | { v: 1; action: "proposal"; preference: PreferenceQuestion; replayed: false }
+  | { v: 1; action: "answer_preference"; preference: PreferenceQuestion };
 
 export interface StatusScope {
   workspaceId: string;
@@ -420,6 +453,8 @@ export interface StatusResult {
     schemaVersion: number | null;
     supportedSchemaVersion: number;
     journalMode: string | null;
+    /** Preferences the user confirmed for every repository (created on first use). */
+    globalDbPath: string;
   };
   /** What bootstrap (without `task` or `workstream`) would resolve, by the same rules, without binding anything. */
   scope: StatusScope | null;
@@ -469,8 +504,20 @@ export interface Memory {
    * alive; `done` is true once nothing approved remains. Each batch is one transaction.
    */
   continueImport(input?: ContinueImportInput): ImportStatus & { done: boolean };
-  /** Appends one attributed record with provenance links and external references. */
-  record(input: RecordInput): RecordResult;
+  /**
+   * Appends one attributed record with provenance links and external references. A
+   * `preference` is not stored: it becomes a question for the user (see `settlePreference`).
+   */
+  record(input: RecordInput & { kind: "preference" }): PreferenceRecordResult;
+  record(input: RecordInput & { kind: Exclude<RecordInput["kind"], "preference"> }): RecordResult;
+  record(input: RecordInput): RecordResult | PreferenceRecordResult;
+  /**
+   * Settles a preference question with what happened when the user was asked directly: their
+   * answer, `cancelled` (dismissed or timed out: stays pending, the agent may not answer for
+   * them) or `unavailable` (could not be shown: the agent may relay the answer). Transports call
+   * it; it is not an agent tool (agents relay answers through `memory_manage`).
+   */
+  settlePreference(input: { candidateId: string; outcome: Settlement }): PreferenceQuestion;
   /** Publishes the next checkpoint revision iff the head is still `expectedRevision`. */
   checkpoint(input: CheckpointInput): CheckpointResult;
   /** Returns a bounded, cited context pack: head checkpoint first, then ranked eligible records. */
@@ -537,6 +584,9 @@ class LocalMemory implements Memory {
   private closed = false;
   /** The newest lifecycle change this session has been told about (the correction watermark). */
   private seenLifecycle = 0;
+  /** Preferences the user said no to in this session: not asked again while it lasts. */
+  private readonly declinedPreferences = new Set<string>();
+  private globalDb: Db | undefined;
   /** Null for hosts without a transcript adapter. */
   private readonly importer: TranscriptImporter | null;
 
@@ -565,7 +615,10 @@ class LocalMemory implements Memory {
       const { db, scope, location } = this.bind({ task: parsed.task, workstream: parsed.workstream });
       const runtime = probeRuntime();
       const imported = this.importer === null ? unsupportedHostStatus(this.host) : this.importer.bootstrap({ location, db }, parsed.importChoice);
+      const stores = this.preferenceStores(db, scope);
+      const preferences = preferenceBlock(stores, reaskAtSessionStart(stores));
       return {
+        preferences,
         scope: scopeView(db, scope),
         created: { workspace: location.isNew, workstream: scope.createdWorkstream },
         runtime: { sqliteVersion: runtime.sqliteVersion, fts5: runtime.fts5, schemaVersion: SCHEMA_VERSION },
@@ -575,10 +628,17 @@ class LocalMemory implements Memory {
     });
   }
 
-  record(input: RecordInput): RecordResult {
-    return this.guard(() => {
+  record(input: RecordInput & { kind: "preference" }): PreferenceRecordResult;
+  record(input: RecordInput & { kind: Exclude<RecordInput["kind"], "preference"> }): RecordResult;
+  record(input: RecordInput): RecordResult | PreferenceRecordResult;
+  record(input: RecordInput): RecordResult | PreferenceRecordResult {
+    return this.guard((): RecordResult | PreferenceRecordResult => {
       const parsed = parse(RecordInput, input);
       const { db, scope } = this.bind();
+      if (parsed.kind === "preference") {
+        // A preference applies only once the user confirms it and says where (PRD §5.6).
+        return { recordId: null, kind: "preference", preference: proposePreference(this.preferenceStores(db, scope), parsed.body, this.declinedPreferences), replayed: false };
+      }
       if (!parsed.workspaceLevel) requireWorkstream(scope, "memory_record");
       const applicability = withHeadCommit(parsed.applicability, scope.worktree);
       // Observed outside the write transaction (Git and file reads must not hold the lock),
@@ -698,44 +758,85 @@ class LocalMemory implements Memory {
     });
   }
 
+  settlePreference(input: { candidateId: string; outcome: Settlement }): PreferenceQuestion {
+    return this.guard(() => {
+      const { db, scope } = this.bind();
+      return settleCandidate(this.preferenceStores(db, scope), input.candidateId, input.outcome, "user", this.declinedPreferences);
+    });
+  }
+
   manage(input: ManageInput): ManageResult {
     return this.guard(() => {
       const parsed = parse(ManageInput, input);
       const { db, scope } = this.bind();
+      const stores = this.preferenceStores(db, scope);
       // ManageInput's refinement guarantees each action's required fields; `given` restates that for the compiler.
-      const action = parsed.action;
-      if (action === "inspect") return this.inspect(db, scope, given(parsed.recordId));
-      const key = { secret: scope.continuationSecret, workspaceId: scope.workspaceId, workstreamId: scope.workstreamId };
-      if (action === "forget_preview") {
-        const recordIds = given(parsed.recordIds);
-        const preview = db.transaction(() => previewForget(db, scope, key, recordIds))();
-        return { v: 1, action, ...preview, notice: FORGET_NOTICE };
+      if (parsed.action === "answer_preference") {
+        const preference = settleCandidate(stores, given(parsed.candidateId), { answer: given(parsed.answer) }, "agent_reported", this.declinedPreferences);
+        return { v: 1, action: "answer_preference", preference };
       }
-      const actor = { sessionId: scope.sessionId, host: scope.host, attribution: given(parsed.attribution), reason: given(parsed.reason) };
-      const applicability = withHeadCommit({}, scope.worktree);
-      const own = { onlyChange: false };
-      const result = this.idempotent(db, scope, "manage", parsed, (): Unreplayed<Exclude<ManageResult, { action: "inspect" | "forget_preview" }>> => {
-        // Nothing in this scope changed since this session last heard: the change is news only to others.
-        own.onlyChange = changesSince(db, scope.workstreamId, this.seenLifecycle) === null;
-        switch (action) {
-          case "restore":
-            return { v: 1, action, ...restoreClaim(db, scope, { recordId: given(parsed.recordId), actor }) };
-          case "forget":
-            return { v: 1, action, ...confirmForget(db, scope, key, { confirmToken: given(parsed.confirmToken), actor }) };
-          case "retract": {
-            const changed = changeClaim(db, scope, { action, recordId: given(parsed.recordId), applicability, actor });
-            return { v: 1, action, recordId: changed.recordId, affected: changed.affected, watermark: changed.watermark };
-          }
-          case "correct":
-          case "supersede": {
-            const changed = changeClaim(db, scope, { action, recordId: given(parsed.recordId), body: given(parsed.body), applicability, actor });
-            return { v: 1, action, ...changed, replacementId: given(changed.replacementId) };
-          }
-        }
-      });
-      if (!result.replayed && own.onlyChange) this.seenLifecycle = result.watermark;
-      return result;
+      // Global preferences live in global.sqlite; every other record in this workspace's database.
+      const named = parsed.recordId ?? parsed.recordIds?.[0] ?? (parsed.confirmToken === undefined ? undefined : confirmationTargets(parsed.confirmToken)[0]);
+      const located = named === undefined ? null : locatePreference(stores, named, existsSync(this.globalDbPath()));
+      return this.manageIn(located ?? { db, scope: "repo" }, scope, parsed, stores);
     });
+  }
+
+  /** One lifecycle operation against the store that holds its record. */
+  private manageIn(target: { db: Db; scope: "global" | "repo" }, scope: BoundScope, parsed: z.output<typeof ManageInput>, stores: PreferenceStores): ManageResult {
+    const { db } = target;
+    const action = parsed.action;
+    if (action === "answer_preference") throw new Error("answer_preference is handled by manage");
+    if (action === "inspect") return this.inspect(db, scope, given(parsed.recordId));
+    const key = { secret: scope.continuationSecret, workspaceId: scope.workspaceId, workstreamId: scope.workstreamId };
+    if (action === "forget_preview") {
+      const recordIds = given(parsed.recordIds);
+      const preview = db.transaction(() => previewForget(db, scope, key, recordIds))();
+      return { v: 1, action, ...preview, notice: FORGET_NOTICE };
+    }
+    const actor = { sessionId: scope.sessionId, host: scope.host, attribution: given(parsed.attribution), reason: given(parsed.reason) };
+    if (action === "correct" || action === "supersede" || action === "retract") {
+      const proposal = proposalFor(db, stores, target.scope, { action, recordId: given(parsed.recordId), body: parsed.body, attribution: actor.attribution, reason: actor.reason });
+      if (proposal !== null) return { v: 1, action: "proposal", preference: proposal, replayed: false };
+    }
+    const applicability = target.scope === "global" ? {} : withHeadCommit({}, scope.worktree);
+    const own = { onlyChange: false };
+    const result = this.idempotent(db, scope, "manage", parsed, (): Unreplayed<Exclude<ManageResult, { action: "inspect" | "forget_preview" | "proposal" | "answer_preference" }>> => {
+      // Nothing in this scope changed since this session last heard: the change is news only to others.
+      own.onlyChange = target.scope === "repo" && changesSince(db, scope.workstreamId, this.seenLifecycle) === null;
+      if (target.scope === "global") ensureGlobalSession(db, stores.actor);
+      switch (action) {
+        case "restore":
+          return { v: 1, action, ...restoreClaim(db, scope, { recordId: given(parsed.recordId), actor }) };
+        case "forget":
+          return { v: 1, action, ...confirmForget(db, scope, key, { confirmToken: given(parsed.confirmToken), actor }) };
+        case "retract": {
+          const changed = changeClaim(db, scope, { action, recordId: given(parsed.recordId), applicability, actor });
+          return { v: 1, action, recordId: changed.recordId, affected: changed.affected, watermark: changed.watermark };
+        }
+        case "correct":
+        case "supersede": {
+          const changed = changeClaim(db, scope, { action, recordId: given(parsed.recordId), body: given(parsed.body), applicability, actor });
+          return { v: 1, action, ...changed, replacementId: given(changed.replacementId) };
+        }
+      }
+    });
+    if (!result.replayed && own.onlyChange) this.seenLifecycle = result.watermark;
+    return result;
+  }
+
+  /** The stores preference operations read and write for this session. */
+  private preferenceStores(db: Db, scope: BoundScope): PreferenceStores {
+    return {
+      repo: db,
+      global: () => (this.globalDb ??= openWorkspaceDatabase(this.globalDbPath(), this.busyTimeoutMs === undefined ? {} : { busyTimeoutMs: this.busyTimeoutMs })),
+      workstreamId: scope.workstreamId,
+      actor: { sessionId: scope.sessionId, host: scope.host },
+    };
+  }
+
+  private globalDbPath(): string {
+    return join(this.home, "global.sqlite");
   }
 
   status(input: StatusInput = {}): StatusResult {
@@ -743,7 +844,7 @@ class LocalMemory implements Memory {
       parse(StatusInput, input);
       const result: StatusResult = {
         runtime: probeRuntime(),
-        storage: { home: this.home, dbPath: null, schemaVersion: null, supportedSchemaVersion: SCHEMA_VERSION, journalMode: null },
+        storage: { home: this.home, dbPath: null, schemaVersion: null, supportedSchemaVersion: SCHEMA_VERSION, journalMode: null, globalDbPath: this.globalDbPath() },
         scope: null,
         counts: null,
         problem: null,
@@ -839,6 +940,8 @@ class LocalMemory implements Memory {
 
   close(): void {
     this.closed = true;
+    this.globalDb?.close();
+    this.globalDb = undefined;
     this.importer?.close();
     this.bound?.db.close();
     this.bound = undefined;
@@ -1214,6 +1317,22 @@ function itemPackable(
       copies,
     }),
   };
+}
+
+/**
+ * A change or removal of a preference the agent inferred (not the user's explicit request) is
+ * only a proposal the user must confirm. Null when the change applies directly.
+ */
+function proposalFor(
+  db: Db,
+  stores: PreferenceStores,
+  scope: "global" | "repo",
+  change: { action: "correct" | "supersede" | "retract"; recordId: string; body: string | undefined; attribution: Attribution; reason: string },
+): PreferenceQuestion | null {
+  if (change.attribution === "user_direction") return null;
+  const row = db.prepare("SELECT * FROM records WHERE id = ?").get(change.recordId) as RecordRow | undefined;
+  if (row?.kind !== "preference" || !eligibilityOf(db, row).eligible) return null;
+  return proposeChange(stores, { row, scope }, { kind: change.action === "retract" ? "remove" : "change", body: change.body ?? "", reason: change.reason });
 }
 
 /** What freshness checks need of a stored record: its references and any test run it reports. */

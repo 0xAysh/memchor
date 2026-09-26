@@ -87,7 +87,7 @@ describe("workstream resolution", () => {
     const orphan = open(firstPath, home);
     orphan.bootstrap();
     const privateRecord = orphan.record({ kind: "decision", body: "zebracorn decision of the orphaned workstream", attribution: "user_direction" });
-    const shared = orphan.record({ kind: "preference", body: "zebracorn preference for the whole repository", attribution: "user_direction", workspaceLevel: true });
+    const shared = orphan.record({ kind: "constraint", body: "zebracorn preference for the whole repository", attribution: "user_direction", workspaceLevel: true });
     orphan.close();
     git(repo, "worktree", "remove", "--force", firstPath);
 

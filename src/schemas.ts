@@ -252,7 +252,10 @@ export type ReadInput = z.input<typeof ReadInput>;
 export const StatusInput = z.strictObject({});
 export type StatusInput = z.input<typeof StatusInput>;
 
-export const MANAGE_ACTIONS = ["inspect", "correct", "supersede", "retract", "restore", "forget_preview", "forget"] as const;
+export const MANAGE_ACTIONS = ["inspect", "correct", "supersede", "retract", "restore", "forget_preview", "forget", "answer_preference"] as const;
+
+/** Answers to a preference question: where a new one applies (or no), or yes/no to a proposed change. */
+export const PREFERENCE_ANSWERS = ["everywhere", "repo", "no", "yes"] as const;
 export type ManageAction = (typeof MANAGE_ACTIONS)[number];
 
 /** Which fields each action takes: required ones, and optional ones beyond `v`/`action`. Anything else is rejected. */
@@ -264,6 +267,7 @@ const MANAGE_FIELDS: Record<ManageAction, { required: readonly string[]; optiona
   restore: { required: ["recordId", "reason", "attribution"], optional: ["operationKey"] },
   forget_preview: { required: ["recordIds"], optional: [] },
   forget: { required: ["confirmToken", "reason", "attribution"], optional: ["operationKey"] },
+  answer_preference: { required: ["candidateId", "answer"], optional: [] },
 };
 
 /**
@@ -276,11 +280,17 @@ export const ManageInput = z
     action: z
       .enum(MANAGE_ACTIONS)
       .describe(
-        "inspect = state, history, evidence and derivations of a record (any state). correct = the claim was wrong: body is the corrected claim. supersede = it was right but is outdated: body is the new version. retract = it was wrong, with no replacement. restore = undo a retraction. forget_preview = what forgetting recordIds would remove (changes nothing). forget = remove it, with the preview's confirmToken, only after the user confirmed that preview.",
+        "inspect = state, history, evidence and derivations of a record (any state). correct = the claim was wrong: body is the corrected claim. supersede = it was right but is outdated: body is the new version. retract = it was wrong, with no replacement. restore = undo a retraction. forget_preview = what forgetting recordIds would remove (changes nothing). forget = remove it, with the preview's confirmToken, only after the user confirmed that preview. answer_preference = relay the user's answer to a preference question Memchor could not ask them directly.",
       ),
     recordId: RecordId.optional(),
     recordIds: z.array(RecordId).min(1).max(LIMITS.forgetTargets).optional().describe("forget_preview: the records to forget (find them with recall or inspect)"),
     confirmToken: z.string().min(1).max(4_096).optional().describe("forget: the confirmToken of the forget_preview the user confirmed"),
+    candidateId: z
+      .string()
+      .regex(/^pc_[0-9a-f]{32}$/, "expected a preference question id like pc_<32 hex>")
+      .optional()
+      .describe("answer_preference: the candidateId of a preference question Memchor could not ask the user directly"),
+    answer: z.enum(PREFERENCE_ANSWERS).optional().describe("answer_preference: exactly what the user answered; never answer for them"),
     body: z
       .string()
       .min(1)

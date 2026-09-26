@@ -24,9 +24,10 @@ The adapters contain no memory policy. Host differences outside the transcript f
 
 | Method | Contract |
 |---|---|
-| `bootstrap({hostSessionId?, importChoice?, task?, workstream?, maxTokens?, maxBytes?})` | Binds scope (or returns `scope.ambiguity`), records an import choice if given, imports the current project's approved transcripts within `importBudgetMs` (default 3 s), and returns scope, `import` status (or the consent question), and `recall({ maxTokens, maxBytes })`. `workstream` (`<id>` or `"new"`) answers an ambiguity; `task` names the task explicitly |
+| `bootstrap({hostSessionId?, importChoice?, task?, workstream?, maxTokens?, maxBytes?})` | Binds scope (or returns `scope.ambiguity`), records an import choice if given, imports the current project's approved transcripts within `importBudgetMs` (default 3 s), and returns scope, `import` status (or the consent question), `recall({ maxTokens, maxBytes })`, and the `preferences` block. `workstream` (`<id>` or `"new"`) answers an ambiguity; `task` names the task explicitly |
 | `continueImport({maxMs?})` | One bounded step of the remaining approved import (current project first, then other projects' own workspaces). The MCP server calls it between requests while alive. Not an agent tool |
-| `record({kind, body, attribution, …})` | Appends one record with its links and search chunks; `operationKey` makes it idempotent |
+| `record({kind, body, attribution, …})` | Appends one record with its links and search chunks; `operationKey` makes it idempotent. `kind: "preference"` stores nothing: it returns a question for the user (see [Preferences](#preferences)) |
+| `settlePreference({candidateId, outcome})` | What happened when a preference question was put to the user directly: their answer, `cancelled`, or `unavailable`. Transports call it; it is not an agent tool |
 | `checkpoint({expectedRevision, goal, status, …})` | Appends revision `expectedRevision + 1` only if the head still equals `expectedRevision` |
 | `recall({query?, kinds?, maxTokens?, maxBytes?, continuation?})` | A bounded pack: head checkpoint first, then ranked eligible items, each with live freshness, provenance, independent root and corroboration (see [Recall applicability](#recall-applicability)), plus `corrections` when memory in scope changed since this session's previous pack |
 | `read({recordId, maxTokens?, maxBytes?, offset?})` | A slice of one visible record's body, with its visible links, live freshness and independent root. Offsets count UTF-16 code units; an offset inside a surrogate pair snaps back to that code point's start. A record that is no longer current is `not_found` with its `lifecycle`, `replacementId` or `taint` |
@@ -91,6 +92,7 @@ The agent shows `question`, then calls `bootstrap({workstream})`. That choice be
 | `worktree_bindings`, `sessions` | Scope binding | One workstream per worktree path; `sessions.workstream_id NULL` (v4) = a workspace-level session awaiting a choice |
 | `chunks`, `chunks_fts` | **Derived** search projection | A pure function of `records`; rebuildable |
 | `sources` | One row per imported transcript | `records.source_id` points here |
+| `preference_candidates` (v6) | Preference questions the user has not answered | Never records: nothing here is recalled, read or injected |
 | `import_cursors` (v2) | Per-transcript reconciliation position | Advances only in the transaction that stores the batch's records; `anchor_hash` detects rewrites |
 | `import_events` (v2) | Event identity → record | PK = host + transcript + branch + event id + content hash, so replay is a no-op and an edit is a new version |
 | `consents` | Reserved | The import decision is host-level, so it lives in `$MEMCHOR_HOME/consent.json`, not in a workspace |
@@ -273,6 +275,35 @@ Transcripts whose cwd is gone or not in Git are counted as `unassigned`. `all pr
 
 Known limits: forgetting is not forensic erasure. A claim already in a model's context, in a host transcript, in WAL frames not yet checkpointed, or in an export or backup is not erased. Deleting `lifecycle.jsonl` removes the restore protection; a running session hears of a change only on its next pack. A paraphrase in a checkpoint or summary, or an uncited agent record repeating the claim, is not found (verbatim only). Copies in another workstream are not changed, though their host event is suppressed for the whole workspace.
 
+## Preferences
+
+`src/integrity/preferences.ts`. A preference becomes standing only after the user answers, and the answer sets where it applies.
+
+```text
+memory_record(kind: preference) ─▶ candidate (a question; never a record)
+   Everywhere ─▶ preference record in $MEMCHOR_HOME/global.sqlite     This repo only ─▶ workspace-level record
+   No, just now ─▶ nothing stored; this process does not ask again
+   no answer ─▶ pending ─▶ asked once more at the next session start ─▶ dropped
+agent_inference supersede/correct/retract of an active preference ─▶ candidate (proposal): Yes applies it, No keeps it
+user_direction supersede/retract ─▶ applies at once (the user's request is the confirmation); a retraction can be restored
+```
+
+**Who asks.** The MCP transport puts the question to the user with form elicitation (`enum: ["Everywhere", "This repo only", "No, just now"]`, or `["Yes", "No"]` for a proposal), waits at most 60 s (`MEMCHOR_ELICITATION_TIMEOUT_MS`), and settles the candidate:
+
+| What the host did | Outcome | May the agent relay an answer? |
+|---|---|---|
+| accept + an answer | that answer (confirmedBy `user`) | — |
+| decline, cancel, no answer within the bound | pending, asked again next session | no (`relay: refused`) |
+| no elicitation capability, request error | pending | yes: the agent asks in chat and calls `memory_manage answer_preference` (confirmedBy `agent_reported`, weaker) |
+
+Decline is not "no": headless hosts answer questions on their own. Observed on the pinned builds (artifacts in `tests/mcp/__artifacts__/`): `claude -p` 2.1.283 cancels in about 0.5 s, and `codex exec` 0.148.0-alpha.21 declines in under a second (with `mcp_servers.memchor.default_tools_approval_mode = "approve"`; exec's approval policy `never` otherwise refuses every Memchor call). Both hosts advertise elicitation interactively: Claude Code `{}` (form), Codex `{form, url}`; `memory_status` reports it as `client.elicitation`.
+
+**Storage.** Active preferences are ordinary `preference` records, so lifecycle, eligibility and lineage apply unchanged. Global ones live in `global.sqlite`, a database with the workspace schema and migrations (its own `lifecycle.jsonl` ledger, and a `sessions` row per writing session); `memory_manage` finds a record in either store. The confirmation source is kept in the record's applicability (`confirmation`). Applying an answer writes the preference first and deletes the candidate second (possibly two databases); after a crash in between, the question comes back and finds the preference already active.
+
+**At session start** `bootstrap.preferences` = `{ note, items, omitted, pending }`: this repository's active preferences, then global ones, newest first, cut at 4 KB of items (`omitted` counts the rest), with a note that preferences are defaults and the current request wins; `pending` holds earlier sessions' unanswered questions, asked once more (the transport asks them directly and returns each with its outcome).
+
+Known limits: lifecycle changes to global preferences are not reported through the `corrections` watermark (a session sees them at its next start); a paraphrase of an active preference is proposed again (text is compared case- and whitespace-insensitively only).
+
 ## Handoff
 
 The V1 story (Claude Code → a fresh Codex session → a fresh Claude Code session in one worktree) needs no handoff-specific code: each host runs its own `memchor mcp` process, and they meet only in `$MEMCHOR_HOME` through the pieces above.
@@ -310,7 +341,7 @@ At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix f
 | `scope_ambiguous` | No workstream is chosen yet (`scope.ambiguity`): thrown by `record` without `workspaceLevel` and by `checkpoint`; `details.candidates` lists the ids. Also the gap reason for a held or quarantined transcript |
 | `scope_denied` | The target belongs to another workstream |
 | `not_found` | Unknown or ineligible record (its `details` name the `lifecycle`, `replacementId` or `taint`), or a chosen `workstream` that is not in this workspace |
-| `lifecycle_conflict` | `memory_manage` found the claim in the wrong state (already corrected, or restoring what was not retracted here); `details.lifecycle` / `replacementId` |
+| `lifecycle_conflict` | `memory_manage` found the claim in the wrong state (already corrected, or restoring what was not retracted here); `details.lifecycle` / `replacementId`. Also an agent relaying an answer to a preference question the user dismissed (`details.relay: refused`) |
 | `invalid_input` | Schema violation, unknown key, oversized content, or a bad continuation |
 | `idempotency_conflict` | The operation key was reused with a different request |
 | `checkpoint_conflict` | The head ≠ `expectedRevision`; `details.currentRevision` gives the head |
@@ -324,7 +355,7 @@ At open, Memchor requires embedded SQLite ≥ 3.51.3, the release with the fix f
 `src/storage/migrations/` holds an append-only ordered list, and `PRAGMA user_version` is the applied count:
 
 - Each step runs in its own `BEGIN IMMEDIATE` transaction together with the version bump, so a failed step leaves the previous version intact.
-- Steps run with foreign keys off, as SQLite's documented table-rebuild procedure requires. v4 rebuilds `sessions` to make `workstream_id` nullable. v5 adds `records.lifecycle` and the `taints`, `lifecycle_events` and `suppressions` tables. Each step runs `foreign_key_check` before committing, and rolls back on any violation.
+- Steps run with foreign keys off, as SQLite's documented table-rebuild procedure requires. v4 rebuilds `sessions` to make `workstream_id` nullable. v5 adds `records.lifecycle` and the `taints`, `lifecycle_events` and `suppressions` tables. v6 adds `preference_candidates` and `sessions.private`. Each step runs `foreign_key_check` before committing, and rolls back on any violation.
 - Concurrent openers serialise, and the second finds nothing to do.
 - A database newer than the build fails closed before any pragma changes it.
 - A shipped migration is never edited.

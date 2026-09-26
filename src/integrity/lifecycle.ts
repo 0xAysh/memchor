@@ -1,9 +1,9 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { MemchorError } from "../errors.js";
 import { eligibilityOf, IN_SCOPE_SQL, type Lifecycle, type RecordRow, requireInScopeRecord, type Taint } from "../retrieval/eligibility.js";
-import type { Applicability, Attribution, LinkRelation, RecordKind } from "../schemas.js";
+import type { Attribution, LinkRelation, RecordKind } from "../schemas.js";
 import { type Db, openDatabase, prepared, requireTransaction, writeTransaction } from "../storage/database.js";
-import { appendRecord } from "../storage/records.js";
+import { appendRecord, type StoredApplicability } from "../storage/records.js";
 import { appendLedger, type LedgerEntry, readLedger } from "./ledger.js";
 import { excerpt } from "./lifecycle-views.js";
 import { findDependents, insertTaints, type Propagation } from "./taints.js";
@@ -106,7 +106,7 @@ const TRANSITIONS: Record<Action, { from: (lifecycle: Lifecycle) => boolean; to:
 export function changeClaim(
   db: Db,
   scope: ChangeScope,
-  request: { action: ChangeAction; recordId: string; body?: string; applicability: Applicability; actor: LiveActor },
+  request: { action: ChangeAction; recordId: string; body?: string; applicability: StoredApplicability; actor: LiveActor },
 ): ChangeResult {
   requireTransaction(db, "changeClaim");
   const { action, actor } = request;
@@ -319,6 +319,19 @@ function planForget(db: Db, scope: ChangeScope, recordIds: readonly string[]): F
     .update(JSON.stringify([groups.map((g) => [g.target.id, g.target.lifecycle, g.records]), [...tainted].sort(), links, chunks, [...events].sort()]))
     .digest("base64url");
   return { groups, impact, digest };
+}
+
+/**
+ * The record ids a confirmToken names, read without verifying it: only to find which store to
+ * confirm the forget in, where the token is then verified. Empty for anything malformed.
+ */
+export function confirmationTargets(token: string): string[] {
+  try {
+    const decoded = JSON.parse(Buffer.from(token.split(".")[0] ?? "", "base64url").toString("utf8")) as { ids?: unknown };
+    return Array.isArray(decoded.ids) ? decoded.ids.filter((id): id is string => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
 function signConfirmation(key: ConfirmationKey, payload: string): string {
