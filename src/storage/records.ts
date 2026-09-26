@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
+import { inheritTaints } from "../integrity/taints.js";
 import { type Citation, insertLinks } from "../integrity/provenance.js";
 import { indexRecord } from "../retrieval/search.js";
 import type { RecordRow } from "../retrieval/eligibility.js";
+import type { StoredTestRun } from "../retrieval/freshness.js";
 import type { Applicability, Attribution, ExternalRef, Freshness, RecordKind, ReviewState } from "../schemas.js";
 import { type Db, prepared, requireTransaction } from "./database.js";
 
@@ -15,13 +17,21 @@ export interface NewRecord {
   host: string;
   attribution: Attribution;
   reviewState: ReviewState;
-  applicability: Applicability;
+  /** A reported test run is stored with the applicability it has: the state it ran against. */
+  applicability: Applicability & { testRun?: StoredTestRun };
   externalRefs: readonly ExternalRef[];
   links: readonly Citation[];
   /** The transcript or external source the record was imported from. */
   sourceId?: string;
   /** When the content was observed, if earlier than now (imported history); defaults to now. */
   createdAt?: string;
+  /**
+   * `strict` (default, agent writes): every link target must be current guidance.
+   * `inherit` (the importer): a target only needs to be in scope, and the new record takes on
+   * the state of what it restates or rests on (see `inheritTaints`), so a copy of a corrected
+   * claim is stored as ineligible instead of resurrecting it.
+   */
+  lineage?: "strict" | "inherit";
 }
 
 /**
@@ -67,7 +77,9 @@ export function appendRecord(db: Db, scopeWorkstreamId: string, record: NewRecor
     contentHash,
     createdAt,
   );
-  const links = insertLinks(db, scopeWorkstreamId, recordId, record.links, createdAt);
+  const lineage = record.lineage ?? "strict";
+  const links = insertLinks(db, scopeWorkstreamId, recordId, record.links, createdAt, lineage);
+  if (lineage === "inherit") inheritTaints(db, recordId, links, createdAt);
   indexRecord(db, { id: recordId, title: record.title, body: record.body, externalRefs: record.externalRefs });
   return { recordId, createdAt, links };
 }
@@ -80,17 +92,20 @@ export interface RecordFields {
   freshness: Freshness;
   applicability: Applicability;
   externalRefs: ExternalRef[];
+  testRun: StoredTestRun | null;
   workspaceLevel: boolean;
 }
 
 export function recordFields(row: RecordRow): RecordFields {
+  const { testRun, ...applicability } = JSON.parse(row.applicability) as Applicability & { testRun?: StoredTestRun };
   return {
     kind: row.kind as RecordKind,
     attribution: row.attribution as Attribution,
     reviewState: row.review_state as ReviewState,
     freshness: row.freshness as Freshness,
-    applicability: JSON.parse(row.applicability) as Applicability,
+    applicability,
     externalRefs: JSON.parse(row.external_refs) as ExternalRef[],
+    testRun: testRun ?? null,
     workspaceLevel: row.workstream_id === null,
   };
 }

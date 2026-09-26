@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { sep } from "node:path";
 import { MemchorError } from "../errors.js";
 import { summarizeCheckpoint, type CheckpointSummary } from "../integrity/checkpoints.js";
+import { ELIGIBLE_STATE_SQL } from "../retrieval/eligibility.js";
 import { type Db, prepared, requireTransaction, writeTransaction } from "../storage/database.js";
 import { mainWorktreeOf, type WorkspaceLocation } from "./workspace-resolution.js";
 
@@ -276,7 +277,7 @@ function ambiguous(db: Db, evidence: { row: WorkstreamRow; signal: CandidateSign
   const byId = new Map<string, WorkstreamCandidate>();
   const head = prepared(
     db,
-    `SELECT r.body FROM checkpoints c JOIN records r ON r.id = c.record_id WHERE c.workstream_id = ? AND c.revision = ? AND r.review_state <> 'retracted'`,
+    `SELECT r.body FROM checkpoints c JOIN records r ON r.id = c.record_id WHERE c.workstream_id = ? AND c.revision = ? AND ${ELIGIBLE_STATE_SQL}`,
   );
   const lastActive = prepared(db, "SELECT max(t) AS t FROM (SELECT max(created_at) AS t FROM records WHERE workstream_id = ? UNION ALL SELECT max(started_at) FROM sessions WHERE workstream_id = ?)");
   for (const { row, signal, detail } of evidence) {

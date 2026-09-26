@@ -51,6 +51,7 @@ function withMemoryDb<T>(fn: (db: Db) => T): T {
  *
  * Pragmas: WAL so several host processes share one file; synchronous=FULL so a
  * committed write survives power loss (a capture is never acknowledged and then lost);
+ * secure_delete so forgotten content does not linger on free pages;
  * foreign_keys so provenance links cannot dangle; a bounded busy_timeout so contention
  * becomes a visible `storage_busy` instead of an indefinite hang.
  */
@@ -70,6 +71,10 @@ export function openDatabase(path: string, options: { busyTimeoutMs?: number } =
       });
     }
     db.pragma("synchronous = FULL");
+    // Deleted content (a forgotten record's payload, its search chunks) is overwritten with
+    // zeros in the file instead of lingering on free pages. Memchor deletes rarely, so the extra
+    // writes cost little. It is not forensic erasure: WAL frames, backups and copies can remain.
+    db.pragma("secure_delete = ON");
     migrate(db); // leaves foreign_keys = ON
     return db;
   } catch (error) {

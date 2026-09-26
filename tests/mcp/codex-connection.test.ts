@@ -9,7 +9,7 @@ import { CODEX_PINNED_VERSION, codex, CodexAppServer, codexEnv, codexSkipReason,
 const SKIP = codexSkipReason();
 if (SKIP !== null) process.stderr.write(`codex connection tests skipped: ${SKIP}\n`);
 
-const TOOLS = ["memory_bootstrap", "memory_checkpoint", "memory_read", "memory_recall", "memory_record", "memory_status"];
+const TOOLS = ["memory_bootstrap", "memory_checkpoint", "memory_manage", "memory_read", "memory_recall", "memory_record", "memory_status"];
 
 function setup() {
   const codexHome = tempDir("memchor-codex-home-");
@@ -46,7 +46,7 @@ describe.skipIf(SKIP !== null)(`real Codex ${CODEX_PINNED_VERSION} connection`, 
     expect(codex(env, tempDir(), "mcp", "get", "missing").code).not.toBe(0);
   });
 
-  test("codex app-server starts memchor, completes the MCP handshake and lists all six memory tools, with no network access from Memchor", async () => {
+  test("codex app-server starts memchor, completes the MCP handshake and lists all seven memory tools, with no network access from Memchor", async () => {
     const { env, networkLog } = setup();
     const repo = initRepo();
     // With no thread, Codex launches MCP servers in its own working directory.

@@ -31,6 +31,7 @@ const INSTRUCTIONS = `Memchor is local working memory shared by the coding agent
 - corroboration.independentRoots counts distinct observations; copies never count twice. Items from different hosts that disagree are both kept: reconcile them, never pick one silently.
 - Record consequential observations, decisions, failed attempts, preferences and next steps with memory_record, with honest attribution and supportedBy citations. Never re-record recalled or read memory as new evidence; cite its recordId.
 - Before finishing, call memory_checkpoint with expectedRevision = the headRevision you last read. On checkpoint_conflict, recall, reconcile and retry; never overwrite.
+- When the user says memory is wrong or outdated, use memory_manage (inspect first). A pack's corrections lists records changed since you last recalled: stop relying on them.
 - An empty or partial pack is an honest miss: do not invent prior context. Report storage errors and conflicts to the user.`;
 
 interface ToolSpec {
@@ -53,7 +54,7 @@ const TOOLS: Record<OperationName, ToolSpec> = {
   },
   memory_read: {
     description:
-      "Expand one record by recordId within a byte/token budget; continue with nextOffset. Freshness of its references is checked live, as in recall. Other workstreams' and retracted records are refused.",
+      "Expand one record by recordId within a byte/token budget; continue with nextOffset. Freshness of its references is checked live, as in recall. Other workstreams' records and records that are no longer current (corrected, retracted, superseded, or resting on one) are refused; the error names the replacement.",
     run: (memory, args) => memory.read(args as never),
   },
   memory_record: {
@@ -65,6 +66,11 @@ const TOOLS: Record<OperationName, ToolSpec> = {
     description:
       "Publish the workstream's continuation state (goal, status, decisions, failed attempts, open questions, next steps) before finishing. Compare-and-swap: pass expectedRevision = the headRevision you last read; a checkpoint_conflict means someone else published first, so recall and reconcile. Fails with scope_ambiguous while no workstream is chosen.",
     run: (memory, args) => memory.checkpoint(args as never),
+  },
+  memory_manage: {
+    description:
+      "Inspect or change what Memchor remembers when the user asks (\"what do you remember about X\", \"that is wrong\", \"that changed\"). inspect: a record's state, history, evidence, and what was derived from it, even if it is no longer current. correct: the claim was wrong; body = the corrected claim (never the old one), reason = why. supersede: it was right but is outdated; body = the new version. retract: wrong, no replacement. restore: undo a retraction. forget_preview (recordIds) shows what forgetting would remove and changes nothing; show it to the user, and only after they explicitly confirm call forget with its confirmToken (it cannot be undone). Each change also takes restatements, conclusions resting on the claim, and checkpoints repeating it out of recall at once, and blocks re-import of the same transcript event. Use attribution user_direction only when the user asked for the change. Tell the user what changed (affected).",
+    run: (memory, args) => memory.manage(args as never),
   },
   memory_status: {
     description:

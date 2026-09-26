@@ -38,7 +38,7 @@ describe("memchor CLI", () => {
     expect(JSON.parse(memchor(repo, home, "diag", "reindex").stdout)).toEqual({ records: 2, chunks: 4 });
     const integrity = memchor(repo, home, "diag", "integrity");
     expect(integrity.code).toBe(0);
-    expect(JSON.parse(integrity.stdout)).toMatchObject({ exists: true, schemaVersion: 4, ok: true, sqlite: ["ok"], searchIndex: "ok", foreignKeyViolations: 0 });
+    expect(JSON.parse(integrity.stdout)).toMatchObject({ exists: true, schemaVersion: 5, ok: true, sqlite: ["ok"], searchIndex: "ok", foreignKeyViolations: 0 });
   });
 
   test("diag status is read-only: the first real bootstrap afterwards still creates the workstream", async () => {

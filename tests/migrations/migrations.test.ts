@@ -7,6 +7,7 @@ import { openDatabase, SCHEMA_VERSION, writeTransaction } from "../../src/storag
 import { sql as schemaV1 } from "../../src/storage/migrations/0001-initial.js";
 import { sql as schemaV2 } from "../../src/storage/migrations/0002-transcript-import.js";
 import { sql as schemaV3 } from "../../src/storage/migrations/0003-import-source-fingerprint.js";
+import { sql as schemaV4 } from "../../src/storage/migrations/0004-scope-resolution.js";
 import { catchMemchorError, initRepo, tempDir } from "../helpers.js";
 
 const CANONICAL_TABLES = [
@@ -16,11 +17,14 @@ const CANONICAL_TABLES = [
   "consents",
   "import_cursors",
   "import_events",
+  "lifecycle_events",
   "links",
   "operations",
   "records",
   "sessions",
   "sources",
+  "suppressions",
+  "taints",
   "workspaces",
   "workstreams",
   "worktree_bindings",
@@ -51,11 +55,60 @@ function atVersionZero(setup = ""): string {
 }
 
 describe("migrations", () => {
-  test("this build introduces schema version 4", () => {
-    expect(SCHEMA_VERSION).toBe(4);
+  test("this build introduces schema version 5", () => {
+    expect(SCHEMA_VERSION).toBe(5);
   });
 
-  test.each([1, 2, 3])("a version-%i database upgrades to version 4: sessions may be workspace-level and every reference survives", (from) => {
+  test.each([1, 2, 3, 4])("a version-%i database upgrades to version 5: every record is active or keeps its retraction, and lifecycle tables start empty", (from) => {
+    const path = join(tempDir(), "memory.sqlite");
+    const old = new Database(path);
+    old.pragma("foreign_keys = ON");
+    for (const step of [schemaV1, schemaV2, schemaV3, schemaV4].slice(0, from)) old.exec(step);
+    old.pragma(`user_version = ${from}`);
+    old.exec(`INSERT INTO workstreams (id, label, created_at) VALUES ('wst_1', 'feat/x', 'now');
+      INSERT INTO sessions (id, host, workstream_id, started_at) VALUES ('ses_1', 'claude-code', 'wst_1', 'now');
+      INSERT INTO records (id, kind, body, workstream_id, session_id, host, attribution, content_hash, created_at)
+        VALUES ('rec_live', 'note', 'current', 'wst_1', 'ses_1', 'claude-code', 'agent_inference', 'h', 'now');
+      INSERT INTO records (id, kind, body, workstream_id, session_id, host, attribution, review_state, retracted_at, content_hash, created_at)
+        VALUES ('rec_gone', 'evidence', 'withdrawn', 'wst_1', 'ses_1', 'claude-code', 'direct_observation', 'retracted', 'migration-v3', 'h', 'now');`);
+    old.close();
+
+    const db = openDatabase(path);
+    try {
+      expect(db.pragma("user_version", { simple: true })).toBe(5);
+      expect(db.prepare("SELECT id, lifecycle, review_state FROM records ORDER BY id").all()).toEqual([
+        { id: "rec_gone", lifecycle: "retracted", review_state: "retracted" },
+        { id: "rec_live", lifecycle: "active", review_state: "unreviewed" },
+      ]);
+      for (const table of ["taints", "lifecycle_events", "suppressions"]) expect(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });
+      expect(() => db.prepare("UPDATE records SET lifecycle = 'deleted' WHERE id = 'rec_live'").run()).toThrow(/CHECK/);
+      expect(() => db.prepare("INSERT INTO taints (record_id, cause_id, taint, created_at) VALUES ('rec_live', 'rec_missing', 'quarantined', 'now')").run()).toThrow(/FOREIGN KEY/);
+      expect(db.pragma("foreign_key_check")).toEqual([]);
+    } finally {
+      db.close();
+    }
+    expect(inspect(path).tables).toEqual(CANONICAL_TABLES);
+  });
+
+  test("a record the v3 migration retracted can never be restored through memory_manage", () => {
+    const repo = initRepo();
+    const home = tempDir();
+    const memory = openMemory({ cwd: repo, host: "pi", home });
+    try {
+      const { recordId } = memory.record({ kind: "note", body: "legacy unsafe result", attribution: "direct_observation" });
+      const dbPath = memory.status().storage.dbPath ?? "";
+      const db = new Database(dbPath);
+      db.prepare("UPDATE records SET review_state = 'retracted', lifecycle = 'retracted', retracted_at = 'migration-v3' WHERE id = ?").run(recordId);
+      db.close();
+      const error = catchMemchorError(() => memory.manage({ action: "restore", recordId, reason: "r", attribution: "user_direction" }));
+      expect(error.code).toBe("lifecycle_conflict");
+      expect(memory.manage({ action: "inspect", recordId })).toMatchObject({ record: { lifecycle: "retracted", eligible: false }, history: [] });
+    } finally {
+      memory.close();
+    }
+  });
+
+  test.each([1, 2, 3])("a version-%i database upgrades through version 4: sessions may be workspace-level and every reference survives", (from) => {
     const path = join(tempDir(), "memory.sqlite");
     const old = new Database(path);
     old.pragma("foreign_keys = ON");
@@ -74,7 +127,7 @@ describe("migrations", () => {
 
     const db = openDatabase(path);
     try {
-      expect(db.pragma("user_version", { simple: true })).toBe(4);
+      expect(db.pragma("user_version", { simple: true })).toBe(SCHEMA_VERSION);
       expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
       expect(db.pragma("foreign_key_check")).toEqual([]);
       expect(db.prepare("SELECT id, host, host_session_id, workstream_id FROM sessions").all()).toEqual([

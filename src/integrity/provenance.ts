@@ -1,6 +1,6 @@
 import type { LinkRelation } from "../schemas.js";
 import { type Db, prepared, requireTransaction } from "../storage/database.js";
-import { requireVisibleRecord, VISIBLE_SQL } from "../retrieval/eligibility.js";
+import { requireInScopeRecord, requireVisibleRecord, VISIBLE_SQL } from "../retrieval/eligibility.js";
 
 export interface Citation {
   recordId: string;
@@ -10,15 +10,17 @@ export interface Citation {
 /**
  * Writes provenance links from a new record. Every target must be visible to the
  * writer's workstream (else `not_found` / `scope_denied`), so a record can never cite
- * across scope. Duplicate (target, relation) pairs collapse to one link.
- * Call inside the transaction that inserts `fromId`.
+ * across scope. With `lineage: "inherit"` (the importer) a target only needs to be in scope:
+ * a copy of a corrected claim must still link to what it copies. Duplicate (target, relation)
+ * pairs collapse to one link. Call inside the transaction that inserts `fromId`.
  */
-export function insertLinks(db: Db, workstreamId: string, fromId: string, links: readonly Citation[], now: string): Citation[] {
+export function insertLinks(db: Db, workstreamId: string, fromId: string, links: readonly Citation[], now: string, lineage: "strict" | "inherit" = "strict"): Citation[] {
   requireTransaction(db, "insertLinks");
   const unique = [...new Map(links.map((link) => [`${link.recordId}\u0000${link.relation}`, link])).values()];
   const insert = prepared(db, "INSERT INTO links (from_id, to_id, relation, created_at) VALUES (?, ?, ?, ?)");
   for (const link of unique) {
-    requireVisibleRecord(db, workstreamId, link.recordId);
+    if (lineage === "strict") requireVisibleRecord(db, workstreamId, link.recordId);
+    else requireInScopeRecord(db, workstreamId, link.recordId);
     insert.run(fromId, link.recordId, link.relation, now);
   }
   return unique;
@@ -26,7 +28,7 @@ export function insertLinks(db: Db, workstreamId: string, fromId: string, links:
 
 /**
  * Outgoing citations of each record, restricted to targets the workstream can see —
- * a citation never discloses an out-of-scope or retracted record.
+ * a citation never discloses an out-of-scope or ineligible record.
  */
 export function citationsFor(db: Db, workstreamId: string, recordIds: readonly string[]): Map<string, Citation[]> {
   const result = new Map<string, Citation[]>(recordIds.map((id) => [id, []]));
