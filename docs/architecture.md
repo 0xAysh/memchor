@@ -285,25 +285,27 @@ memory_record(kind: preference) ─▶ candidate (a question; never a record)
    Everywhere ─▶ preference record in $MEMCHOR_HOME/global.sqlite     This repo only ─▶ workspace-level record
    No, just now ─▶ nothing stored; this process does not ask again
    no answer ─▶ pending ─▶ asked once more at the next session start ─▶ dropped
-agent_inference supersede/correct/retract of an active preference ─▶ candidate (proposal): Yes applies it, No keeps it
-user_direction supersede/retract ─▶ applies at once (the user's request is the confirmation); a retraction can be restored
+agent_inference supersede/correct/retract of an active preference ─▶ candidate (proposal, reused on a retry): Yes applies it, No keeps it
+agent_inference restore of a removed preference ─▶ refused (lifecycle_conflict): only the user brings one back
+user_direction supersede/retract/restore ─▶ applies at once (the user's request is the confirmation)
 ```
 
-**Who asks.** The MCP transport puts the question to the user with form elicitation (`enum: ["Everywhere", "This repo only", "No, just now"]`, or `["Yes", "No"]` for a proposal), waits at most 60 s (`MEMCHOR_ELICITATION_TIMEOUT_MS`), and settles the candidate:
+**Who asks.** The MCP transport puts questions to the user with one form elicitation per tool call (`enum: ["Everywhere", "This repo only", "No, just now"]`, or `["Yes", "No"]` for a proposal; the pending questions at session start share one form, one field each), waits at most 60 s in all (`MEMCHOR_ELICITATION_TIMEOUT_MS`), and passes the host's raw reply to `settlePreference`. The transport holds no policy; `settleCandidate` decides what a reply means:
 
 | What the host did | Outcome | May the agent relay an answer? |
 |---|---|---|
+| (being asked) | pending | no, until the reply arrives |
 | accept + an answer | that answer (confirmedBy `user`) | — |
-| decline, cancel, no answer within the bound | pending, asked again next session | no (`relay: refused`) |
+| decline, cancel, accept without an answer, no answer within the bound | pending, asked again next session; not asked again this session | no (`relay: refused`) |
 | no elicitation capability, request error | pending | yes: the agent asks in chat and calls `memory_manage answer_preference` (confirmedBy `agent_reported`, weaker) |
 
 Decline is not "no": headless hosts answer questions on their own. Observed on the pinned builds (artifacts in `tests/mcp/__artifacts__/`): `claude -p` 2.1.283 cancels in about 0.5 s, and `codex exec` 0.148.0-alpha.21 declines in under a second (with `mcp_servers.memchor.default_tools_approval_mode = "approve"`; exec's approval policy `never` otherwise refuses every Memchor call). Both hosts advertise elicitation interactively: Claude Code `{}` (form), Codex `{form, url}`; `memory_status` reports it as `client.elicitation`.
 
-**Storage.** Active preferences are ordinary `preference` records, so lifecycle, eligibility and lineage apply unchanged. Global ones live in `global.sqlite`, a database with the workspace schema and migrations (its own `lifecycle.jsonl` ledger, and a `sessions` row per writing session); `memory_manage` finds a record in either store. The confirmation source is kept in the record's applicability (`confirmation`). Applying an answer writes the preference first and deletes the candidate second (possibly two databases); after a crash in between, the question comes back and finds the preference already active.
+**Storage.** Active preferences are ordinary `preference` records, so lifecycle, eligibility and lineage apply unchanged. Global ones live in `global.sqlite`, a database with the workspace schema and migrations (its own `lifecycle.jsonl` ledger, and a `sessions` row per writing session); `memory_manage` finds a record in either store. The confirmation source is kept in the record's applicability (`confirmation`; null for preferences recorded before confirmation existed, and the block says so). An answer is applied in one transaction when the preference and the candidate share this repository's database (a repo preference, "no"); a global preference is written first and the candidate deleted second, and after a crash in between the question comes back and finds the preference already active. An operation key on a global preference is hashed without the workstream, so a retry from another repository is the same request.
 
 **At session start** `bootstrap.preferences` = `{ note, items, omitted, pending }`: this repository's active preferences, then global ones, newest first, cut at 4 KB of items (`omitted` counts the rest), with a note that preferences are defaults and the current request wins; `pending` holds earlier sessions' unanswered questions, asked once more (the transport asks them directly and returns each with its outcome).
 
-Known limits: lifecycle changes to global preferences are not reported through the `corrections` watermark (a session sees them at its next start); a paraphrase of an active preference is proposed again (text is compared case- and whitespace-insensitively only).
+Known limits: lifecycle changes to global preferences are not reported through the `corrections` watermark (a session sees them at its next start); a paraphrase of an active preference is proposed again (text is compared case- and whitespace-insensitively only); this repository's preferences are also ordinary records, so recall can return them (that is how ones past the 4 KB cap stay reachable), while global ones appear only in the block.
 
 ## Private sessions
 
@@ -313,6 +315,7 @@ Known limits: lifecycle changes to global preferences are not reported through t
 transcripts of the session   Codex: the thread id (host session id) · Claude Code: transcripts whose Memchor output
                              named it as scope.sessionId (transcript_sessions, recorded at import)
 forget (no preview; the request is its own confirmation)   records the session wrote + records imported from those transcripts
+                             + global preferences it confirmed (global.sqlite) + preference questions it raised
 mark                         sessions.private = 1 · private_transcripts += those transcripts
 ledger                       forget entries + a private_session entry (a restored older copy is marked again)
 ```

@@ -90,6 +90,23 @@ describe.each(HOSTS)("preference confirmation over MCP elicitation: $name", ({ c
     expect(Date.now() - started).toBeLessThan(5_000);
   });
 
+  test("a question the host fails to show can be relayed by the agent", async () => {
+    const { handle } = await server(initRepo(), tempDir(), { capability, respond: () => Promise.reject(new Error("the host could not render the form")) });
+    const question = await proposeOver(handle);
+    expect(question).toMatchObject({ state: "pending", relay: "allowed" });
+    expect(await handle.ok<ManageResult>("memory_manage", { action: "answer_preference", candidateId: question.candidateId, answer: "repo" })).toMatchObject({
+      preference: { state: "active", confirmedBy: "agent_reported" },
+    });
+  });
+
+  test("a question the user dismissed is not asked again in the same session", async () => {
+    const { handle, asked } = await server(initRepo(), tempDir(), { capability, respond: () => Promise.resolve({ action: "cancel" }) });
+    await proposeOver(handle);
+    const again = await handle.ok<{ preference: PreferenceQuestion }>("memory_record", { kind: "preference", body: "Use bun instead of npm.", attribution: "user_direction" });
+    expect(again.preference).toMatchObject({ state: "pending", relay: "refused" });
+    expect(asked).toHaveLength(1);
+  });
+
   test("an agent-inferred change is asked as a yes/no proposal, and yes applies it", async () => {
     const { handle, asked } = await server(initRepo(), tempDir(), { capability, respond: (request) => answer(request.message.startsWith("Save") ? "This repo only" : "Yes")(request) });
     const saved = await proposeOver(handle);
@@ -108,6 +125,23 @@ describe("without elicitation", () => {
     expect(await handle.ok<ManageResult>("memory_manage", { action: "answer_preference", candidateId: question.candidateId, answer: "repo" })).toMatchObject({
       preference: { state: "active", scope: "repo", confirmedBy: "agent_reported" },
     });
+  });
+
+  test("several pending questions at session start are asked in one form, within one bound", async () => {
+    const repo = initRepo();
+    const home = tempDir();
+    const first = await server(repo, home, { capability: {}, respond: () => Promise.resolve({ action: "cancel" }) });
+    await proposeOver(first.handle, "Use bun instead of npm.");
+    await first.handle.ok("memory_record", { kind: "preference", body: "Prefer small commits.", attribution: "user_direction" });
+    await first.handle.ok("memory_record", { kind: "preference", body: "Run the linter before pushing.", attribution: "user_direction" });
+    const second = await server(repo, home, { capability: {}, respond: () => new Promise<never>(() => undefined), timeoutMs: 300 });
+    const started = Date.now();
+    const boot = await second.handle.ok<BootstrapResult>("memory_bootstrap");
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(second.asked).toHaveLength(1);
+    const form = second.asked[0] as { requestedSchema: { properties: object } };
+    expect(Object.keys(form.requestedSchema.properties)).toEqual(["answer_1", "answer_2", "answer_3"]);
+    expect(boot.preferences.pending.map((q) => [q.state, q.relay])).toEqual(Array(3).fill(["pending", "refused"]));
   });
 
   test("a question left pending is asked once more at the next session start, directly", async () => {
